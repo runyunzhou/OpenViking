@@ -135,7 +135,6 @@ class NamedQueue:
 
         # Status tracking
         self._lock = threading.Lock()
-        self._in_progress = 0
         self._processed = 0
         self._requeue_count = 0
         self._error_count = 0
@@ -154,15 +153,9 @@ class NamedQueue:
             on_error=self._on_process_error,
         )
 
-    def _on_dequeue_start(self) -> None:
-        """Called on dequeue."""
-        with self._lock:
-            self._in_progress += 1
-
     def _on_process_success(self) -> None:
         """Called on processing success."""
         with self._lock:
-            self._in_progress -= 1
             self._processed += 1
 
     def _on_process_requeue(self) -> None:
@@ -177,7 +170,6 @@ class NamedQueue:
             if metadata is not None:
                 self._task_work_index.record_failure(metadata.task_id, error_msg)
         with self._lock:
-            self._in_progress -= 1
             self._error_count += 1
             self._errors.append(
                 QueueError(
@@ -191,11 +183,11 @@ class NamedQueue:
 
     async def get_status(self) -> QueueStatus:
         """Get queue status."""
-        pending = await self.size()
+        backend_status = await self._read_backend_status()
         with self._lock:
             return QueueStatus(
-                pending=pending,
-                in_progress=self._in_progress,
+                pending=backend_status["pending"],
+                in_progress=backend_status["processing"],
                 processed=self._processed,
                 requeue_count=self._requeue_count,
                 error_count=self._error_count,
@@ -205,7 +197,6 @@ class NamedQueue:
     def reset_status(self) -> None:
         """Reset status counters."""
         with self._lock:
-            self._in_progress = 0
             self._processed = 0
             self._requeue_count = 0
             self._error_count = 0
@@ -325,7 +316,6 @@ class NamedQueue:
             msg_id = data.get("id", "") if isinstance(data, dict) else ""
             raw_data = data
             if self._dequeue_handler:
-                self._on_dequeue_start()
                 data = await self.process_dequeued(data)
             # Ack unconditionally after handler returns (success or handled error).
             # If on_dequeue raises, the exception propagates and ack is skipped —
@@ -346,11 +336,7 @@ class NamedQueue:
             return None
 
     async def process_dequeued(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Invoke the dequeue handler on already-fetched raw data.
-
-        NOTE: caller must call _on_dequeue_start() before invoking this method
-        so that in_progress is incremented atomically with the dequeue.
-        """
+        """Invoke the dequeue handler on already-fetched raw data."""
         if self._dequeue_handler is None:
             return data
 
@@ -413,6 +399,19 @@ class NamedQueue:
             return int(text) if text else 0
         except (AGFSNotFoundError, FileNotFoundError):
             return 0
+
+    async def _read_backend_status(self) -> Dict[str, int]:
+        await self._ensure_initialized()
+        content = await self._async_agfs.read(f"{self.path}/status")
+        if isinstance(content, bytes):
+            content = content.decode("utf-8")
+        elif hasattr(content, "content") and content.content is not None:
+            content = content.content.decode("utf-8")
+        status = json.loads(content)
+        return {
+            "pending": int(status["pending"]),
+            "processing": int(status["processing"]),
+        }
 
     async def snapshot(self) -> List[Dict[str, Any]]:
         """Return all unacknowledged messages without changing queue state."""

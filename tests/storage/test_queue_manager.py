@@ -5,7 +5,9 @@
 import os
 import subprocess
 import sys
+from unittest.mock import AsyncMock
 
+from openviking.storage.queuefs.named_queue import NamedQueue
 from openviking.storage.queuefs.queue_manager import QueueManager
 
 
@@ -34,3 +36,24 @@ def test_queue_concurrency_uses_separate_configured_values() -> None:
     assert manager._max_concurrent_for_queue(manager.EXTERNAL_PARSE) == 9
     assert manager._max_concurrent_for_queue(manager.ADD_RESOURCE) == 7
     assert manager._max_concurrent_for_queue(manager.SESSION_COMMIT) == 5
+
+
+async def test_status_waits_for_processing_messages_from_other_workers(monkeypatch) -> None:
+    client = AsyncMock()
+
+    async def read(path: str):
+        if path.endswith("/status"):
+            return b'{"pending":0,"processing":1}'
+        raise AssertionError(f"unexpected read: {path}")
+
+    client.read.side_effect = read
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.named_queue.AsyncAGFSClient",
+        lambda _: client,
+    )
+
+    status = await NamedQueue(object(), "/queue", "Test").get_status()
+
+    assert status.pending == 0
+    assert status.in_progress == 1
+    assert not status.is_complete

@@ -276,7 +276,6 @@ class QueueManager:
                     # Ack after successful processing (delete from persistent storage).
                     await queue.ack(msg_id, data)
                 except Exception as e:
-                    # Handler did not call report_error; decrement in_progress manually.
                     # Do NOT ack — let RecoverStale re-queue on next startup.
                     queue._on_process_error(str(e), data)
                     logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
@@ -287,18 +286,11 @@ class QueueManager:
 
             # While capacity remains, keep draining the queue
             while len(active_tasks) < max_concurrent:
-                try:
-                    queue_size = await queue.size()
-                except Exception:
-                    break
-                if not queue.has_dequeue_handler() or queue_size == 0:
+                if not queue.has_dequeue_handler():
                     break
                 data = await queue.dequeue_raw()
                 if data is None:
                     break
-                # Increment before task creation to close the race window where
-                # size=0 and in_progress=0 between dequeue_raw() and task execution.
-                queue._on_dequeue_start()
                 task = asyncio.create_task(process_one(data))
                 active_tasks.add(task)
                 logger.debug(
