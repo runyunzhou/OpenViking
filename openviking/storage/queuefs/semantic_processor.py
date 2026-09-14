@@ -46,6 +46,7 @@ from openviking.storage.abstract_overview import (
 from openviking.storage.acl import CreatorAclGrant
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecutor
 from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg, build_semantic_coalesce_key
@@ -229,21 +230,18 @@ class SemanticProcessor(DequeueHandlerBase):
     async def _requeue_semantic_msg_after_error(
         self,
         msg: SemanticMsg,
-        data: Optional[Dict[str, Any]],
         error: Exception,
-    ) -> None:
+    ) -> ProcessResult:
         try:
             await self._reenqueue_semantic_msg(msg)
             self._merge_request_stats(msg.telemetry_id, requeue_count=1)
             get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
-            self.report_requeue()
         except Exception as requeue_err:
             logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
             self._merge_request_stats(msg.telemetry_id, error_count=1)
             get_request_wait_tracker().mark_semantic_failed(msg.telemetry_id, msg.id, str(error))
-            self.report_error(str(error), data)
-            return
-        self.report_success()
+            return ProcessResult.failed(str(error))
+        return ProcessResult.requeued()
 
     async def _enqueue_parent_refresh(
         self, msg: SemanticMsg, uri: str, *, l0_body_changed: bool
@@ -330,7 +328,7 @@ class SemanticProcessor(DequeueHandlerBase):
         self,
         data: Optional[Dict[str, Any]],
         lock: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> ProcessResult:
         """Process dequeued SemanticMsg, recursively process all subdirectories."""
         msg: Optional[SemanticMsg] = None
         collector = None
@@ -338,7 +336,7 @@ class SemanticProcessor(DequeueHandlerBase):
             import json
 
             if not data:
-                return None
+                return ProcessResult.success()
 
             if "data" in data and isinstance(data["data"], str):
                 data = json.loads(data["data"])
@@ -349,8 +347,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 logger.warning("Skipping semantic generation for root URI: %s", msg.uri)
                 if msg.telemetry_id and msg.id:
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                self.report_success()
-                return None
+                return ProcessResult.success()
             if is_semantic_msg_stale(msg):
                 live_file_changes = {
                     kind: list(msg.changes.get(kind, []))
@@ -378,8 +375,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     )
                     if msg.telemetry_id and msg.id:
                         get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
-                    self.report_success()
-                    return None
+                    return ProcessResult.success()
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
                 self._circuit_breaker.check()
@@ -390,9 +386,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 await self._reenqueue_semantic_msg(msg)
                 self._merge_request_stats(msg.telemetry_id, requeue_count=1)
                 get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
-                self.report_requeue()
-                self.report_success()
-                return None
+                return ProcessResult.requeued()
             collector = resolve_telemetry(msg.telemetry_id)
             telemetry_ctx = bind_telemetry(collector) if collector is not None else nullcontext()
             with telemetry_ctx:
@@ -520,9 +514,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
                     self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
-                    self.report_success()
                     self._circuit_breaker.record_success()
-                    return None
+                    return ProcessResult.success()
                 finally:
                     reset_root_observability_context(root_context_token)
 
@@ -535,10 +528,8 @@ class SemanticProcessor(DequeueHandlerBase):
                     exc_info=True,
                 )
                 if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
-                else:
-                    self.report_error(str(e), data)
-                return None
+                    return await self._requeue_semantic_msg_after_error(msg, e)
+                return ProcessResult.failed(str(e))
 
             error_class = classify_api_error(e)
             if error_class == ERROR_CLASS_INPUT_TOO_LARGE:
@@ -551,7 +542,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                self.report_error(str(e), data)
+                return ProcessResult.failed(str(e))
             elif error_class == ERROR_CLASS_PERMANENT:
                 logger.critical(
                     f"Permanent API error processing semantic message, dropping: {e}",
@@ -563,7 +554,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     get_request_wait_tracker().mark_semantic_failed(
                         msg.telemetry_id, msg.id, str(e)
                     )
-                self.report_error(str(e), data)
+                return ProcessResult.failed(str(e))
             else:
                 # Transient or unknown — re-enqueue for retry
                 logger.warning(
@@ -572,12 +563,10 @@ class SemanticProcessor(DequeueHandlerBase):
                 )
                 self._circuit_breaker.record_failure(e)
                 if msg is not None:
-                    await self._requeue_semantic_msg_after_error(msg, data, e)
-                else:
-                    self.report_error(str(e), data)
-            return None
+                    return await self._requeue_semantic_msg_after_error(msg, e)
+                return ProcessResult.failed(str(e))
 
-    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         """Release a queued semantic lock before cancelled work is ACKed."""
         try:
             import json
@@ -587,8 +576,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 payload = json.loads(payload)
             msg = SemanticMsg.from_dict(payload)
         except (TypeError, ValueError) as exc:
-            self.report_error(str(exc), data)
-            return None
+            return ProcessResult.failed(str(exc))
 
         if msg.telemetry_id and msg.id:
             get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
@@ -599,8 +587,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 await viking_fs._async_agfs.pathlock_release(lock)
             except Exception as exc:
                 logger.warning("Failed to release cancelled semantic lock: %s", exc)
-        self.report_success()
-        return None
+        return ProcessResult.cancelled()
 
     def get_dag_stats(self) -> Optional["DagStats"]:
         return SemanticDagExecutor.get_active_stats()

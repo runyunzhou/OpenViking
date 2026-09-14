@@ -8,6 +8,7 @@ import pytest
 
 from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking_cli.exceptions import OpenVikingError, PermissionDeniedError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.server.test_admin_api import ROOT_KEY
@@ -23,6 +24,14 @@ ROOT_ACCOUNT_HEADERS = {
     "X-API-Key": ROOT_KEY,
     "X-OpenViking-Account": "default",
 }
+
+
+@pytest.fixture
+def semantic_config(monkeypatch):
+    monkeypatch.setattr(
+        "openviking.service.reindex_executor.get_openviking_config",
+        lambda: SimpleNamespace(vlm=SimpleNamespace(max_concurrent=2)),
+    )
 
 
 def _make_reindex_run(ctx, counters):
@@ -748,7 +757,9 @@ async def test_reindex_upsert_uses_uri_owner_for_user_scoped_records(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(monkeypatch):
+async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     captured = {}
@@ -760,6 +771,7 @@ async def test_reindex_semantic_processor_uses_uri_owner_for_user_scoped_records
         async def on_dequeue(self, payload, lock=None):
             captured["payload"] = payload
             captured["lock"] = lock
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -1363,6 +1375,7 @@ async def test_reindex_semantic_processor_uses_configured_vlm_concurrency(monkey
 
         async def on_dequeue(self, data, lock=None):
             seen["data"] = data
+            return ProcessResult.success()
 
     monkeypatch.setattr(reindex_mod, "SemanticProcessor", FakeSemanticProcessor)
     monkeypatch.setattr(
@@ -2131,7 +2144,9 @@ async def test_reindex_resource_vectors_parallelize_files_and_isolate_failures(m
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypatch):
+async def test_reindex_semantic_processor_runs_with_skip_vectorization(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2142,6 +2157,7 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -2170,7 +2186,9 @@ async def test_reindex_semantic_processor_runs_with_skip_vectorization(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypatch):
+async def test_reindex_semantic_processor_passes_non_recursive_message(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2181,6 +2199,7 @@ async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypat
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",
@@ -2206,7 +2225,9 @@ async def test_reindex_semantic_processor_passes_non_recursive_message(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_reindex_semantic_processor_sets_memory_aggregation_policy(monkeypatch):
+async def test_reindex_semantic_processor_sets_memory_aggregation_policy(
+    monkeypatch, semantic_config
+):
     from openviking.service.reindex_executor import ReindexExecutor
 
     seen = {}
@@ -2217,6 +2238,7 @@ async def test_reindex_semantic_processor_sets_memory_aggregation_policy(monkeyp
 
         async def on_dequeue(self, payload, lock=None):
             seen["payload"] = payload
+            return ProcessResult.success()
 
     monkeypatch.setattr(
         "openviking.service.reindex_executor.SemanticProcessor",

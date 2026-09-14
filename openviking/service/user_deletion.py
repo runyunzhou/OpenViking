@@ -14,8 +14,10 @@ from openviking.core.namespace import canonical_user_root
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_store import SYSTEM_TASK_ACCOUNT_ID, SYSTEM_TASK_USER_ID
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
+from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher
 from openviking.service.task_work_index import extract_task_metadata
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.viking_fs import LS_ALL_NODES
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -471,7 +473,7 @@ class _UserDeletionProcessor(DequeueHandlerBase):
         service_loop: asyncio.AbstractEventLoop,
     ) -> None:
         self._deletion_service = deletion_service
-        self._service_loop = service_loop
+        self._dispatcher = OwnerLoopDispatcher(service_loop)
 
     @staticmethod
     def _parse_message(data: dict[str, Any]) -> dict[str, Any]:
@@ -498,29 +500,16 @@ class _UserDeletionProcessor(DequeueHandlerBase):
             },
         }
 
-    async def on_dequeue(self, data: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    async def on_dequeue(self, data: Optional[dict[str, Any]]) -> ProcessResult:
         if not data:
-            return None
+            return ProcessResult.success()
         try:
             message = self._parse_message(data)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            self.report_error(str(exc), data)
-            return None
+            return ProcessResult.failed(str(exc))
 
-        future = asyncio.run_coroutine_threadsafe(
-            self._deletion_service._process(message),
-            self._service_loop,
-        )
-        try:
-            error = await asyncio.wrap_future(future)
-        except asyncio.CancelledError:
-            future.cancel()
-            raise
-        if error is None:
-            self.report_success()
-        else:
-            self.report_error(error, data)
-        return None
+        error = await self._dispatcher.run(lambda: self._deletion_service._process(message))
+        return ProcessResult.success() if error is None else ProcessResult.failed(error)
 
 
 async def setup_user_deletion(

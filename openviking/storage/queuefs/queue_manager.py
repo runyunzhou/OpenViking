@@ -10,13 +10,14 @@ import atexit
 import threading
 import time
 import traceback
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Sequence, Set, Union
 
 from openviking.service.task_work_index import TaskWorkIndex
 from openviking_cli.utils.logger import get_logger
 
 from .embedding_queue import EmbeddingQueue
-from .named_queue import DequeueHandlerBase, EnqueueHookBase, NamedQueue, QueueStatus
+from .named_queue import DequeueHandlerBase, NamedQueue, QueueStatus
+from .queue_middleware import QueueMiddleware
 from .semantic_queue import SemanticQueue
 
 logger = get_logger(__name__)
@@ -37,6 +38,8 @@ def init_queue_manager(
     max_concurrent_add_resource: int = 4,
     max_concurrent_session_commit: int = DEFAULT_MAX_CONCURRENT_SESSION_COMMIT,
     max_concurrent_external_task: int = 10,
+    *,
+    middlewares: Sequence[QueueMiddleware] = (),
 ) -> "QueueManager":
     """Initialize QueueManager singleton.
 
@@ -49,6 +52,7 @@ def init_queue_manager(
         max_concurrent_external_parse: Max concurrent ExternalParse tasks.
         max_concurrent_add_resource: Max concurrent AddResource tasks.
         max_concurrent_session_commit: Max concurrent SessionCommit tasks.
+        middlewares: Additional middleware, fixed at construction for all queues.
     """
     global _instance
     _instance = QueueManager(
@@ -61,6 +65,7 @@ def init_queue_manager(
         max_concurrent_add_resource=max_concurrent_add_resource,
         max_concurrent_session_commit=max_concurrent_session_commit,
         max_concurrent_external_task=max_concurrent_external_task,
+        middlewares=middlewares,
     )
     return _instance
 
@@ -101,6 +106,8 @@ class QueueManager:
         max_concurrent_add_resource: int = 4,
         max_concurrent_session_commit: int = DEFAULT_MAX_CONCURRENT_SESSION_COMMIT,
         max_concurrent_external_task: int = 10,
+        *,
+        middlewares: Sequence[QueueMiddleware] = (),
     ):
         """Initialize QueueManager."""
         self._agfs = agfs
@@ -118,6 +125,13 @@ class QueueManager:
         self._queue_stop_events: Dict[str, threading.Event] = {}
         self._poll_interval = 0.2
         self._task_work_index = TaskWorkIndex()
+        # Import at composition time to avoid a service <-> queue package cycle.
+        from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
+
+        self._middlewares: tuple[QueueMiddleware, ...] = (
+            TaskWorkQueueMiddleware(self._task_work_index),
+            *middlewares,
+        )
 
         atexit.register(self.stop)
         logger.info(
@@ -276,8 +290,7 @@ class QueueManager:
                     # Ack after successful processing (delete from persistent storage).
                     await queue.ack(msg_id, data)
                 except Exception as e:
-                    # Do NOT ack — let RecoverStale re-queue on next startup.
-                    queue._on_process_error(str(e), data)
+                    # The message remains in processing and will be recovered.
                     logger.error(f"[QueueManager] Concurrent worker error for {queue.name}: {e}")
 
         while not stop_event.is_set():
@@ -348,7 +361,6 @@ class QueueManager:
     def get_queue(
         self,
         name: str,
-        enqueue_hook: Optional[EnqueueHookBase] = None,
         dequeue_handler: Optional[DequeueHandlerBase] = None,
         allow_create: bool = False,
     ) -> NamedQueue:
@@ -361,27 +373,24 @@ class QueueManager:
                     self._agfs,
                     self.mount_point,
                     name,
-                    enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
-                    task_work_index=self._task_work_index,
+                    middlewares=self._middlewares,
                 )
             elif name == self.SEMANTIC:
                 self._queues[name] = SemanticQueue(
                     self._agfs,
                     self.mount_point,
                     name,
-                    enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
-                    task_work_index=self._task_work_index,
+                    middlewares=self._middlewares,
                 )
             else:
                 self._queues[name] = NamedQueue(
                     self._agfs,
                     self.mount_point,
                     name,
-                    enqueue_hook=enqueue_hook,
                     dequeue_handler=dequeue_handler,
-                    task_work_index=self._task_work_index,
+                    middlewares=self._middlewares,
                 )
             if self._started:
                 self._start_queue_worker(self._queues[name])

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_queue_middleware import TaskWorkQueueMiddleware
 from openviking.service.task_work_index import (
     TaskWorkIndex,
     TaskWorkRejected,
@@ -419,7 +420,7 @@ async def test_task_work_rejection_does_not_stop_shared_semantic_worker():
         None,
         "/queue",
         "Embedding",
-        task_work_index=work_index,
+        middlewares=[TaskWorkQueueMiddleware(work_index)],
     )
     embedding_queue._initialized = True
     unrelated_ran = asyncio.Event()
