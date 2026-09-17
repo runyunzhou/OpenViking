@@ -60,11 +60,10 @@ OpenViking 的配置分为两个层级：
 | 范围 | 配置 | 生命周期 | 生效说明 |
 | --- | --- | --- | --- |
 | Cluster | `agent_evolution` | 动态配置 | ROOT 可通过 Admin API 修改，作为集群默认值使用。 |
-| Account | `vlm`、`memory`、`feishu`、`agent_evolution` | 动态配置 | ROOT 或该 Account 的 ADMIN 可修改；这些配置段声明了 Cluster fallback。目前只有 Agent Evolution 已通过运行时管理器接入业务读取。 |
+| Account | `feishu`、`agent_evolution` | 动态配置 | ROOT 或该 Account 的 ADMIN 可修改。Agent Evolution 整段回落到 Cluster 配置。Account 未设置 Feishu 时也整段使用 Cluster 配置；一旦设置，则仅 `domain` 来自 Cluster，省略的 Account 字段使用 Feishu 默认值。两者都已通过运行时管理器接入业务读取。 |
 | Account | `github`、`acl` | 动态配置 | ROOT 或该 Account 的 ADMIN 可修改；没有 Cluster fallback。 |
-| Account | `embedding`、`vectordb` | 仅创建时配置 | 创建 Account 时可以设置，后续不能通过配置 PATCH 修改；显式设置时必须成对配置。 |
 
-Cluster 的 `embedding`、Cluster 的 `vlm`、`query_planner`、Cluster 的 `memory`、存储、解析器、检索等普通配置仍然是启动配置。Account 的 `vlm`、`memory`、`feishu`、`embedding` 和 `vectordb` 当前可以完成校验和持久化，但业务消费方尚未全部接入；配置成功保存不代表所有组件都已经切换。
+Cluster 的 `embedding`、`vlm`、`query_planner`、`memory`、`feishu`、存储、解析器、检索等普通配置仍然是启动配置。Account 的 `vlm`、`memory`、`embedding` 和 `vectordb` 不在当前 Account 配置 API 范围内，包含这些字段的请求会被拒绝。
 
 修改运行时配置使用以下接口：
 
@@ -88,7 +87,7 @@ PATCH /api/v1/admin/accounts/{account_id}/configuration
 }
 ```
 
-PATCH 采用三态语义：字段缺失表示不修改，具体值表示设置或替换，`null` 表示删除当前层的覆盖。对象递归合并，数组整体替换。响应返回目标层的显式值，不返回继承值或最终生效值。权限、校验、fallback 和兼容接口详见 [Admin API - 运行时配置](../api/08-admin.md#runtime_configuration)；实现设计见 [运行时配置设计](../../design/runtime-configuration-design.md)。
+PATCH 采用三态语义：字段缺失表示不修改，具体值表示设置或替换，`null` 表示删除当前层的覆盖。对象递归合并，数组整体替换。响应返回目标层的显式值，不返回继承值或最终生效值。权限、校验、fallback 和兼容接口详见 [Admin API - 运行时配置](../api/08-admin.md#runtime-configuration)；实现设计见 [运行时配置设计](../../design/runtime-configuration-design.md)。
 
 ## 配置示例
 

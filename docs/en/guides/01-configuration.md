@@ -59,11 +59,10 @@ Only fields explicitly declared as runtime fields are exposed by the runtime con
 | Scope | Configuration | Lifecycle | Effective behavior |
 | --- | --- | --- | --- |
 | Cluster | `agent_evolution` | Dynamic | ROOT can update it through the Admin API; it is used as the cluster default. |
-| Account | `vlm`, `memory`, `feishu`, `agent_evolution` | Dynamic | ROOT or the Account ADMIN can update it. The first four sections declare Cluster fallback; currently Agent Evolution is consumed through the runtime manager. |
+| Account | `feishu`, `agent_evolution` | Dynamic | ROOT or the Account ADMIN can update them. Agent Evolution falls back to the whole Cluster section. An unset Account Feishu section also uses the Cluster section; once set, only `domain` comes from Cluster and omitted Account fields use Feishu defaults. Both are consumed through the runtime manager. |
 | Account | `github`, `acl` | Dynamic | ROOT or the Account ADMIN can update it. These sections have no Cluster fallback. |
-| Account | `embedding`, `vectordb` | Create-only | Can be supplied when creating an Account, but cannot be changed by a later configuration PATCH. They must be configured together when explicitly set. |
 
-Cluster `embedding`, Cluster `vlm`, `query_planner`, Cluster `memory`, storage, parser, retrieval, and other ordinary configuration sections remain startup-only. Account `vlm`, `memory`, `feishu`, `embedding`, and `vectordb` values can currently be validated and persisted, but their complete business consumer integrations are still being rolled out; do not interpret persistence alone as proof that every component has switched.
+Cluster `embedding`, Cluster `vlm`, `query_planner`, Cluster `memory`, `feishu`, storage, parser, retrieval, and other ordinary configuration sections remain startup-only. Account `vlm`, `memory`, `embedding`, and `vectordb` are not on the current Account configuration API surface; requests that contain them are rejected.
 
 For runtime changes, use the following endpoints:
 
@@ -87,7 +86,7 @@ The request body wraps a sparse patch in `settings`:
 }
 ```
 
-PATCH uses three states: an omitted field is unchanged, a concrete value sets or replaces the value, and `null` removes the override at that layer. Objects merge recursively and arrays replace as a whole. The response contains explicit values at the addressed layer, not inherited or effective values. See [Admin API - Runtime Configuration](../api/08-admin.md#runtime_configuration) for permissions, validation, fallback, and compatibility details. The implementation design is documented in [Runtime Configuration Design](../../design/runtime-configuration-design.md).
+PATCH uses three states: an omitted field is unchanged, a concrete value sets or replaces the value, and `null` removes the override at that layer. Objects merge recursively and arrays replace as a whole. The response contains explicit values at the addressed layer, not inherited or effective values. See [Admin API - Runtime Configuration](../api/08-admin.md#runtime-configuration) for permissions, validation, fallback, and compatibility details. The implementation design is documented in [Runtime Configuration Design](../../design/runtime-configuration-design.md).
 
 ## Configuration Examples
 
