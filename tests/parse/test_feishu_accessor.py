@@ -5,6 +5,7 @@
 import asyncio
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -16,6 +17,7 @@ from openviking.parse.accessors.feishu_accessor import (
     FeishuAccessor,
     _FeishuWikiTreeNode,
 )
+from openviking.parse.accessors.feishu_session import FeishuApiSession
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils.config.parser_config import FeishuConfig
 
@@ -45,6 +47,7 @@ def test_generated_doc_url_uses_account_feishu_domain():
 class _FakeRequestOption:
     def __init__(self):
         self.user_access_token = None
+        self.tenant_access_token = None
 
     @staticmethod
     def builder():
@@ -59,6 +62,10 @@ class _FakeRequestOptionBuilder:
         self._option.user_access_token = token
         return self
 
+    def tenant_access_token(self, token):
+        self._option.tenant_access_token = token
+        return self
+
     def build(self):
         return self._option
 
@@ -70,6 +77,7 @@ class _FakeClientBuilder:
         self.app_id_value = None
         self.app_secret_value = None
         self.enable_set_token_value = False
+        self.cache_value = None
 
     def domain(self, value):
         self.domain_value = value
@@ -91,6 +99,10 @@ class _FakeClientBuilder:
         self.enable_set_token_value = value
         return self
 
+    def cache(self, value):
+        self.cache_value = value
+        return self
+
     def build(self):
         return SimpleNamespace(
             domain=self.domain_value,
@@ -98,6 +110,7 @@ class _FakeClientBuilder:
             app_id=self.app_id_value,
             app_secret=self.app_secret_value,
             enable_set_token=self.enable_set_token_value,
+            cache=self.cache_value,
         )
 
 
@@ -264,6 +277,21 @@ def _install_fake_lark_modules(monkeypatch):
 
 def _use_fake_client(monkeypatch, accessor: FeishuAccessor, client):
     monkeypatch.setattr(accessor, "_get_client", lambda **_kwargs: client)
+    accessor._session = SimpleNamespace(
+        tenant_token_cache_scope=lambda: nullcontext(),
+    )
+    monkeypatch.setattr(
+        FeishuApiSession,
+        "tenant_token_cache_scope",
+        lambda _self: nullcontext(),
+    )
+    monkeypatch.setattr(
+        accessor,
+        "_user_request_option",
+        lambda token: _FakeRequestOption.builder().user_access_token(token).build()
+        if token
+        else None,
+    )
 
 
 def _feishu_config(**kwargs) -> FeishuConfig:
@@ -316,6 +344,18 @@ def test_tenant_token_client_uses_environment_credentials(monkeypatch):
 
     assert client.app_id == "env-app"
     assert client.app_secret == "env-secret"
+
+
+def test_tenant_clients_install_account_scoped_sdk_cache(monkeypatch):
+    _install_fake_lark_modules(monkeypatch)
+    accessor = _operation(
+        FeishuAccessor(),
+        config=_feishu_config(app_id="account-app", app_secret="account-secret"),
+    )
+    client = accessor._get_client(use_user_token=False)
+
+    assert client.cache is not None
+    assert client.enable_set_token is False
 
 
 def test_shared_accessor_keeps_concurrent_operation_contexts_isolated(monkeypatch):

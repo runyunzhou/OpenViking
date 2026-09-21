@@ -11,7 +11,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 import httpx
+from lark_oapi.core.cache import ICache
 
+from openviking.parse.accessors.feishu_token import (
+    resolve_feishu_tenant_token_cache,
+)
 from openviking_cli.utils.config.parser_config import FeishuConfig
 
 FEISHU_AUTH_PROVIDER = "feishu"
@@ -162,16 +166,36 @@ def apply_feishu_refreshed_token(
 class FeishuOAuthClient:
     """Small wrapper around Feishu/Lark user and tenant token operations."""
 
-    def __init__(self, credentials: FeishuAppCredentials):
+    def __init__(
+        self,
+        credentials: FeishuAppCredentials,
+        *,
+        tenant_token_cache: ICache | None = None,
+    ):
         self._credentials = credentials
+        self._tenant_token_cache = resolve_feishu_tenant_token_cache(tenant_token_cache)
         self._client = None
 
     @classmethod
-    def from_config(cls, config) -> "FeishuOAuthClient":
-        return cls(load_feishu_app_credentials(config=config))
+    def from_config(
+        cls,
+        config,
+        *,
+        tenant_token_cache: ICache | None = None,
+    ) -> "FeishuOAuthClient":
+        return cls(
+            load_feishu_app_credentials(config=config),
+            tenant_token_cache=tenant_token_cache,
+        )
 
     @classmethod
-    def from_auth_state(cls, auth_state: Dict[str, Any], *, config) -> "FeishuOAuthClient":
+    def from_auth_state(
+        cls,
+        auth_state: Dict[str, Any],
+        *,
+        config,
+        tenant_token_cache: ICache | None = None,
+    ) -> "FeishuOAuthClient":
         try:
             bound = feishu_config_from_auth_state(auth_state, config)
             credentials = load_feishu_app_credentials(config=bound)
@@ -180,7 +204,7 @@ class FeishuOAuthClient:
                 "Feishu app credentials in watch task are invalid.",
                 permanent=True,
             ) from exc
-        return cls(credentials)
+        return cls(credentials, tenant_token_cache=tenant_token_cache)
 
     async def get_tenant_access_token(self) -> str:
         return await asyncio.to_thread(self._get_tenant_access_token_sync)
@@ -201,7 +225,12 @@ class FeishuOAuthClient:
         config.domain = self._credentials.domain
         config.timeout = self._credentials.request_timeout
         try:
-            token = TokenManager.get_self_tenant_token(config)
+            with self._tenant_token_cache.sdk_scope(
+                app_id=self._credentials.app_id,
+                app_secret=self._credentials.app_secret,
+                domain=self._credentials.domain,
+            ):
+                token = TokenManager.get_self_tenant_token(config)
         except Exception as exc:
             raise FeishuTenantTokenError("Failed to obtain Feishu tenant token.") from exc
         if not isinstance(token, str) or not token.strip():

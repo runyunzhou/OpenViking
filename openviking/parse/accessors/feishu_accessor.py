@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, Tuple, Union
 from urllib.parse import parse_qs, unquote, urlparse, urlunparse
 
+from lark_oapi.core.cache import ICache
+
 from openviking.parse.base import format_table_to_markdown
 from openviking.parse.feishu_import import FeishuImportPlan, recursive_wiki
 from openviking.utils.exceptions import error_code_from_http_status
@@ -364,9 +366,15 @@ class FeishuAccessor(DataAccessor):
         }
     )
 
-    def __init__(self, session: Optional[FeishuApiSession] = None):
+    def __init__(
+        self,
+        session: Optional[FeishuApiSession] = None,
+        *,
+        tenant_token_cache: Optional[ICache] = None,
+    ):
         """Initialize a shared selector or a request-scoped worker."""
         self._session = session
+        self._tenant_token_cache = tenant_token_cache
 
     def _new_operation(
         self,
@@ -379,7 +387,10 @@ class FeishuAccessor(DataAccessor):
             config=config,
         )
         worker = copy.copy(self)
-        worker._session = FeishuApiSession(context)
+        worker._session = FeishuApiSession(
+            context,
+            tenant_token_cache=self._tenant_token_cache,
+        )
         return worker
 
     def _require_session(self) -> FeishuApiSession:
@@ -1612,7 +1623,10 @@ class FeishuAccessor(DataAccessor):
 
     def _call_api(self, method, request, feishu_access_token: Optional[str] = None):
         option = self._user_request_option(feishu_access_token)
-        return method(request) if option is None else method(request, option)
+        if option is not None:
+            return method(request, option)
+        with self._require_session().tenant_token_cache_scope():
+            return method(request)
 
     @classmethod
     def _raw_feishu_error(cls, raw_resp: Any) -> Optional[Tuple[int, str]]:
@@ -1655,8 +1669,13 @@ class FeishuAccessor(DataAccessor):
         from lark_oapi.core.token import verify
 
         option = self._user_request_option(feishu_access_token) or RequestOption()
-        verify(client._config, request, option)
-        raw_resp = Transport.execute(client._config, request, option)
+        if feishu_access_token:
+            verify(client._config, request, option)
+            raw_resp = Transport.execute(client._config, request, option)
+        else:
+            with self._require_session().tenant_token_cache_scope():
+                verify(client._config, request, option)
+                raw_resp = Transport.execute(client._config, request, option)
 
         response = BaseResponse()
         feishu_error = self._raw_feishu_error(raw_resp)

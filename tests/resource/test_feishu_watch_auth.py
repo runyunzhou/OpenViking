@@ -211,10 +211,14 @@ def test_refresh_user_token_keeps_legacy_endpoint_for_ur_tokens(monkeypatch):
 
 
 def test_get_tenant_access_token_uses_configured_app(monkeypatch):
+    from lark_oapi.core.token import TokenManager
+
+    monkeypatch.setattr(TokenManager, "cache", TokenManager.cache)
     seen = {}
 
     def fake_get_token(config):
         seen["config"] = config
+        seen["cache"] = TokenManager.cache
         return " t-test "
 
     monkeypatch.setattr(
@@ -235,3 +239,4 @@ def test_get_tenant_access_token_uses_configured_app(monkeypatch):
     assert seen["config"].app_secret == "secret-test"
     assert seen["config"].domain == "https://open.feishu.cn"
     assert seen["config"].timeout == 12
+    assert seen["cache"] is client._tenant_token_cache
