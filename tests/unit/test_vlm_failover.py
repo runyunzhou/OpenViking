@@ -7,7 +7,12 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from openviking.models.vlm.base import FailoverVLM, PrimaryBackupSwitcher
+from openviking.models.vlm.base import (
+    FailoverVLM,
+    MultiCredentialVLM,
+    PrimaryBackupSwitcher,
+)
+from openviking.models.vlm.token_usage import TokenUsageTracker
 from openviking_cli.utils.config.vlm_config import VLMConfig
 
 
@@ -147,6 +152,38 @@ class TestVLMBackupConfig:
 
         assert dict_a["max_tokens"] == 2048
         assert dict_b["max_tokens"] == 8192
+
+
+def test_multicredential_wrapper_preserves_common_runtime_behavior():
+    primary = Mock(
+        model="primary-model",
+        provider="openai",
+        temperature=0.4,
+        max_retries=7,
+        timeout=120,
+        max_tokens=4096,
+        thinking=True,
+    )
+    secondary = Mock(
+        model="secondary-model",
+        provider="openai",
+        temperature=0.4,
+        max_retries=7,
+        timeout=120,
+        max_tokens=2048,
+        thinking=True,
+    )
+
+    vlm = MultiCredentialVLM(
+        [primary, secondary],
+        credential_ids=["primary", "secondary"],
+    )
+
+    assert vlm.temperature == 0.4
+    assert vlm.max_retries == 7
+    assert vlm.timeout == 120
+    assert vlm.max_tokens == 2048
+    assert vlm.thinking is True
 
 
 class TestLegacyProvidersDictMigration:
@@ -373,6 +410,24 @@ class TestLegacyProvidersDictMigration:
 
 class TestFailoverVLM:
     """Tests for FailoverVLM wrapper."""
+
+    def test_shared_tracker_is_not_merged_twice(self):
+        tracker = TokenUsageTracker()
+        tracker.update("model", "provider", 2, 3)
+
+        primary = Mock(model="primary-model", provider="openai")
+        primary.token_tracker = tracker
+        backup = Mock(model="backup-model", provider="openai")
+        backup.token_tracker = tracker
+
+        failover = FailoverVLM(primary, backup)
+        assert failover.get_token_usage() == tracker.to_dict()
+
+        multi = MultiCredentialVLM(
+            [primary, backup],
+            credential_ids=["primary", "backup"],
+        )
+        assert multi.get_token_usage() == tracker.to_dict()
 
     def test_initialization(self):
         """Test that FailoverVLM initializes correctly with primary and backup."""

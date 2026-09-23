@@ -60,6 +60,22 @@ async def test_resource_processor_upload_understanding_file_delegates():
     media_processor.upload_understanding_file.assert_awaited_once_with("/tmp/upload.pdf")
 
 
+@pytest.mark.asyncio
+async def test_account_media_processor_does_not_reuse_unbound_processor():
+    processor = ResourceProcessor(_FakeVikingDB(), vlm_resolver=object())
+    unbound = SimpleNamespace()
+    bound_vlm_processor = object()
+    processor._media_processor = unbound
+    processor._vlm_processor_for = AsyncMock(return_value=bound_vlm_processor)
+
+    result = await processor._media_processor_for(
+        RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
+    )
+
+    assert result is not unbound
+    assert result._vlm_processor is bound_vlm_processor
+
+
 @pytest.fixture
 def ctx() -> RequestContext:
     return RequestContext(
@@ -168,7 +184,7 @@ async def test_flat_file_refreshes_parent_semantics_and_vectorizes_via_summary(
     )
     processor = ResourceProcessor(_FakeVikingDB())
     summarizer = SimpleNamespace(refresh_file_parent=AsyncMock(return_value={"status": "success"}))
-    processor._get_summarizer = Mock(return_value=summarizer)
+    processor._summarizer = summarizer
 
     result = await processor.finish_prepared_resource(
         {
@@ -207,7 +223,7 @@ async def test_local_flat_file_refresh_passes_final_md5(monkeypatch, ctx):
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
     processor = ResourceProcessor(_FakeVikingDB())
     summarizer = SimpleNamespace(refresh_file_parent=AsyncMock(return_value={"status": "success"}))
-    processor._get_summarizer = Mock(return_value=summarizer)
+    processor._summarizer = summarizer
 
     await processor.finish_prepared_resource(
         {
@@ -293,7 +309,7 @@ async def test_local_incremental_noop_skips_semantic_queue_and_releases_resource
     processor = ResourceProcessor(_FakeVikingDB())
     processor._build_parse_output_store = Mock(return_value=store)
     summarizer = SimpleNamespace(summarize=AsyncMock(return_value={"status": "success"}))
-    processor._get_summarizer = Mock(return_value=summarizer)
+    processor._summarizer = summarizer
 
     result = await processor.finish_prepared_resource(
         {
@@ -399,7 +415,7 @@ async def test_directory_semantic_plan_is_enqueued_without_artifact_or_legacy_di
     summarizer = SimpleNamespace(
         summarize=AsyncMock(return_value={"status": "success", "enqueued_count": 1})
     )
-    processor._get_summarizer = Mock(return_value=summarizer)
+    processor._summarizer = summarizer
 
     await processor.finish_prepared_resource(
         {
@@ -458,8 +474,8 @@ async def test_plan_artifact_is_cleaned_only_after_semantic_enqueue(monkeypatch,
         assert tmp_path.joinpath("artifacts", ref.root.split("/")[-1]).exists()
         return {"status": "success", "enqueued_count": 1}
 
-    processor._get_summarizer = Mock(
-        return_value=SimpleNamespace(summarize=AsyncMock(side_effect=summarize))
+    processor._summarizer = SimpleNamespace(
+        summarize=AsyncMock(side_effect=summarize)
     )
 
     await processor.finish_prepared_resource(
@@ -511,10 +527,8 @@ async def test_plan_enqueue_failure_cleans_artifact_and_releases_lock(monkeypatc
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
     processor = ResourceProcessor(_FakeVikingDB())
     processor._build_parse_output_store = Mock(return_value=store)
-    processor._get_summarizer = Mock(
-        return_value=SimpleNamespace(
-            summarize=AsyncMock(side_effect=RuntimeError("queue unavailable"))
-        )
+    processor._summarizer = SimpleNamespace(
+        summarize=AsyncMock(side_effect=RuntimeError("queue unavailable"))
     )
 
     with pytest.raises(RuntimeError, match="queue unavailable"):
@@ -568,10 +582,8 @@ async def test_plan_enqueue_error_result_cleans_artifact_and_fails(monkeypatch, 
     monkeypatch.setattr("openviking.utils.resource_processor.get_viking_fs", lambda: viking_fs)
     processor = ResourceProcessor(_FakeVikingDB())
     processor._build_parse_output_store = Mock(return_value=store)
-    processor._get_summarizer = Mock(
-        return_value=SimpleNamespace(
-            summarize=AsyncMock(return_value={"status": "error", "message": "queue rejected plan"})
-        )
+    processor._summarizer = SimpleNamespace(
+        summarize=AsyncMock(return_value={"status": "error", "message": "queue rejected plan"})
     )
 
     with pytest.raises(RuntimeError, match="queue rejected plan"):
@@ -605,10 +617,8 @@ async def test_local_flat_refresh_failure_cleans_artifact(monkeypatch, ctx, tmp_
     await store.write_bytes(ref, "document/report.md", b"body")
     processor = ResourceProcessor(_FakeVikingDB())
     processor._build_parse_output_store = Mock(return_value=store)
-    processor._get_summarizer = Mock(
-        return_value=SimpleNamespace(
-            refresh_file_parent=AsyncMock(side_effect=RuntimeError("queue unavailable"))
-        )
+    processor._summarizer = SimpleNamespace(
+        refresh_file_parent=AsyncMock(side_effect=RuntimeError("queue unavailable"))
     )
 
     with pytest.raises(RuntimeError, match="queue unavailable"):

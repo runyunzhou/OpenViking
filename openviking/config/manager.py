@@ -13,9 +13,10 @@ Two scopes are managed side by side, mirroring the two independent config models
 - **cluster** — a single process-wide config object, bridged through the
   ``get_config`` / ``set_config`` / ``build_config`` hooks so the manager stays
   agnostic to the concrete cluster model.
-- **account** — a per-account cache of ``(sparse override, constructed account
-  config, last-access time)``. ``get_account(account_id, field)`` loads the
-  account on demand and resolves the field's declared cluster fallback.
+- **account** — a per-account cache of the constructed Account configuration
+  and its last-access time. Account and Cluster configurations remain distinct.
+  ``get_account(account_id, field)`` returns the Account value, except for the
+  deprecated whole-section fallback retained for existing fields.
 
 Both models are built and validated by caller-supplied hooks, so the manager
 imports neither ``OpenVikingConfig`` nor ``AccountConfig`` directly.
@@ -28,7 +29,7 @@ import time
 import weakref
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable, Generic, Optional, TypeVar
+from typing import Any, Awaitable, Callable, Generic, Iterable, Optional, TypeVar
 
 from openviking.config.merge import apply_three_state_patch, diff_sections
 from openviking.config.scope import ConfigScope, ScopeKind
@@ -43,14 +44,16 @@ logger = get_logger(__name__)
 C = TypeVar("C")
 A = TypeVar("A")
 T = TypeVar("T")
+_NO_OLD_SETTINGS = object()
 
 
 @dataclass(frozen=True)
 class AccountConfigView(Generic[C, A]):
-    """Resolve fields against a captured account/cluster publication pair.
+    """Expose one atomically captured Account/Cluster publication pair.
 
     Used only by synchronous selectors, never as a request context. Returned
-    models are shared, read-only configuration values.
+    models are shared, read-only configuration values. Business resolvers should
+    combine them explicitly instead of adding generic framework fallback rules.
     """
 
     _account: A
@@ -58,7 +61,7 @@ class AccountConfigView(Generic[C, A]):
 
     @property
     def account(self) -> A:
-        """Return the captured sparse account configuration."""
+        """Return the captured Account configuration."""
         return self._account
 
     @property
@@ -67,6 +70,11 @@ class AccountConfigView(Generic[C, A]):
         return self._cluster
 
     def get(self, field: str) -> Any:
+        """Return an Account field with legacy whole-section fallback.
+
+        This compatibility API never merges nested values. New business
+        resolvers should read ``account`` and ``cluster`` explicitly.
+        """
         fields = getattr(type(self._account), "model_fields", {})
         if field not in fields:
             raise AttributeError(field)
@@ -75,6 +83,37 @@ class AccountConfigView(Generic[C, A]):
             return value
         target = fallback_of(fields[field])
         return resolve_fallback(self._cluster, target) if target is not None else None
+
+
+@dataclass(frozen=True)
+class AccountCandidateContext(Generic[C, A]):
+    """Read-only inputs for synchronous, side-effect-free domain validation.
+
+    ``old_view`` is supplied only for an update PATCH, built from the latest
+    document passed to the source's mutation callback (including absent settings
+    on an existing Account). Both views share one captured Cluster publication.
+    Creation, initial loading and refresh validate only the candidate; loading a
+    persisted document is not a local update request. ``changed_sections`` names
+    PATCH keys, or is ``None`` when all validators must run.
+    """
+
+    new_view: AccountConfigView[C, A]
+    old_view: Optional[AccountConfigView[C, A]]
+    changed_sections: Optional[frozenset[str]]
+    creating: bool
+
+
+@dataclass(frozen=True)
+class AccountCandidateValidator(Generic[C, A]):
+    """Validate every candidate; sections describe the domain's dependencies.
+
+    Validators may use context.changed_sections to scope PATCH transition
+    rules, but must always validate the complete candidate's effective values.
+    """
+
+    sections: frozenset[str]
+    validate: Callable[[AccountCandidateContext[C, A]], None]
+
 
 REFRESH_INTERVAL_SECS = 30.0
 # Accounts unused for this long are evicted and stop being polled.
@@ -85,7 +124,8 @@ ACCOUNT_IDLE_TTL_SECS = 24 * 60 * 60.0
 class ConfigChangeEvent:
     """Emitted after a new config is published.
 
-    ``scope`` names the changed override (cluster-wide or one account).
+    ``scope`` names the changed persisted settings document (cluster-wide or
+    one account).
     ``old_config`` / ``new_config`` are the objects for that scope (the cluster
     config, or that account's :class:`AccountConfig`; ``None`` when the account
     scope was cleared or evicted). ``reason`` distinguishes ordinary config
@@ -126,15 +166,23 @@ class _AccountEntry(Generic[A]):
     last_access: float
 
 
+@dataclass(frozen=True)
+class _PreparedPatch:
+    """Candidate and persisted document prepared for one scope mutation."""
+
+    persisted_settings: dict
+    candidate: Any
+
+
 class RuntimeConfigManager(Generic[C, A]):
-    """Coordinate override merge/publish/invalidation over a :class:`ConfigSource`.
+    """Coordinate scoped config patching/publication over a :class:`ConfigSource`.
 
     ``base_config`` is the caller-owned immutable startup baseline.
     ``get_config`` / ``set_config`` bridge to the process-wide cluster singleton;
     ``build_config`` rebuilds the cluster model from the baseline plus a complete
-    cluster override; ``build_account`` constructs an account model from its
-    sparse override. Supplying these as hooks keeps the manager free of any
-    concrete config-model import.
+    Cluster settings document; ``build_account`` constructs an Account model from
+    its own settings document. Supplying these as hooks keeps the manager free of
+    concrete config-model imports and business-specific defaulting rules.
     """
 
     def __init__(
@@ -147,6 +195,7 @@ class RuntimeConfigManager(Generic[C, A]):
         build_config: Callable[[C, dict], C],
         build_account: Callable[[Optional[dict]], A],
         validate_request: Optional[Callable[[dict, bool, bool], None]] = None,
+        account_candidate_validators: Iterable[AccountCandidateValidator[C, A]] = (),
     ) -> None:
         self._source = source
         self._dispatcher = OwnerLoopDispatcher()
@@ -157,17 +206,17 @@ class RuntimeConfigManager(Generic[C, A]):
         self._set_config = set_config
         # build_config(old_cluster, cluster_override) -> new validated cluster config.
         self._build_config = build_config
-        # build_account(sparse_override) -> constructed & validated account config.
-        # The manager persists and builds from the *sparse* override only; fallback
-        # is never materialized. AccountConfig's own @model_validator(after) runs at
-        # construction, but it only cross-checks fields the account set explicitly
-        # (see _check_embedding_vectordb_dim), so it never needs the cluster here.
+        # build_account(account_settings) -> validated Account configuration.
+        # Account/Cluster composition belongs to business resolvers. Existing
+        # RuntimeField fallback remains a whole-section compatibility read only.
         self._build_account = build_account
         # validate_request(patch, is_account_scope, creating) -> None (structural gate).
         self._validate_request = validate_request
+        # Domain validators run before persistence and never mutate publications.
+        self._account_candidate_validators = tuple(account_candidate_validators)
         # Per-account cache; only touched on the owner loop.
         self._accounts: dict[str, _AccountEntry[A]] = {}
-        self._overrides: dict[ConfigScope, Optional[dict]] = {}
+        self._persisted_settings: dict[ConfigScope, Optional[dict]] = {}
         self._consumers: list[_ConsumerRegistration] = []
         # Per-scope local locks serialize same-node concurrent PATCHes so two
         # requests mutating the same scope can't interleave read-merge-write.
@@ -206,7 +255,7 @@ class RuntimeConfigManager(Generic[C, A]):
         await self._refresh_scope(ConfigScope.cluster(), reason=ConfigChangeReason.UPDATE)
 
     async def replace_base_config(self, base_config: C) -> ConfigChangeEvent:
-        """Replace the startup baseline without persisting a runtime override."""
+        """Replace the startup baseline without persisting runtime settings."""
         return await self._dispatcher.run(
             lambda: run_to_completion(lambda: self._replace_base_config(base_config))
         )
@@ -216,9 +265,12 @@ class RuntimeConfigManager(Generic[C, A]):
         async with self._lock_for(scope):
             async with self._publish_lock:
                 self._base_config = base_config
+                persisted_settings = self._persisted_settings.get(scope)
+                candidate = self._build_candidate(scope, persisted_settings)
                 event = self._publish(
                     scope,
-                    self._overrides.get(scope),
+                    persisted_settings,
+                    candidate,
                     reason=ConfigChangeReason.UPDATE,
                 )
         await self._notify(event)
@@ -227,11 +279,11 @@ class RuntimeConfigManager(Generic[C, A]):
     # -- account loading -----------------------------------------------------
 
     async def _ensure_loaded(self, account_id: str) -> None:
-        """Load one account's override and construct its config, once.
+        """Load and validate one Account configuration, once.
 
-        Idempotent and concurrency-safe per account. Absence of a file records
-        "loaded, no override"; a read/decrypt/validate failure raises and does
-        not fall back to another account's config.
+        Idempotent and concurrency-safe per Account. Absence of a file records
+        "loaded, no settings"; a read/decrypt/validate failure raises and does
+        not fall back to another Account's configuration.
         """
         entry = self._accounts.get(account_id)
         if entry is not None:
@@ -242,16 +294,16 @@ class RuntimeConfigManager(Generic[C, A]):
             if account_id in self._accounts:
                 self._accounts[account_id].last_access = time.monotonic()
                 return
-            override = await self._source.load(scope)
+            persisted_settings = await self._source.load(scope)
             async with self._publish_lock:
                 self._accounts[account_id] = _AccountEntry(
-                    config=self._build_account(override),
+                    config=self._build_account_candidate(persisted_settings),
                     last_access=time.monotonic(),
                 )
-                self._overrides[scope] = override
+                self._persisted_settings[scope] = persisted_settings
 
     async def get_account(self, account_id: str, field: str) -> Any:
-        """Load an account on demand and return one effective config field."""
+        """Load an Account field, retaining deprecated whole-section fallback."""
         return await self.resolve_account(account_id, lambda view: view.get(field))
 
     async def resolve_account(
@@ -282,7 +334,7 @@ class RuntimeConfigManager(Generic[C, A]):
         return result
 
     async def get_settings(self, scope: ConfigScope) -> dict:
-        """Read explicit overrides, never the merged configuration."""
+        """Read the settings stored for exactly one scope."""
         import copy
 
         return copy.deepcopy(await self._dispatcher.run(lambda: self._source.load(scope)) or {})
@@ -292,13 +344,12 @@ class RuntimeConfigManager(Generic[C, A]):
         ConfigScope.account(account_id)
         if self._validate_request is not None:
             self._validate_request(settings, True, True)
-        # Construct-to-validate: section-internal and cross-section validators run.
-        self._build_account(settings)
+        self._build_account_candidate(settings, creating=True)
 
     # -- PATCH ---------------------------------------------------------------
 
     async def patch_cluster(self, patch: dict) -> ConfigChangeEvent:
-        """Apply a three-state PATCH to the cluster override and publish."""
+        """Apply a three-state PATCH to the Cluster settings and publish."""
         scope = ConfigScope.cluster()
         return await self._dispatcher.run(
             lambda: run_to_completion(lambda: self._patch(scope, patch))
@@ -307,14 +358,14 @@ class RuntimeConfigManager(Generic[C, A]):
     async def patch_account(
         self, account_id: str, patch: dict, *, creating: bool = False
     ) -> ConfigChangeEvent:
-        """Apply a three-state PATCH to one account override and publish."""
+        """Apply a three-state PATCH to one Account configuration and publish."""
         scope = ConfigScope.account(account_id)
         return await self._dispatcher.run(
             lambda: run_to_completion(lambda: self._patch(scope, patch, creating=creating))
         )
 
     async def delete_account(self, account_id: str) -> ConfigChangeEvent:
-        """Delete one account override and evict all manager-owned state."""
+        """Delete one Account configuration and evict all manager-owned state."""
         scope = ConfigScope.account(account_id)
         return await self._dispatcher.run(
             lambda: run_to_completion(lambda: self._delete_account(scope))
@@ -325,11 +376,9 @@ class RuntimeConfigManager(Generic[C, A]):
         async with self._lock_for(scope):
             await self._source.delete(scope)
             async with self._publish_lock:
-                entry = self._accounts.pop(scope.key, None)
-                self._overrides.pop(scope, None)
-                event = self._account_event(
-                    scope.key,
-                    entry.config if entry is not None else None,
+                event = self._publish(
+                    scope,
+                    None,
                     None,
                     reason=ConfigChangeReason.EVICT,
                 )
@@ -339,24 +388,88 @@ class RuntimeConfigManager(Generic[C, A]):
     async def _patch(
         self, scope: ConfigScope, patch: dict, *, creating: bool = False
     ) -> ConfigChangeEvent:
-        is_account = scope.kind is ScopeKind.ACCOUNT
-        if self._validate_request is not None:
-            self._validate_request(patch, is_account, creating)
+        # Phase 1: validate only the request boundary. Candidate validation
+        # happens after the current document has been merged.
+        self._validate_patch_request(scope, patch, creating)
+
+        # Phase 2: serialize the scope's read/merge/validate/write operation.
         async with self._lock_for(scope):
+            prepared = await self._persist_validated_patch(scope, patch, creating=creating)
 
-            def mutate(current: Optional[dict]) -> dict:
-                override = apply_three_state_patch(current, patch)
-                if self._validate_request is not None and not creating:
-                    self._validate_resets(current or {}, patch, is_account)
-                # Construct-to-validate before persisting.
-                self._build_candidate(scope, override)
-                return override
-
-            override = await self._source.update(scope, mutate)
+            # Phase 3: publish only the already-built candidate. Account and
+            # Cluster publications are independent; a Cluster pointer change
+            # never rebuilds the AccountConfig candidate.
             async with self._publish_lock:
-                event = self._publish(scope, override, reason=ConfigChangeReason.UPDATE)
+                event = self._publish(
+                    scope,
+                    prepared.persisted_settings,
+                    prepared.candidate,
+                    reason=ConfigChangeReason.UPDATE,
+                )
+
+        # Phase 4: consumers observe a completed publication.
         await self._notify(event)
         return event
+
+    def _validate_patch_request(
+        self,
+        scope: ConfigScope,
+        patch: dict,
+        creating: bool,
+    ) -> None:
+        """Validate the request boundary before entering scope serialization."""
+        if self._validate_request is not None:
+            self._validate_request(patch, scope.kind is ScopeKind.ACCOUNT, creating)
+
+    async def _persist_validated_patch(
+        self,
+        scope: ConfigScope,
+        patch: dict,
+        *,
+        creating: bool,
+    ) -> _PreparedPatch:
+        """Prepare one candidate and persist its explicit scope document."""
+        prepared: Optional[_PreparedPatch] = None
+
+        def mutate(current: Optional[dict]) -> dict:
+            nonlocal prepared
+            prepared = self._prepare_patch(scope, current, patch, creating=creating)
+            return prepared.persisted_settings
+
+        persisted_settings = await self._source.update(scope, mutate)
+        if prepared is None:
+            raise RuntimeError("config source update did not invoke its mutate callback")
+        if prepared.persisted_settings is not persisted_settings:
+            prepared = _PreparedPatch(
+                persisted_settings=persisted_settings,
+                candidate=prepared.candidate,
+            )
+        return prepared
+
+    def _prepare_patch(
+        self,
+        scope: ConfigScope,
+        current: Optional[dict],
+        patch: dict,
+        *,
+        creating: bool,
+    ) -> _PreparedPatch:
+        """Merge, transition-check, construct and validate one PATCH candidate."""
+        persisted_settings = apply_three_state_patch(current, patch)
+        if self._validate_request is not None and not creating:
+            self._validate_resets(
+                current or {},
+                patch,
+                scope.kind is ScopeKind.ACCOUNT,
+            )
+        candidate = self._build_candidate(
+            scope,
+            persisted_settings,
+            changed_sections=frozenset(patch),
+            old_settings=current,
+            creating=creating,
+        )
+        return _PreparedPatch(persisted_settings=persisted_settings, candidate=candidate)
 
     def _validate_resets(self, current: dict, patch: dict, is_account: bool) -> None:
         """A parent reset must not erase creation-only overrides beneath it."""
@@ -377,48 +490,92 @@ class RuntimeConfigManager(Generic[C, A]):
 
     # -- copy-on-write publish -----------------------------------------------
 
-    def _build_candidate(self, scope: ConfigScope, override: Optional[dict]) -> Any:
-        """Build (and thereby validate) the new object for a scope's override."""
+    def _build_candidate(
+        self,
+        scope: ConfigScope,
+        persisted_settings: Optional[dict],
+        *,
+        changed_sections: Optional[frozenset[str]] = None,
+        old_settings: Any = _NO_OLD_SETTINGS,
+        creating: bool = False,
+    ) -> Any:
+        """Build and validate the candidate publication for one scope."""
         if scope.kind is ScopeKind.CLUSTER:
-            return self._build_config(self._base_config, override or {})
-        return self._build_account(override)
+            return self._build_config(self._base_config, persisted_settings or {})
+        return self._build_account_candidate(
+            persisted_settings,
+            changed_sections=changed_sections,
+            old_settings=old_settings,
+            creating=creating,
+        )
+
+    def _build_account_candidate(
+        self,
+        settings: Optional[dict],
+        *,
+        changed_sections: Optional[frozenset[str]] = None,
+        old_settings: Any = _NO_OLD_SETTINGS,
+        creating: bool = False,
+    ) -> A:
+        """Build an Account model and run injected cross-publication checks."""
+        account = self._build_account(settings)
+        # The source may contain changes rejected by a previous refresh.
+        # Validate the complete candidate; changed_sections only scopes
+        # transition checks inside validators, never candidate validity.
+        validators = self._account_candidate_validators
+        if not validators:
+            return account
+        cluster = self._get_config()
+        context = AccountCandidateContext(
+            new_view=AccountConfigView(account, cluster),
+            old_view=(
+                AccountConfigView(self._build_account(old_settings), cluster)
+                if not creating and old_settings is not _NO_OLD_SETTINGS
+                else None
+            ),
+            changed_sections=changed_sections,
+            creating=creating,
+        )
+        for validator in validators:
+            validator.validate(context)
+        return account
 
     def _publish(
         self,
         scope: ConfigScope,
-        override: Optional[dict],
+        persisted_settings: Optional[dict],
+        candidate: Any,
         *,
         reason: ConfigChangeReason,
     ) -> ConfigChangeEvent:
-        """Swap in the new object for a scope and return the change event.
-
-        Cluster publish swaps the singleton pointer; account publish replaces the
-        cache entry. Either way business code only ever sees a fully-built object,
-        never a partially-mutated one.
-        """
+        """Swap an already-built candidate into publication state."""
         if scope.kind is ScopeKind.CLUSTER:
+            if candidate is None:
+                raise ValueError("cluster publication requires a candidate")
             old = self._get_config()
-            new = self._build_config(self._base_config, override or {})
-            self._set_config(new)
-            self._overrides[scope] = override
+            self._set_config(candidate)
+            self._persisted_settings[scope] = persisted_settings
             return ConfigChangeEvent(
                 scope=scope,
-                changed_sections=diff_sections(old, new),
+                changed_sections=diff_sections(old, candidate),
                 old_config=old,
-                new_config=new,
+                new_config=candidate,
                 reason=reason,
             )
         assert scope.key is not None
         account_id = scope.key
         old_entry = self._accounts.get(account_id)
         old_config = old_entry.config if old_entry is not None else None
-        new_config = self._build_account(override)
-        self._accounts[account_id] = _AccountEntry(
-            config=new_config,
-            last_access=(old_entry.last_access if old_entry else time.monotonic()),
-        )
-        self._overrides[scope] = override
-        return self._account_event(account_id, old_config, new_config, reason=reason)
+        if candidate is None:
+            self._accounts.pop(account_id, None)
+            self._persisted_settings.pop(scope, None)
+        else:
+            self._accounts[account_id] = _AccountEntry(
+                config=candidate,
+                last_access=(old_entry.last_access if old_entry else time.monotonic()),
+            )
+            self._persisted_settings[scope] = persisted_settings
+        return self._account_event(account_id, old_config, candidate, reason=reason)
 
     def _account_event(
         self,
@@ -494,7 +651,7 @@ class RuntimeConfigManager(Generic[C, A]):
         """Reload cluster + hot accounts once, publishing any observed change.
 
         Every active scope is reloaded and diffed against the last published
-        override (``_refresh_scope``); the manager owns change detection, so the
+        settings document (``_refresh_scope``); the manager owns change detection, so the
         source stays stateless. Cold accounts (idle > TTL) are evicted and stop
         being reloaded. On load or publish failure the last effective value is
         kept, and the next refresh retries the active scope.
@@ -523,16 +680,26 @@ class RuntimeConfigManager(Generic[C, A]):
         reason: ConfigChangeReason,
     ) -> None:
         async with self._lock_for(scope):
-            override = await self._source.load(scope)
-            if scope in self._overrides and self._overrides[scope] == override:
+            persisted_settings = await self._source.load(scope)
+            if (
+                scope in self._persisted_settings
+                and self._persisted_settings[scope] == persisted_settings
+            ):
                 return
+            candidate = self._build_candidate(
+                scope,
+                persisted_settings,
+                changed_sections=None,
+                old_settings=_NO_OLD_SETTINGS,
+                creating=False,
+            )
             async with self._publish_lock:
                 if scope.kind is ScopeKind.ACCOUNT:
                     assert scope.key is not None
                     if scope.key not in self._accounts:
                         # A refresh must not resurrect an evicted/never-loaded account.
                         return
-                event = self._publish(scope, override, reason=reason)
+                event = self._publish(scope, persisted_settings, candidate, reason=reason)
         await self._notify(event)
 
     def _evict_cold_accounts(self) -> list[ConfigChangeEvent]:
@@ -545,7 +712,7 @@ class RuntimeConfigManager(Generic[C, A]):
         events: list[ConfigChangeEvent] = []
         for account_id in cold:
             entry = self._accounts.pop(account_id)
-            self._overrides.pop(ConfigScope.account(account_id), None)
+            self._persisted_settings.pop(ConfigScope.account(account_id), None)
             events.append(
                 self._account_event(
                     account_id,

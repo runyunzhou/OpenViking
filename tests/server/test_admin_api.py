@@ -19,6 +19,8 @@ from fastapi import FastAPI
 from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse
 
+from openviking.config.binding import manager_over_source
+from openviking.config.source import MemoryConfigSource
 from openviking.pyagfs.exceptions import AGFSNotFoundError
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.app import create_app
@@ -132,6 +134,7 @@ class _FakeService:
     def __init__(self):
         self.viking_fs = _FakeVikingFS()
         self.sessions = self
+        self.runtime_config_manager = manager_over_source(MemoryConfigSource())
 
     async def get_agent_evolution_enabled(self, account_id):
         del account_id
@@ -185,6 +188,7 @@ def _build_lightweight_admin_test_app() -> FastAPI:
 @pytest_asyncio.fixture(scope="function")
 async def lightweight_admin_app(monkeypatch):
     app = _build_lightweight_admin_test_app()
+    await app.state.fake_service.runtime_config_manager.initialize()
     await app.state.api_key_manager.load()
     return app
 
@@ -1466,7 +1470,9 @@ async def test_account_memory_templates_commit_keeps_snapshot_through_file_write
 
         return Mock(run=run)
 
-    compressor = SessionCompressorV3(vikingdb=None)
+    vlm = Mock()
+    resolver = Mock(get_vlm=AsyncMock(return_value=vlm))
+    compressor = SessionCompressorV3(vikingdb=None, vlm_resolver=resolver)
     monkeypatch.setattr(compressor, "_get_or_create_react", orchestrator)
     try:
         await compressor._extract_user_memories(
@@ -1476,6 +1482,7 @@ async def test_account_memory_templates_commit_keeps_snapshot_through_file_write
         )
     finally:
         await updater.close()
+    resolver.get_vlm.assert_awaited_once_with(account_id)
     assert initialized == ["soul.md"]
     content = MemoryFileUtils.read(fs.files[uri], uri=uri).content
     assert "# OLD_TEMPLATE" in content and "Business fact" in content
@@ -1641,12 +1648,39 @@ async def test_account_memory_templates_corrupt_storage_is_not_overwritten(
         assert fs.agfs._files == original
 
 
-async def test_create_account(admin_client: httpx.AsyncClient, admin_service: OpenVikingService):
+@pytest.mark.parametrize("settings", [None, {
+    "embedding": {"max_retries": 5},
+    "vectordb": {
+        "backend": "vikingdb",
+        "name": "account_context",
+        "index_name": "default",
+        "dimension": 1024,
+        "vikingdb": {"host": "https://account.invalid"},
+    },
+}])
+async def test_create_account(
+    admin_client: httpx.AsyncClient, admin_service: OpenVikingService, settings, monkeypatch
+):
     """ROOT can create an account with first admin."""
+    adapter = Mock(mode="vikingdb", USE_CONTENT_FIELD=True)
+    adapter.get.return_value = []
+    adapter.get_collection.return_value.get_meta_data.return_value = {
+        "Fields": [{"FieldName": name} for name in (
+            "id", "uri", "account_id", "context_type", "abstract", "level",
+            "user", "agent", "vector", "sparse_vector", "created_at", "updated_at",
+        )]
+    }
+    adapter.upsert.side_effect = lambda rows: [row["id"] for row in rows]
+    factory = Mock(return_value=adapter)
+    if settings:
+        monkeypatch.setattr(
+            "openviking.storage.viking_vector_index_backend.create_collection_adapter",
+            factory,
+        )
     acct = _uid()
     resp = await admin_client.post(
         "/api/v1/admin/accounts",
-        json={"account_id": acct, "admin_user_id": "alice"},
+        json={"account_id": acct, "admin_user_id": "alice", "settings": settings},
         headers=root_headers(),
     )
     assert resp.status_code == 200
@@ -1658,6 +1692,38 @@ async def test_create_account(admin_client: httpx.AsyncClient, admin_service: Op
     ctx = RequestContext(user=UserIdentifier(acct, "alice"), role=Role.ADMIN)
     assert await admin_service.viking_fs.abstract("viking://resources", ctx=ctx)
     assert await admin_service.viking_fs.abstract("viking://user", ctx=ctx)
+    if settings:
+        stored = await admin_client.get(
+            f"/api/v1/admin/accounts/{acct}/configuration", headers=root_headers()
+        )
+        assert stored.json()["result"]["settings"] == settings
+        effective = await admin_service.vector_config_resolver.resolve(acct)
+        assert effective.dedicated_vectordb
+        assert effective.vectordb.name == "account_context"
+        assert effective.embedding.max_retries == 5
+        factory.assert_called_once()
+        assert factory.call_args.args[0].vikingdb.host == "https://account.invalid"
+        adapter.get.assert_called()
+        adapter.create_collection.assert_not_called()
+
+
+async def test_create_account_rejects_incompatible_vectors_without_identity(admin_client, admin_app):
+    acct = _uid()
+    response = await admin_client.post(
+        "/api/v1/admin/accounts",
+        json={
+            "account_id": acct,
+            "admin_user_id": "alice",
+            "settings": {"embedding": {"dense": {"dimension": 7}},
+                         "vectordb": {"dimension": 8}},
+        },
+        headers=root_headers(),
+    )
+    assert response.status_code == 400, response.text
+    assert not any(
+        account["account_id"] == acct
+        for account in admin_app.state.api_key_manager.get_accounts()
+    )
 
 
 async def test_create_account_rolls_back_when_runtime_config_write_fails(
@@ -2161,8 +2227,8 @@ async def test_delete_account(
         row[filter.field] == filter.value for row in indexed_rows.values()
     )
     vectors = admin_service.viking_fs.vector_store
-    vectors._root_backend = _SingleAccountBackend(
-        vectors._config, bound_account_id=None, shared_adapter=adapter
+    vectors._resolved_backends[acct] = _SingleAccountBackend(
+        vectors._config, bound_account_id=acct, shared_adapter=adapter
     )
     original_delete = vectors.delete_account_data
     started, release = asyncio.Event(), asyncio.Event()

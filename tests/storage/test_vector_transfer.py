@@ -22,12 +22,12 @@ from openviking.storage.vectordb_adapters.vikingdb_private_adapter import (
 )
 from openviking.storage.viking_vector_index_backend import (
     VectorTransferRollbackError,
-    VikingVectorIndexBackend,
     _SingleAccountBackend,
 )
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from tests.storage.vector_test_utils import ConfiguredVectorBackend as VikingVectorIndexBackend
 
 
 class _EnabledAclConfig:
@@ -76,7 +76,7 @@ class _MemoryTransferBackend(VikingVectorIndexBackend):
     def mode(self) -> str:
         return self.backend_mode
 
-    def _get_backend_for_context(self, ctx):
+    async def _get_backend_for_context(self, ctx):
         del ctx
         return SimpleNamespace(strict_query=self._query)
 
@@ -563,16 +563,15 @@ async def test_legacy_transfer_reads_use_private_adapter_query_and_fetch(monkeyp
     )
     adapter._collection = Collection(collection)
     account_backend = _SingleAccountBackend(VectorDBBackendConfig(), "acct", shared_adapter=adapter)
-    monkeypatch.setattr(backend, "_get_backend_for_context", lambda ctx: account_backend)
+    monkeypatch.setattr(
+        backend, "_get_backend_for_context", AsyncMock(return_value=account_backend)
+    )
     monkeypatch.setattr(
         backend,
         "_strict_transfer_get",
         VikingVectorIndexBackend._strict_transfer_get.__get__(backend),
     )
-    monkeypatch.setattr(
-        "openviking.storage.vectordb_adapters.base.get_openviking_config",
-        lambda: SimpleNamespace(embedding=SimpleNamespace(dimension=2)),
-    )
+    adapter._dimension = 2
     paths = []
 
     def data_post(path, data):

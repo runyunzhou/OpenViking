@@ -13,12 +13,21 @@ from __future__ import annotations
 from typing import Optional
 
 from openviking.config.account_config import AccountConfig
+from openviking.config.account_vector import AccountEmbeddingCredential
 from openviking.config.assembly import build_config_source, resolve_config_source_settings
-from openviking.config.manager import RuntimeConfigManager
+from openviking.config.manager import AccountCandidateValidator, RuntimeConfigManager
 from openviking.config.merge import apply_three_state_patch
 from openviking.config.source.base import ConfigSource
 from openviking.config.source.file_source import FileConfigSource
-from openviking.config.validate import validate_patch
+from openviking.config.validate import (
+    ConfigPatchError,
+    filter_runtime_fields,
+    validate_patch,
+)
+from openviking.config.vector import (
+    MODEL_SECTIONS,
+    validate_account_vector_candidate,
+)
 from openviking.pyagfs import AsyncAGFSClient
 from openviking_cli.utils.config import get_openviking_config, set_openviking_config
 from openviking_cli.utils.config.config_utils import warn_unknown_config_fields
@@ -27,7 +36,7 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# The concrete manager type this module hands back.
+# The concrete manager type this module hands back; business rules are hooks.
 OpenVikingRuntimeConfigManager = RuntimeConfigManager[OpenVikingConfig, AccountConfig]
 
 
@@ -45,14 +54,15 @@ def _build_cluster(old: OpenVikingConfig, override: dict) -> OpenVikingConfig:
     stored override may contain top-level fields from a newer binary, so that
     runtime-only rebuild intentionally ignores those fields.
     """
+    runtime_override = filter_runtime_fields(OpenVikingConfig, override or {})
     merged = apply_three_state_patch(
         old.model_dump(by_alias=True, exclude_unset=True),
-        override or {},
+        runtime_override,
     )
     return OpenVikingConfig.from_dict(merged)
 
 
-def _build_account(override: Optional[dict]) -> AccountConfig:
+def _build_account(settings: Optional[dict]) -> AccountConfig:
     """Construct (and thereby validate) an account config from its sparse override.
 
     A persisted account override may carry fields this binary does not declare --
@@ -60,15 +70,46 @@ def _build_account(override: Optional[dict]) -> AccountConfig:
     stay ignored so legacy settings keep loading, and the warning keeps the drop
     visible. Only field names are logged, never values.
     """
-    sparse = override or {}
+    sparse = settings or {}
     warn_unknown_config_fields(data=sparse, model=AccountConfig, logger=logger)
-    return AccountConfig.model_validate(sparse)
+    return AccountConfig.model_validate(filter_runtime_fields(AccountConfig, settings))
 
 
 def _validate_request(patch: dict, is_account: bool, creating: bool) -> None:
     """Structural gate: which model's RuntimeField surface a patch may touch."""
     model = AccountConfig if is_account else OpenVikingConfig
+    if is_account and isinstance(patch, dict) and isinstance(patch.get("vectordb"), dict):
+        patch = {**patch, "vectordb": dict(patch["vectordb"])}
+        if "project" in patch["vectordb"]:
+            patch["vectordb"]["project_name"] = patch["vectordb"].pop("project")
     validate_patch(model, patch, creating=creating)
+    if is_account:
+        _validate_account_credential_fields(patch)
+
+
+def _validate_account_credential_fields(patch: dict) -> None:
+    """Reject unknown credential keys in this request, not in stored settings."""
+    embedding = patch.get("embedding")
+    if not isinstance(embedding, dict):
+        return
+    allowed = set(AccountEmbeddingCredential.model_fields)
+    for mode in MODEL_SECTIONS:
+        section = embedding.get(mode)
+        if not isinstance(section, dict):
+            continue
+        credentials = section.get("credentials")
+        if not isinstance(credentials, list):
+            continue
+        for index, credential in enumerate(credentials):
+            if not isinstance(credential, dict):
+                continue
+            unknown = set(credential) - allowed
+            if unknown:
+                field = sorted(unknown)[0]
+                raise ConfigPatchError(
+                    "field is not modifiable by the config API",
+                    path=("embedding", mode, "credentials", str(index), field),
+                )
 
 
 def build_runtime_config_manager(
@@ -104,7 +145,7 @@ def manager_over_source(
     ``base_config`` is captured from the current singleton at construction time.
     """
     base = base_config or get_openviking_config()
-    return RuntimeConfigManager(
+    return OpenVikingRuntimeConfigManager(
         source,
         base_config=base,
         get_config=get_openviking_config,
@@ -112,4 +153,10 @@ def manager_over_source(
         build_config=_build_cluster,
         build_account=_build_account,
         validate_request=_validate_request,
+        account_candidate_validators=[
+            AccountCandidateValidator(
+                sections=frozenset({"embedding", "vectordb"}),
+                validate=validate_account_vector_candidate,
+            )
+        ],
     )

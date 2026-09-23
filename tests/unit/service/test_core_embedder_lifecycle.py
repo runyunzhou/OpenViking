@@ -35,6 +35,7 @@ async def test_service_closes_embedder_after_workers_and_storage_stop(monkeypatc
     service = OpenVikingService.__new__(OpenVikingService)
     service._config = SimpleNamespace(vlm=SimpleNamespace(close=lambda: events.append("vlm")))
     service._runtime_config_manager = None
+    service._vlm_resolver = SimpleNamespace(close=lambda: events.append("resolver"))
     service._resource_service = _ResourceService()
     service._watch_scheduler = None
     service._session_auto_commit_scheduler = None
@@ -50,6 +51,7 @@ async def test_service_closes_embedder_after_workers_and_storage_stop(monkeypatc
     assert events == [
         "background",
         "queue",
+        "resolver",
         "vlm",
         "storage-mark",
         "storage-close",

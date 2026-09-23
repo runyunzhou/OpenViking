@@ -39,6 +39,22 @@ def test_pipeline_initialization():
     assert pipeline._client is None
 
 
+def test_pipeline_llm_uses_config_path(tmp_path):
+    from openviking_cli.utils.config.open_viking_config import OpenVikingConfigSingleton
+
+    config_path = tmp_path / "ov.conf"
+    config_path.write_text(
+        json.dumps({"vlm": {"model": "path-model", "provider": "litellm"}}),
+        encoding="utf-8",
+    )
+    OpenVikingConfigSingleton.reset_instance()
+    try:
+        pipeline = RAGQueryPipeline(config_path=str(config_path))
+        assert pipeline._get_llm().model == "path-model"
+    finally:
+        OpenVikingConfigSingleton.reset_instance()
+
+
 def test_async_record_writer_drains_records_before_stop_sentinel():
     writer = AsyncRecordWriter.__new__(AsyncRecordWriter)
     writer._queue = queue.Queue()
@@ -59,7 +75,7 @@ def test_async_record_writer_drains_records_before_stop_sentinel():
 
 def test_pipeline_query_consumes_http_result_and_generates_answer():
     class Client:
-        def search(self, **kwargs):
+        def search(self, query, **kwargs):
             return {
                 "memories": [
                     {

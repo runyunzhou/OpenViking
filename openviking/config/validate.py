@@ -25,6 +25,7 @@ the request shape, not the semantic validity of individual values.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import types
 import typing
@@ -35,6 +36,7 @@ from pydantic import BaseModel
 from openviking_cli.utils.config.runtime_field import (
     collect_frozen_paths,
     collect_runtime_field_paths,
+    is_runtime_field,
 )
 
 
@@ -76,6 +78,42 @@ def validate_patch(
     _walk(patch, (), allowed, frozen, model, creating)
     if not creating:
         _reject_frozen(patch, (), frozen)
+
+
+def filter_runtime_fields(model: type[BaseModel], settings: dict[str, Any] | None) -> dict:
+    """Build the effective runtime document from a persisted settings document.
+
+    This is intentionally different from :func:`validate_patch`. A ConfigSource
+    document is trusted persisted state, not a post-creation write request, so
+    ``dynamic=False`` RuntimeFields must still be loaded on every node. The
+    filter only prevents known ordinary ``Field`` values and fields unknown to
+    this binary from becoming effective. The raw document remains in the
+    source for forward-compatible round trips.
+    """
+    if not isinstance(settings, dict):
+        return {}
+
+    def walk(cls: type[Any], node: dict[str, Any]) -> dict:
+        fields = _model_fields(cls)
+        aliases = {
+            field.alias: name
+            for name, field in fields.items()
+            if getattr(field, "alias", None)
+        }
+        result: dict = {}
+        for key, value in node.items():
+            name = key if key in fields else aliases.get(key)
+            field = fields.get(name)
+            if field is None or not is_runtime_field(field):
+                continue
+            nested = _unwrap_model(_field_annotation(field))
+            if nested is not None and isinstance(value, dict):
+                result[key] = walk(nested, value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
+
+    return walk(model, settings)
 
 
 def _reject_frozen(

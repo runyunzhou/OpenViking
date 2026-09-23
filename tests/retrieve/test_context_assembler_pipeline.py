@@ -48,7 +48,27 @@ class _FakeFindResult:
         self.skills = skills or []
 
 
-def _service(*, hits, bodies, session=None, abstracts=None):
+class _FakeVLMResolver:
+    async def get_query_planner(self, account_id):
+        del account_id
+        return object()
+
+    async def has_dedicated_query_planner(self, account_id):
+        del account_id
+        return True
+
+
+_DEFAULT_VLM_RESOLVER = _FakeVLMResolver()
+
+
+def _service(
+    *,
+    hits,
+    bodies,
+    session=None,
+    abstracts=None,
+    vlm_resolver=_DEFAULT_VLM_RESOLVER,
+):
     abstracts = abstracts or {}
 
     async def fake_find(**kwargs):
@@ -75,6 +95,7 @@ def _service(*, hits, bodies, session=None, abstracts=None):
         fs=SimpleNamespace(read=fake_read, abstract=fake_abstract),
         sessions=SimpleNamespace(get=fake_get),
         viking_fs=None,
+        vlm_resolver=vlm_resolver,
     )
 
 
@@ -151,8 +172,8 @@ async def test_assembly_returns_readable_entries_within_budget():
 async def test_query_expansion_fans_out_planned_queries(monkeypatch):
     queries_seen = []
 
-    async def fake_expand(*, query, session, mode, timeout_s=None):
-        del session, mode, timeout_s
+    async def fake_expand(*, query, session, mode, **kwargs):
+        del session, mode, kwargs
         return [query, "expanded query"], "used"
 
     async def fake_find(**kwargs):
@@ -171,6 +192,7 @@ async def test_query_expansion_fans_out_planned_queries(monkeypatch):
         fs=SimpleNamespace(read=None),
         sessions=SimpleNamespace(get=fake_get),
         viking_fs=None,
+        vlm_resolver=_DEFAULT_VLM_RESOLVER,
     )
 
     result = await assemble_context(
@@ -410,17 +432,18 @@ async def test_rewrite_kernel_distinguishes_no_relevant_from_invalid_output(monk
 
     config = SimpleNamespace(
         retrieval=SimpleNamespace(recall_rewrite_timeout_s=1),
-        get_query_planner=lambda: _Planner(),
     )
     monkeypatch.setattr(rewrite_module, "get_openviking_config", lambda: config)
     monkeypatch.setattr(rewrite_module, "render_prompt", lambda *args, **kwargs: "rewrite prompt")
 
     statuses = []
+    planner = _Planner()
     for _ in range(3):
         digest, status, _ = await rewrite_module.rewrite_context(
             query="q",
             rendered='<memory uri="viking://a">body</memory>',
             valid_uris=["viking://a"],
+            planner=planner,
         )
         assert digest == ""
         statuses.append(status)
@@ -446,6 +469,76 @@ async def test_rewrite_receives_only_served_uris(monkeypatch):
 
     assert result.digest.startswith("OpenViking memory digest:")
     assert result.stats["rewrite"] == "ok"
+
+
+async def test_account_query_planner_routes_expansion_and_rewrite(monkeypatch):
+    account_id = _ctx().account_id
+    planner = object()
+    routed_accounts = []
+
+    async def fake_expand(*, query, session, mode, planner):
+        del session, mode
+        assert planner is not None
+        routed_accounts.append(("expand", planner))
+        return [query], "used"
+
+    class FakeResolver:
+        async def get_query_planner(self, requested_account_id):
+            routed_accounts.append(("rewrite", requested_account_id))
+            return planner
+
+        async def has_dedicated_query_planner(self, requested_account_id):
+            del requested_account_id
+            return True
+
+    resolver = FakeResolver()
+
+    async def fake_rewrite(**kwargs):
+        assert kwargs["planner"] is planner
+        return "", "ok", None
+
+    monkeypatch.setattr(pipeline_module, "expand_queries", fake_expand)
+    monkeypatch.setattr(pipeline_module, "server_rewrite_enabled", lambda mode: True)
+    monkeypatch.setattr(pipeline_module, "rewrite_context", fake_rewrite)
+
+    hits = [{"uri": f"{USER_ROOT}/memories/events/a.md", "score": 0.6, "abstract": "abs"}]
+    await assemble_context(
+        service=_service(hits=hits, bodies={}, session=_fake_session(), vlm_resolver=resolver),
+        ctx=_ctx(),
+        params=AssembleParams(
+            query="account routed",
+            rewrite=True,
+            query_expansion="auto",
+            session_id="session-1",
+        ),
+    )
+
+    assert routed_accounts == [
+        ("rewrite", account_id),
+        ("expand", planner),
+        ("rewrite", account_id),
+    ]
+
+
+async def test_account_rewrite_planner_lookup_failure_keeps_context(monkeypatch):
+    class FailingResolver:
+        async def get_query_planner(self, _account_id):
+            raise RuntimeError("config source unavailable")
+
+        async def has_dedicated_query_planner(self, _account_id):
+            return True
+
+    monkeypatch.setattr(pipeline_module, "server_rewrite_enabled", lambda mode: True)
+
+    hits = [{"uri": f"{USER_ROOT}/memories/events/a.md", "score": 0.6, "abstract": "abs"}]
+    result = await assemble_context(
+        service=_service(hits=hits, bodies={}, vlm_resolver=FailingResolver()),
+        ctx=_ctx(),
+        params=AssembleParams(query="rewrite me", rewrite=True),
+    )
+
+    assert result.rendered.count("<memory ") == 1
+    assert result.stats["rewrite"] == "failed"
 
 
 async def test_only_candidates_that_can_deepen_are_read():

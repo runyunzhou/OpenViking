@@ -112,6 +112,25 @@ class FakeVikingDB:
         return True
 
 
+def test_patch_merge_optimizer_preserves_positional_constructor_order():
+    viking_fs = object()
+    vlm = object()
+    registry = object()
+
+    optimizer = PatchMergePolicyOptimizer(
+        viking_fs,
+        vlm,
+        "session_skills",
+        registry,
+    )
+
+    assert optimizer.viking_fs is viking_fs
+    assert optimizer.vlm is vlm
+    assert optimizer.memory_type == "session_skills"
+    assert optimizer.memory_registry is registry
+    assert optimizer.vlm_resolver is None
+
+
 def _experience_set() -> ExperienceSet:
     return ExperienceSet(
         root_uri="viking://user/u/memories/experiences",

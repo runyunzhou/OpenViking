@@ -10,7 +10,9 @@ import pytest
 from openviking.models.embedder.base import (
     EmbedderBase,
     EmbedResult,
+    QueryEmbeddingCache,
     embed_compat,
+    query_embed_cache_scope,
     query_embed_cache_var,
 )
 
@@ -42,7 +44,7 @@ class CountingEmbedder(EmbedderBase):
 
 async def test_embed_compat_reuses_same_query_text_within_request():
     embedder = CountingEmbedder()
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     first = await embed_compat(embedder, "hello", is_query=True)
     second = await embed_compat(embedder, "hello", is_query=True)
@@ -53,7 +55,7 @@ async def test_embed_compat_reuses_same_query_text_within_request():
 
 async def test_embed_compat_caches_distinct_texts_separately():
     embedder = CountingEmbedder()
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     await embed_compat(embedder, "alpha", is_query=True)
     await embed_compat(embedder, "beta", is_query=True)
@@ -66,7 +68,7 @@ async def test_embed_compat_dedupes_concurrent_same_text():
     # copy the request context, so the cache dict must be shared by reference
     # and the first find's in-flight embed is awaited by every sibling.
     embedder = CountingEmbedder()
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     async def one():
         return await embed_compat(embedder, "shared", is_query=True)
@@ -80,7 +82,7 @@ async def test_embed_compat_dedupes_concurrent_same_text():
 
 async def test_embed_compat_never_caches_resource_embeds():
     embedder = CountingEmbedder()
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     await embed_compat(embedder, "hello", is_query=False)
     await embed_compat(embedder, "hello", is_query=False)
@@ -102,7 +104,7 @@ async def test_embed_compat_does_not_cache_outside_request_scope():
 async def test_embed_compat_retries_after_a_failed_embed():
     embedder = CountingEmbedder()
     embedder.fail_next = 1
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     failed = False
     try:
@@ -117,18 +119,14 @@ async def test_embed_compat_retries_after_a_failed_embed():
 
 
 async def test_query_embed_cache_scope_resets_after_exit():
-    from openviking.models.embedder.base import query_embed_cache_scope
-
-    with query_embed_cache_scope():
+    async with query_embed_cache_scope():
         assert query_embed_cache_var.get() is not None
     assert query_embed_cache_var.get() is None
 
 
 async def test_query_embed_cache_scope_resets_on_exception():
-    from openviking.models.embedder.base import query_embed_cache_scope
-
     with pytest.raises(RuntimeError):
-        with query_embed_cache_scope():
+        async with query_embed_cache_scope():
             raise RuntimeError("boom")
     assert query_embed_cache_var.get() is None
 
@@ -138,7 +136,7 @@ async def test_embedders_with_same_model_name_do_not_share_entries():
     # model_name from serving each other's vectors.
     first = CountingEmbedder(model_name="shared-name")
     second = CountingEmbedder(model_name="shared-name")
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     await embed_compat(first, "same-text", is_query=True)
     await embed_compat(second, "same-text", is_query=True)
@@ -147,25 +145,21 @@ async def test_embedders_with_same_model_name_do_not_share_entries():
     assert second.calls == ["same-text"]
 
 
-async def test_waiter_cancellation_leaves_shared_embed_running():
-    # Cancelling a waiter must not cancel the shared in-flight embed (shield),
-    # and the cache entry must stay usable for later waiters.
+async def test_one_waiter_cancellation_leaves_shared_embed_running():
+    # One cancelled sibling must not affect another waiter on the same query.
     embedder = CountingEmbedder(delay=0.1)
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     waiter = asyncio.create_task(embed_compat(embedder, "shared", is_query=True))
-    await asyncio.sleep(0.01)  # let the waiter create and await the shared task
+    await asyncio.sleep(0.01)
+    survivor = asyncio.create_task(embed_compat(embedder, "shared", is_query=True))
     waiter.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
 
-    # The shared embed survived the waiter cancellation and completed.
-    await asyncio.sleep(0.15)
+    result = await survivor
     assert embedder.calls == ["shared"]
-
-    result = await embed_compat(embedder, "shared", is_query=True)
     assert result.dense_vector == [1.0]
-    assert embedder.calls == ["shared"]  # served from cache, no second embed
 
 
 async def test_cancelled_shared_embed_is_evicted_and_retried():
@@ -173,13 +167,13 @@ async def test_cancelled_shared_embed_is_evicted_and_retried():
     # cancellation, the poisoned key must be evicted, and the next embed of the
     # same text must start a fresh task instead of awaiting the dead one.
     embedder = CountingEmbedder(delay=0.1)
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     waiter = asyncio.create_task(embed_compat(embedder, "shared", is_query=True))
     await asyncio.sleep(0.01)  # let the waiter create and await the shared task
     cache = query_embed_cache_var.get()
     assert cache is not None
-    next(iter(cache.values())).cancel()
+    next(iter(cache.values())).task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await waiter
     assert cache == {}
@@ -189,13 +183,11 @@ async def test_cancelled_shared_embed_is_evicted_and_retried():
     assert embedder.calls == ["shared", "shared"]
 
 
-async def test_waiter_cancelled_then_shared_embed_failure_evicts_entry():
-    # The last waiter is cancelled while the shared embed still runs; when that
-    # orphaned embed then fails, the stale entry must be evicted so the next
-    # embed of the same text starts fresh instead of replaying the old failure.
+async def test_last_waiter_cancellation_stops_shared_embed_and_evicts_entry():
+    # The cache owns shared work, so cancelling its last waiter also cancels
+    # that work instead of leaving an orphaned API call in the request scope.
     embedder = CountingEmbedder(delay=0.1)
-    embedder.fail_next = 1
-    query_embed_cache_var.set({})
+    query_embed_cache_var.set(QueryEmbeddingCache())
 
     waiter = asyncio.create_task(embed_compat(embedder, "shared", is_query=True))
     await asyncio.sleep(0.01)  # let the waiter create and await the shared task
@@ -203,9 +195,7 @@ async def test_waiter_cancelled_then_shared_embed_failure_evicts_entry():
     with pytest.raises(asyncio.CancelledError):
         await waiter
 
-    # Let the orphaned shared embed run to failure; the done callback must
-    # have evicted the failed entry.
-    await asyncio.sleep(0.2)
+    await asyncio.sleep(0)
     assert query_embed_cache_var.get() == {}
 
     result = await embed_compat(embedder, "shared", is_query=True)

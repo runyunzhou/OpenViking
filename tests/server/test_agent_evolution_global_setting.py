@@ -385,6 +385,105 @@ async def test_account_configuration_exposes_three_state_layer(settings_http):
     }
 
 
+def test_account_vlm_configuration_is_root_only():
+    from openviking.server.routers.admin import (
+        _authorize_account_config_patch,
+        _visible_account_config,
+    )
+    from openviking_cli.exceptions import PermissionDeniedError
+
+    admin = RequestContext(
+        user=UserIdentifier("default", "admin"),
+        role=Role.ADMIN,
+    )
+    root = RequestContext(
+        user=UserIdentifier("default", "root"),
+        role=Role.ROOT,
+    )
+    settings = {
+        "github": {"token": "github-token"},
+        "vlm": {"model": "account-vlm"},
+        "query_planner": {"model": "account-planner"},
+        "embedding": {"max_retries": 5},
+        "vectordb": {"name": "account_vectors"},
+    }
+
+    with pytest.raises(PermissionDeniedError, match="Only ROOT"):
+        _authorize_account_config_patch(admin, settings)
+    _authorize_account_config_patch(root, settings)
+    assert _visible_account_config(admin, settings) == {
+        "github": {"token": "github-token"}
+    }
+    assert _visible_account_config(root, settings) == settings
+
+
+async def test_account_embedding_http_patch_requires_complete_binding(settings_http):
+    client, service = settings_http
+    await service.runtime_config_manager.patch_account(
+        "default",
+        {"embedding": {"dense": {
+            "model": "test-embedder",
+            "dimension": 1024,
+            "credentials": [{
+                "provider": "openai",
+                "api_key": "initial-key",
+            }],
+        }}},
+        creating=True,
+    )
+    url = "/api/v1/admin/accounts/default/configuration"
+    updated = await client.patch(url, json={"settings": {"embedding": {
+        "dense": {"credentials": [{
+            "provider": "openai", "model": "new-deployment", "api_key": "new-key",
+        }]},
+        "max_retries": 5,
+    }}})
+    assert updated.status_code == 200, updated.text
+    expected = {"embedding": {
+        "dense": {
+            "model": "test-embedder",
+            "dimension": 1024,
+            "credentials": [{
+                "provider": "openai", "model": "new-deployment", "api_key": "new-key",
+            }],
+        },
+        "max_retries": 5,
+    }}
+    assert updated.json()["result"]["settings"] == expected
+    for patch in (
+        {"vectordb": {}}, {"vectordb": None},
+        {"embedding": {"dense": {"model": "other-model"}}},
+        {"embedding": {"dense": {"dimension": 1024}}},
+        {"embedding": {"dense": {"credentials": [{"provider": "azure", "api_key": "bad"}]}}},
+    ):
+        rejected = await client.patch(url, json={"settings": patch})
+        assert rejected.status_code == 400, rejected.text
+        assert (await client.get(url)).json()["result"]["settings"] == expected
+
+
+@pytest.mark.parametrize("section", ["embedding", "vectordb"])
+async def test_account_vector_admin_denied_before_reading_config(settings_http, section):
+    from openviking.server.auth import get_request_context
+
+    client, service = settings_http
+    app = client._transport.app
+    admin = RequestContext(user=UserIdentifier("default", "admin"), role=Role.ADMIN)
+    app.dependency_overrides[get_request_context] = lambda: admin
+    manager = service.runtime_config_manager
+    manager.patch_account = AsyncMock(side_effect=AssertionError("must authorize first"))
+    manager.get_settings = AsyncMock(return_value={
+        "embedding": {"max_retries": 5}, "vectordb": {"name": "secret"}, "github": {"token": "x"}
+    })
+    url = "/api/v1/admin/accounts/default/configuration"
+    denied = await client.patch(url, json={"settings": {section: {"invalid": True}}})
+    assert denied.status_code == 403, denied.text
+    manager.patch_account.assert_not_called()
+    manager.get_settings.assert_not_called()
+    visible = await client.get(url)
+    assert visible.status_code == 200, visible.text
+    assert visible.json()["result"]["settings"] == {"github": {"token": "x"}}
+
+
 async def test_cluster_agent_evolution_override_is_account_fallback(settings_http):
     client, service = settings_http
 

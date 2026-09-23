@@ -1,6 +1,8 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
+import pytest
+
 from openviking.storage.acl import AclSpec, AclUpdate
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.utils.ingest_options import IngestOptions
@@ -48,6 +50,7 @@ def test_semantic_msg_reads_legacy_search_tag_fields():
         {
             "uri": "viking://resources/demo",
             "context_type": "resource",
+            "account_id": "default",
             "search_tags": ["team=search"],
             "search_tag_mode": "append",
         }
@@ -58,6 +61,16 @@ def test_semantic_msg_reads_legacy_search_tag_fields():
         search_tag_mode="append",
     )
     assert msg.aggregate_directory is True
+
+
+def test_semantic_msg_requires_account_id_on_deserialization():
+    with pytest.raises(ValueError, match="account_id"):
+        SemanticMsg.from_dict(
+            {
+                "uri": "viking://resources/demo",
+                "context_type": "resource",
+            }
+        )
 
 
 def test_semantic_msg_round_trips_deferred_aggregation_flag():

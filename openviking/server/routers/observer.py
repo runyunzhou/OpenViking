@@ -66,20 +66,20 @@ async def observer_vikingdb(
 ):
     """Get VikingDB status."""
     service = get_service()
-    component = service.debug.observer.get_vikingdb_status(ctx=ctx, format=format)
+    component = await service.debug.observer.account_vikingdb(ctx, format=format)
     return Response(status="ok", result=_component_to_dict(component))
 
 
 @router.get("/models")
 async def observer_models(
-    _ctx: RequestContext = Depends(get_request_context),
+    ctx: RequestContext = Depends(get_request_context),
     format: Literal["table", "json"] = Query(
         "table", description="Observer status representation format"
     ),
 ):
     """Get models status (VLM, Embedding, Rerank)."""
     service = get_service()
-    component = service.debug.observer.get_models_status(format=format)
+    component = await service.debug.observer.account_models(ctx, format=format)
     return Response(status="ok", result=_component_to_dict(component))
 
 

@@ -4,7 +4,7 @@
 Tests for DebugService and ObserverService.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from openviking.service.debug_service import (
     ComponentStatus,
@@ -195,10 +195,10 @@ class TestObserverService:
         assert status.name == "models"
         assert status.is_healthy is True
         assert status.has_errors is False
-        assert status.status == "Models Status Table"
+        assert status.status == "Scope: Cluster\nModels Status Table"
         mock_observer_cls.assert_called_once_with(
             vlm_instance=mock_vlm_instance,
-            embedding_instance=None,
+            embedding_instance=ANY,
             rerank_instance=None,
         )
 

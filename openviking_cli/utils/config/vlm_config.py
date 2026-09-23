@@ -37,6 +37,22 @@ def _reject_stream_config(data: Any, location: str) -> None:
         )
 
 
+def _bind_token_usage_tracker(instance: Any, tracker: Any) -> None:
+    """Bind one Account tracker to all concrete VLM instances in a wrapper."""
+    if instance is None:
+        return
+    if hasattr(instance, "_token_tracker"):
+        instance._token_tracker = tracker
+    if hasattr(instance, "_vlm_instances"):
+        for child in instance._vlm_instances:
+            _bind_token_usage_tracker(child, tracker)
+    else:
+        for name in ("primary", "backup"):
+            child = getattr(instance, name, None)
+            if child is not None:
+                _bind_token_usage_tracker(child, tracker)
+
+
 class VLMCredential(BaseModel):
     """Single VLM credential configuration for multi-credential failover."""
 
@@ -113,7 +129,15 @@ class VLMMediaConfig(BaseModel):
 
 
 class VLMConfig(BaseModel):
-    """VLM configuration, supports multiple provider backends and multi-credential failover."""
+    """VLM configuration with multi-provider and multi-credential failover.
+
+    Compatibility contract: top-level fields added here must describe common
+    runtime behavior that is safe for Account VLM configurations to inherit
+    from Cluster configuration. Fields that select a model service, credential,
+    endpoint, or provider-specific request identity must instead be represented
+    by ``AccountVLMConfig`` (normally ``model`` or ``VLMCredential``) and excluded by
+    ``AccountVLMConfig._ACCOUNT_OWNED_MODEL_SERVICE_FIELDS``.
+    """
 
     backup: Optional["VLMConfig"] = Field(
         default=None, description="Backup VLM configuration for failover (legacy)"
@@ -211,6 +235,7 @@ class VLMConfig(BaseModel):
     )
 
     _vlm_instance: Optional[Any] = None
+    _token_usage_tracker: Any = PrivateAttr(default=None)
     _media_semaphores: weakref.WeakKeyDictionary[
         asyncio.AbstractEventLoop,
         weakref.ReferenceType[asyncio.Semaphore],
@@ -665,7 +690,18 @@ class VLMConfig(BaseModel):
                 else:
                     self._vlm_instance = primary
 
+            if self._token_usage_tracker is not None:
+                _bind_token_usage_tracker(self._vlm_instance, self._token_usage_tracker)
+
         return self._vlm_instance
+
+    def set_token_usage_tracker(self, tracker: Any) -> None:
+        """Bind an externally owned tracker without eagerly creating a client."""
+        if self._token_usage_tracker is tracker:
+            return
+        self._token_usage_tracker = tracker
+        if self._vlm_instance is not None:
+            _bind_token_usage_tracker(self._vlm_instance, tracker)
 
     def close(self) -> None:
         """Close and clear the cached VLM instance."""
@@ -673,6 +709,13 @@ class VLMConfig(BaseModel):
         self._vlm_instance = None
         if instance is not None:
             instance.close()
+
+    def __del__(self) -> None:
+        """Release a lazily-created client when the config is no longer referenced."""
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _build_vlm_config_dict_for_credential(self, credential: VLMCredential) -> Dict[str, Any]:
         """Build VLM instance config dict for a specific credential."""

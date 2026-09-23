@@ -106,6 +106,32 @@ async def test_single_turn_llm_rollout_executor_accepts_custom_prompt_builder():
     assert rollouts[0].messages[1].content == "structured answer"
 
 
+@pytest.mark.asyncio
+async def test_single_turn_rollout_uses_policy_account_before_metadata():
+    routed_accounts = []
+    vlm = FakeVLM()
+
+    class FakeResolver:
+        async def get_vlm(self, account_id):
+            routed_accounts.append(account_id)
+            return vlm
+
+    policy_set = _policy_set()
+    policy_set.request_context = SimpleNamespace(account_id="policy-account")
+
+    await SingleTurnLLMRolloutExecutor(vlm_resolver=FakeResolver()).execute(
+        [_case()],
+        policy_set,
+        ExecutionContext(
+            policy_snapshot_id="snapshot-account",
+            metadata={"account_id": "metadata-account"},
+        ),
+    )
+
+    assert routed_accounts == ["policy-account"]
+    assert len(vlm.calls) == 1
+
+
 def test_default_single_turn_prompt_contains_case_policy_and_rubric():
     prompt = default_single_turn_prompt(
         _case(),
@@ -117,6 +143,20 @@ def test_default_single_turn_prompt_contains_case_policy_and_rubric():
     assert "booking_policy v2 [production]" in prompt
     assert "cancel duplicate booking" in prompt
     assert "verify_duplicate" in prompt
+
+
+def test_single_turn_rollout_executor_preserves_positional_constructor_order():
+    vlm = FakeVLM()
+
+    def build_prompt(case, policy_set, context):
+        return f"{case.name}:{len(policy_set.policies)}:{context.policy_snapshot_id}"
+
+    executor = SingleTurnLLMRolloutExecutor(vlm, build_prompt, False)
+
+    assert executor.vlm is vlm
+    assert executor.prompt_builder is build_prompt
+    assert executor.thinking is False
+    assert executor.vlm_resolver is None
 
 
 def test_dataset_service_policy_set_from_dict_preserves_policies():

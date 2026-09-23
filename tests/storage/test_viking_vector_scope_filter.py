@@ -11,11 +11,11 @@ from openviking.storage.acl import AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
 from openviking.storage.expr import And, Eq, In, Or, PathScope, RawDSL
 from openviking.storage.viking_vector_index_backend import (
-    VikingVectorIndexBackend,
     _SingleAccountBackend,
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from tests.storage.vector_test_utils import ConfiguredVectorBackend as VikingVectorIndexBackend
 
 
 def _ctx(*, role: Role = Role.USER, actor_peer_id: str | None = None) -> RequestContext:
@@ -83,7 +83,7 @@ async def test_search_by_random_passes_runtime_acl_state_to_tenant_filter():
     acl_reader = _AclConfigReader(False)
     backend = object.__new__(VikingVectorIndexBackend)
     backend.acl_manager = AclManager(backend, acl_reader)
-    backend._get_backend_for_context = lambda _ctx: adapter
+    backend._get_backend_for_context = AsyncMock(return_value=adapter)
 
     assert await backend.search_by_random(ctx=ctx) == []
     adapter.search_by_random.assert_awaited_once()

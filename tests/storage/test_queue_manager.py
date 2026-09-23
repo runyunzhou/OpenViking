@@ -48,6 +48,14 @@ def test_queue_concurrency_uses_separate_configured_values() -> None:
     assert manager._max_concurrent_for_queue(manager.SESSION_COMMIT) == 5
 
 
+def test_semantic_workers_require_explicit_vlm_resolver() -> None:
+    manager = QueueManager(agfs=object())
+    manager._queues[manager.SEMANTIC] = object()
+
+    with pytest.raises(RuntimeError, match="requires a VLM resolver"):
+        manager.start()
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("concurrency", [1, 2])
 async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
@@ -136,12 +144,16 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
         lambda: SimpleNamespace(exists=AsyncMock(return_value=True)),
     )
     monkeypatch.setattr(
-        "openviking.storage.collection_schemas.TextEmbeddingHandler", lambda _: SimpleNamespace()
+        "openviking.storage.collection_schemas.TextEmbeddingHandler",
+        lambda *_: SimpleNamespace(),
     )
     manager = QueueManager(
         object(), max_concurrent_semantic=concurrency, max_concurrent_embedding=concurrency
     )
     manager._poll_interval = 0.001
+    manager.set_vlm_resolver(
+        SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace()))
+    )
     manager.setup_standard_queues(object(), start=False)
     semantic = manager._queues[manager.SEMANTIC]._dequeue_handler
     manager._queues = {

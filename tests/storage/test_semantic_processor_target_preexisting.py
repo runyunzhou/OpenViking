@@ -1,11 +1,16 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import SyncDiff
+
+
+def _processor(**kwargs):
+    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace()))
+    return SemanticProcessor(vlm_resolver=resolver, **kwargs)
 
 
 class _FakeVikingFS:
@@ -98,6 +103,61 @@ async def test_vectorize_directory_returns_enqueued_levels(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_on_dequeue_resolves_vlm_for_each_use(monkeypatch):
+    resolved_vlm = SimpleNamespace(name="account-vlm")
+    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=resolved_vlm))
+    snapshots = []
+
+    class SnapshotTree:
+        stale = False
+
+        def __init__(self, *, processor, ctx, **kwargs):
+            del kwargs
+            self.processor = processor
+            self.ctx = ctx
+
+        async def run(self, root_uri):
+            del root_uri
+            snapshots.append(await self.processor._get_vlm_config(self.ctx))
+            snapshots.append(await self.processor._get_vlm_config(self.ctx))
+
+        def get_stats(self):
+            from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
+
+            return SemanticTreeStats()
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
+        lambda: _FakeVikingFS(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticTreeExecutor",
+        SnapshotTree,
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
+        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
+    )
+    processor = SemanticProcessor(vlm_resolver=resolver)
+    processor._enqueue_parent_refresh = AsyncMock()
+    msg = SemanticMsg(
+        uri="viking://resources/account-owned",
+        context_type="resource",
+        account_id="ov-a",
+        propagate_to_parent=False,
+    )
+
+    await processor.on_dequeue(msg.to_dict())
+
+    assert resolver.get_vlm.await_count == 2
+    assert resolver.get_vlm.await_args_list == [
+        call("ov-a"),
+        call("ov-a"),
+    ]
+    assert snapshots == [resolved_vlm, resolved_vlm]
+
+
+@pytest.mark.asyncio
 async def test_target_source_syncs_before_semantic_executor(monkeypatch):
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.get_viking_fs",
@@ -114,7 +174,7 @@ async def test_target_source_syncs_before_semantic_executor(monkeypatch):
 
     _FakeTreeExecutor.calls = []
     _FakeTreeExecutor.runs = []
-    processor = SemanticProcessor()
+    processor = _processor()
     processor._enqueue_parent_refresh = AsyncMock()
     processor._sync_topdown_recursive = AsyncMock(
         return_value=SyncDiff(
@@ -160,7 +220,7 @@ async def test_stale_content_write_keeps_file_work_without_directory_aggregation
 
     _FakeTreeExecutor.calls = []
     _FakeTreeExecutor.runs = []
-    processor = SemanticProcessor()
+    processor = _processor()
     processor._enqueue_parent_refresh = AsyncMock()
     changed = "viking://resources/wiki/changed.md"
     msg = SemanticMsg(
@@ -200,7 +260,7 @@ async def test_memory_reindex_uses_semantic_executor(monkeypatch, recursive):
 
     _FakeTreeExecutor.calls = []
     _FakeTreeExecutor.runs = []
-    processor = SemanticProcessor()
+    processor = _processor()
     processor._process_memory_directory = AsyncMock()
     msg = SemanticMsg(
         uri="viking://user/alice/memories/preferences",
@@ -229,7 +289,7 @@ async def test_memory_trigger_does_not_select_hierarchical_aggregation(monkeypat
         AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
     )
 
-    processor = SemanticProcessor()
+    processor = _processor()
     processor._process_memory_directory = AsyncMock()
     msg = SemanticMsg(
         uri="viking://user/alice/memories/preferences",
@@ -244,7 +304,7 @@ async def test_memory_trigger_does_not_select_hierarchical_aggregation(monkeypat
 
 @pytest.mark.asyncio
 async def test_content_copy_does_not_enqueue_ancestor_refresh(monkeypatch):
-    processor = SemanticProcessor()
+    processor = _processor()
     plan_refresh = AsyncMock()
     monkeypatch.setattr(
         "openviking.storage.queuefs.semantic_processor.plan_abstract_overview_refresh",
@@ -283,7 +343,7 @@ async def test_sync_wrapper_delegates_to_sync_tree_and_cleans_temp(monkeypatch):
         AsyncMock(),
     )
 
-    diff = await SemanticProcessor()._sync_topdown_recursive(
+    diff = await _processor()._sync_topdown_recursive(
         "viking://temp/import",
         "viking://resources/root",
         lock=lease,
@@ -316,7 +376,7 @@ async def test_sync_wrapper_whole_tree_mv_for_new_target(monkeypatch):
         AsyncMock(),
     )
 
-    await SemanticProcessor()._sync_topdown_recursive(
+    await _processor()._sync_topdown_recursive(
         "viking://temp/import",
         "viking://resources/root",
         lock=None,
@@ -336,7 +396,7 @@ async def test_sync_missing_source_never_touches_target(monkeypatch):
     )
 
     with pytest.raises(FileNotFoundError, match="refusing to sync"):
-        await SemanticProcessor()._sync_topdown_recursive(
+        await _processor()._sync_topdown_recursive(
             "viking://temp/missing",
             "viking://resources/root",
             lock=None,
