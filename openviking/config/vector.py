@@ -244,10 +244,3 @@ def validate_account_vector_candidate(context: AccountCandidateContext) -> None:
             raise ConfigPatchError("embedding mode is create-only", path=("embedding", mode))
     if before.dimension != after.dimension:
         raise ConfigPatchError("embedding dimension is create-only", path=("embedding",))
-
-
-async def resolve_vector_settings(manager, account_id: str) -> VectorRuntimeSettings:
-    """Compatibility helper; new composition roots should inject a resolver."""
-    if not account_id:
-        raise ValueError("account_id is required for vector configuration")
-    return await manager.resolve_account(account_id, vector_settings_from_view)

@@ -13,19 +13,16 @@ from __future__ import annotations
 from typing import Optional
 
 from openviking.config.account_config import AccountConfig
-from openviking.config.account_vector import AccountEmbeddingCredential
 from openviking.config.assembly import build_config_source, resolve_config_source_settings
 from openviking.config.manager import AccountCandidateValidator, RuntimeConfigManager
 from openviking.config.merge import apply_three_state_patch
 from openviking.config.source.base import ConfigSource
 from openviking.config.source.file_source import FileConfigSource
 from openviking.config.validate import (
-    ConfigPatchError,
     filter_runtime_fields,
     validate_patch,
 )
 from openviking.config.vector import (
-    MODEL_SECTIONS,
     validate_account_vector_candidate,
 )
 from openviking.pyagfs import AsyncAGFSClient
@@ -83,33 +80,6 @@ def _validate_request(patch: dict, is_account: bool, creating: bool) -> None:
         if "project" in patch["vectordb"]:
             patch["vectordb"]["project_name"] = patch["vectordb"].pop("project")
     validate_patch(model, patch, creating=creating)
-    if is_account:
-        _validate_account_credential_fields(patch)
-
-
-def _validate_account_credential_fields(patch: dict) -> None:
-    """Reject unknown credential keys in this request, not in stored settings."""
-    embedding = patch.get("embedding")
-    if not isinstance(embedding, dict):
-        return
-    allowed = set(AccountEmbeddingCredential.model_fields)
-    for mode in MODEL_SECTIONS:
-        section = embedding.get(mode)
-        if not isinstance(section, dict):
-            continue
-        credentials = section.get("credentials")
-        if not isinstance(credentials, list):
-            continue
-        for index, credential in enumerate(credentials):
-            if not isinstance(credential, dict):
-                continue
-            unknown = set(credential) - allowed
-            if unknown:
-                field = sorted(unknown)[0]
-                raise ConfigPatchError(
-                    "field is not modifiable by the config API",
-                    path=("embedding", mode, "credentials", str(index), field),
-                )
 
 
 def build_runtime_config_manager(

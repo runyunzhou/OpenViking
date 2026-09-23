@@ -171,8 +171,6 @@ class AccountVLMProvider:
         self._retired: set[_VLMResource] = set()
         self._usage: dict[str, TokenUsageTracker] = {}
         self._planner_usage: dict[str, TokenUsageTracker] = {}
-        self._cluster_usage = TokenUsageTracker()
-        self._cluster_planner_usage = TokenUsageTracker()
         self._lock = threading.RLock()
         self._epoch = 0
         self._closed = False
@@ -389,12 +387,7 @@ class AccountVLMProvider:
 
     def get_node_token_usage(self) -> dict:
         with self._lock:
-            trackers = (
-                self._cluster_usage,
-                self._cluster_planner_usage,
-                *self._usage.values(),
-                *self._planner_usage.values(),
-            )
+            trackers = (*self._usage.values(), *self._planner_usage.values())
         return TokenUsageTracker.merge(*trackers).to_dict()
 
     async def has_dedicated_query_planner(self, account_id: str) -> bool:

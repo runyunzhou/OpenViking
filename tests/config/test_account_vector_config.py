@@ -9,9 +9,9 @@ from openviking.config.scope import ConfigScope
 from openviking.config.source import MemoryConfigSource
 from openviking.config.validate import ConfigPatchError, validate_patch
 from openviking.config.vector import (
+    AccountVectorConfigResolver,
     resolve_effective_embedding,
     resolve_effective_vectordb,
-    resolve_vector_settings,
     validate_vector_settings,
 )
 from openviking_cli.utils.config import set_openviking_config
@@ -137,6 +137,7 @@ def test_create_only_fields_are_rejected(patch):
 async def test_dynamic_patch_persistence_reset_and_failure(vector_config):
     source = MemoryConfigSource()
     manager = manager_over_source(source, base_config=vector_config)
+    resolver = AccountVectorConfigResolver(manager)
     await manager.initialize()
     await manager.patch_account("old-account", {"embedding": {"max_retries": 5}})
     scope = ConfigScope.account("old-account")
@@ -146,7 +147,7 @@ async def test_dynamic_patch_persistence_reset_and_failure(vector_config):
         lambda view: view.account.embedding.model_dump(exclude_unset=True),
     )
     assert account_embedding == {"max_retries": 5}
-    settings = await resolve_vector_settings(manager, "old-account")
+    settings = await resolver.resolve("old-account")
     assert settings.embedding.dense.api_key == "cluster-secret"
     assert settings.embedding.max_retries == 5
     assert settings.vectordb.dimension == 4
@@ -164,9 +165,9 @@ async def test_dynamic_patch_persistence_reset_and_failure(vector_config):
                 }
             },
         )
-    assert (await resolve_vector_settings(manager, "old-account")).embedding.max_retries == 5
+    assert (await resolver.resolve("old-account")).embedding.max_retries == 5
     await manager.patch_account("old-account", {"embedding": {"max_retries": None}})
-    assert (await resolve_vector_settings(manager, "old-account")).embedding.max_retries == 3
+    assert (await resolver.resolve("old-account")).embedding.max_retries == 3
     assert await manager.get_settings(scope) == {"embedding": {}}
     assert "cluster-secret" not in str(await manager.get_settings(scope))
 
@@ -220,11 +221,12 @@ async def test_new_mode_allowed_at_creation_and_loaded_on_another_manager(vector
     manager.validate_initial_settings("a", settings)
     await manager.patch_account("a", settings, creating=True)
     reader = manager_over_source(source, base_config=vector_config)
+    reader_resolver = AccountVectorConfigResolver(reader)
     await reader.initialize()
-    assert (await resolve_vector_settings(reader, "a")).embedding.sparse is not None
+    assert (await reader_resolver.resolve("a")).embedding.sparse is not None
     await manager.patch_account("a", {"embedding": {"max_retries": 7}})
     await reader.refresh_once()
-    refreshed = await resolve_vector_settings(reader, "a")
+    refreshed = await reader_resolver.resolve("a")
     assert refreshed.embedding.max_retries == 7
     assert refreshed.embedding.sparse is not None
 
@@ -400,6 +402,7 @@ async def test_old_node_preserves_unknown_stored_credential_fields(vector_config
 @pytest.mark.asyncio
 async def test_credentials_null_cannot_break_complete_account_binding(vector_config):
     manager = manager_over_source(MemoryConfigSource(), base_config=vector_config)
+    resolver = AccountVectorConfigResolver(manager)
     await manager.initialize()
     await manager.patch_account(
         "a",
@@ -417,7 +420,7 @@ async def test_credentials_null_cannot_break_complete_account_binding(vector_con
         },
         creating=True,
     )
-    assert (await resolve_vector_settings(manager, "a")).embedding.dense.api_key is None
+    assert (await resolver.resolve("a")).embedding.dense.api_key is None
     with pytest.raises(ValueError, match="Field required"):
         await manager.patch_account("a", {"embedding": {"dense": {"credentials": None}}})
 
@@ -439,6 +442,7 @@ def test_account_dimension_cannot_reinfer_shared_cluster_collection(vector_confi
 @pytest.mark.asyncio
 async def test_account_publication_does_not_materialize_cluster_vector_values(vector_config):
     manager = manager_over_source(MemoryConfigSource(), base_config=vector_config)
+    resolver = AccountVectorConfigResolver(manager)
     await manager.initialize()
     await manager.patch_account(
         "a",
@@ -462,7 +466,7 @@ async def test_account_publication_does_not_materialize_cluster_vector_values(ve
         "dimension": 4,
         "vikingdb": {"host": "https://account.invalid"},
     }
-    effective = await resolve_vector_settings(manager, "a")
+    effective = await resolver.resolve("a")
     assert effective.vectordb.dimension == 4
     assert effective.vectordb.name == "account-context"
 
