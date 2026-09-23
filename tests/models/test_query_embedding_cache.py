@@ -201,3 +201,35 @@ async def test_last_waiter_cancellation_stops_shared_embed_and_evicts_entry():
     result = await embed_compat(embedder, "shared", is_query=True)
     assert result.dense_vector == [1.0]
     assert embedder.calls == ["shared", "shared"]
+
+
+async def test_cache_close_waits_for_cancelled_task_cleanup():
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def factory():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await release_cleanup.wait()
+            raise
+
+    cache = QueryEmbeddingCache()
+    waiter = asyncio.create_task(cache.run("shared", factory))
+    await started.wait()
+
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    await cleanup_started.wait()
+
+    closing = asyncio.create_task(cache.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+
+    release_cleanup.set()
+    await closing
+    assert not cache._pending_tasks

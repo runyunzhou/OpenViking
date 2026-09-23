@@ -21,7 +21,9 @@ from openviking.utils.model_retry import (
     ERROR_CLASS_INPUT_TOO_LARGE,
     classify_api_error,
 )
+from openviking_cli.utils.logger import get_logger
 
+logger = get_logger(__name__)
 
 @dataclass(frozen=True)
 class EmbeddingResourceStatus:
@@ -60,7 +62,7 @@ class _EmbeddingResource:
                 self.closed = True
                 close = True
         if close:
-            self.embedder.close()
+            self._close_embedder()
 
     def retire(self) -> None:
         close = False
@@ -70,7 +72,20 @@ class _EmbeddingResource:
                 self.closed = True
                 close = True
         if close:
+            self._close_embedder()
+
+    def _close_embedder(self) -> None:
+        try:
             self.embedder.close()
+        except Exception:
+            # Retirement must remain terminal even if a provider's best-effort
+            # close path fails; otherwise AccountEmbeddingProvider.close() can
+            # wait forever for this resource to leave _retired.
+            logger.warning(
+                "Failed to close retired embedding resource %s",
+                self.fingerprint,
+                exc_info=True,
+            )
 
     def status(self) -> EmbeddingResourceStatus:
         with self.lock:

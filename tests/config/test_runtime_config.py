@@ -972,6 +972,35 @@ def test_account_patch_rejects_inactive_fields_and_allows_active_fields():
         validate_patch(AccountConfig, {"embedding": {"dense": {"model": "m"}}})
 
 
+@pytest.mark.parametrize("section", ["vlm", "query_planner"])
+def test_account_patch_rejects_unknown_fields_inside_model_lists(section):
+    validate_patch(
+        AccountConfig,
+        {
+            section: {
+                "model": "m",
+                "credentials": [{"provider": "openai", "api_key": "key"}],
+            }
+        },
+    )
+    with pytest.raises(ConfigPatchError, match=f"{section}.*api_bsae"):
+        validate_patch(
+            AccountConfig,
+            {
+                section: {
+                    "model": "m",
+                    "credentials": [
+                        {
+                            "provider": "openai",
+                            "api_key": "key",
+                            "api_bsae": "https://wrong.example",
+                        }
+                    ],
+                }
+            },
+        )
+
+
 def test_feishu_cluster_patch_rejects_unknown_fields():
     from openviking_cli.utils.config.open_viking_config import OpenVikingConfig
 
@@ -1164,7 +1193,7 @@ def test_real_feishu_account_override_and_cluster_fallback():
     asyncio.run(run())
 
 
-def test_account_vlm_provider_shares_resources_and_resolves_overrides():
+def test_account_vlm_provider_isolates_resources_and_resolves_overrides():
     async def run():
         from openviking.config.binding import manager_over_source
         from openviking.config.vlm import AccountVLMProvider
@@ -1184,7 +1213,7 @@ def test_account_vlm_provider_shares_resources_and_resolves_overrides():
         try:
             assert (await provider.get_vlm("ov-a")).model == "cluster-model"
             assert (await provider.get_vlm("ov-b")).model == "cluster-model"
-            assert provider._bindings[("ov-a", "vlm")] is provider._bindings[
+            assert provider._bindings[("ov-a", "vlm")] is not provider._bindings[
                 ("ov-b", "vlm")
             ]
 

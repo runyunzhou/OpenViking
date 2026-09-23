@@ -21,8 +21,16 @@ class _ControlledVLM:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.closed = 0
+        self.calls = []
 
-    async def get_completion_async(self, **_kwargs):
+    async def get_completion_async(self, **kwargs):
+        self.calls.append(kwargs)
+        self.started.set()
+        await self.release.wait()
+        return self.model
+
+    async def get_vision_completion_async(self, **kwargs):
+        self.calls.append(kwargs)
         self.started.set()
         await self.release.wait()
         return self.model
@@ -160,6 +168,132 @@ async def test_bound_query_planner_tracks_role_precedence_changes(runtime):
         await asyncio.sleep(0)
     clients[1].release.set()
     assert await dedicated == "planner-v1"
+
+
+@pytest.mark.asyncio
+async def test_bound_vlm_forwards_per_call_max_tokens(runtime):
+    _, provider, clients = runtime
+    bound = await provider.get_vlm("a")
+    call = asyncio.create_task(
+        bound.get_completion_async(prompt="extract", max_tokens=321)
+    )
+    while not clients:
+        await asyncio.sleep(0)
+    clients[0].release.set()
+
+    assert await call == "account-v1"
+    assert clients[0].calls[0]["max_tokens"] == 321
+
+
+@pytest.mark.asyncio
+async def test_bound_vlm_forwards_vision_tool_choice(runtime):
+    _, provider, clients = runtime
+    bound = await provider.get_vlm("a")
+    tool_choice = {"type": "function", "function": {"name": "describe"}}
+    call = asyncio.create_task(
+        bound.get_vision_completion_async(
+            prompt="describe",
+            tools=[{"type": "function"}],
+            tool_choice=tool_choice,
+        )
+    )
+    while not clients:
+        await asyncio.sleep(0)
+    clients[0].release.set()
+
+    assert await call == "account-v1"
+    assert clients[0].calls[0]["tool_choice"] == tool_choice
+
+
+@pytest.mark.asyncio
+async def test_cluster_fallback_vlm_and_planner_usage_is_account_scoped():
+    base = OpenVikingConfig.from_dict(
+        {
+            "vlm": {"model": "cluster-vlm", "provider": "litellm"},
+            "query_planner": {"model": "cluster-planner", "provider": "litellm"},
+        }
+    )
+    set_openviking_config(base)
+    manager = manager_over_source(MemoryConfigSource(), base_config=base)
+    await manager.initialize()
+    provider = AccountVLMProvider(manager)
+    try:
+        vlm_a = await provider.get_vlm("a")
+        vlm_b = await provider.get_vlm("b")
+        planner_a = await provider.get_query_planner("a")
+        planner_b = await provider.get_query_planner("b")
+
+        assert provider._bindings[("a", "vlm")] is not provider._bindings[("b", "vlm")]
+        assert provider._bindings[("a", "query_planner")] is not provider._bindings[
+            ("b", "query_planner")
+        ]
+        assert vlm_a.model == vlm_b.model == "cluster-vlm"
+        assert planner_a.model == planner_b.model == "cluster-planner"
+
+        vlm_a.token_tracker.update("cluster-vlm", "litellm", 100, 20)
+        planner_b.token_tracker.update("cluster-planner", "litellm", 30, 10)
+
+        assert provider.get_token_usage("a")["total_usage"]["total_tokens"] == 120
+        assert provider.get_token_usage("b")["total_usage"]["total_tokens"] == 0
+        assert provider.get_node_token_usage()["total_usage"]["total_tokens"] == 160
+    finally:
+        await provider.close()
+        OpenVikingConfigSingleton.reset_instance()
+
+
+@pytest.mark.asyncio
+async def test_query_planner_vlm_fallback_counts_shared_tracker_once():
+    base = OpenVikingConfig.from_dict(
+        {"vlm": {"model": "cluster-vlm", "provider": "litellm"}}
+    )
+    set_openviking_config(base)
+    manager = manager_over_source(MemoryConfigSource(), base_config=base)
+    await manager.initialize()
+    provider = AccountVLMProvider(manager)
+    try:
+        vlm = await provider.get_vlm("a")
+        planner = await provider.get_query_planner("a")
+
+        assert provider._bindings[("a", "vlm")] is provider._bindings[
+            ("a", "query_planner")
+        ]
+        assert vlm.token_tracker is planner.token_tracker
+
+        vlm.token_tracker.update("cluster-vlm", "litellm", 100, 20)
+        assert provider.get_node_token_usage()["total_usage"]["total_tokens"] == 120
+    finally:
+        await provider.close()
+        OpenVikingConfigSingleton.reset_instance()
+
+
+@pytest.mark.asyncio
+async def test_cluster_vlm_update_retires_account_fallback_resources():
+    base = OpenVikingConfig.from_dict(
+        {"vlm": {"model": "cluster-v1", "provider": "litellm"}}
+    )
+    set_openviking_config(base)
+    manager = manager_over_source(MemoryConfigSource(), base_config=base)
+    await manager.initialize()
+    provider = AccountVLMProvider(manager)
+    try:
+        await provider.get_vlm("a")
+        await provider.get_vlm("b")
+        first_resource = provider._bindings[("a", "vlm")]
+        second_resource = provider._bindings[("b", "vlm")]
+
+        updated = OpenVikingConfig.from_dict(
+            {"vlm": {"model": "cluster-v2", "provider": "litellm"}}
+        )
+        await manager.replace_base_config(updated)
+
+        assert first_resource.retired and first_resource.closed
+        assert second_resource.retired and second_resource.closed
+        assert ("a", "vlm") not in provider._bindings
+        assert ("b", "vlm") not in provider._bindings
+        assert (await provider.get_vlm("a")).model == "cluster-v2"
+    finally:
+        await provider.close()
+        OpenVikingConfigSingleton.reset_instance()
 
 
 @pytest.mark.asyncio

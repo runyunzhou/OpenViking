@@ -193,23 +193,6 @@ async def choose_vector_restore_action(
     if vector_mode == "recompute":
         return "recompute"
 
-    unsupported_reason = await dense_snapshot_unsupported_reason(
-        vector_store,
-        vector_config_resolver,
-        ctx,
-    )
-    if unsupported_reason:
-        if vector_mode == "require":
-            raise InvalidArgumentError(
-                "ovpack dense vector snapshot cannot be restored into a sparse or hybrid index",
-                details={"reason": unsupported_reason},
-            )
-        logger.info(
-            "[ovpack] Recomputing vectors because dense snapshot restore is unsupported: "
-            f"{unsupported_reason}"
-        )
-        return "recompute"
-
     dense_count = dense_record_count(index_records)
     if dense_count == 0 or not dense_vectors:
         if vector_mode == "require":
@@ -227,6 +210,23 @@ async def choose_vector_restore_action(
     if not vector_store or not hasattr(vector_store, "upsert"):
         if vector_mode == "require":
             raise InvalidArgumentError("Vector restore requires a writable vector store")
+        return "recompute"
+
+    unsupported_reason = await dense_snapshot_unsupported_reason(
+        vector_store,
+        vector_config_resolver,
+        ctx,
+    )
+    if unsupported_reason:
+        if vector_mode == "require":
+            raise InvalidArgumentError(
+                "ovpack dense vector snapshot cannot be restored into a sparse or hybrid index",
+                details={"reason": unsupported_reason},
+            )
+        logger.info(
+            "[ovpack] Recomputing vectors because dense snapshot restore is unsupported: "
+            f"{unsupported_reason}"
+        )
         return "recompute"
 
     settings = await vector_config_resolver.resolve(ctx.account_id)

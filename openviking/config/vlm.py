@@ -222,7 +222,11 @@ class AccountVLMProvider:
     def _select_vlm(self, account_id: str, view: _VLMView) -> _VLMSelection:
         account_vlm = view.account.vlm
         if account_vlm is None:
-            return _VLMSelection(("cluster", "vlm"), view.cluster.vlm, self._cluster_usage)
+            return _VLMSelection(
+                ("account", account_id, "vlm"),
+                view.cluster.vlm,
+                self._account_tracker(self._usage, account_id),
+            )
         return _VLMSelection(
             ("account", account_id, "vlm"),
             account_vlm.to_vlm_config(view.cluster.vlm),
@@ -244,11 +248,11 @@ class AccountVLMProvider:
             return self._select_vlm(account_id, view)
         if view.cluster.query_planner is not None and view.cluster.query_planner._has_any_config():
             return _VLMSelection(
-                ("cluster", "query_planner"),
+                ("account", account_id, "query_planner"),
                 view.cluster.query_planner,
-                self._cluster_planner_usage,
+                self._account_tracker(self._planner_usage, account_id),
             )
-        return _VLMSelection(("cluster", "vlm"), view.cluster.vlm, self._cluster_usage)
+        return self._select_vlm(account_id, view)
 
     @staticmethod
     def _create_resource(selection: _VLMSelection) -> _VLMResource:
@@ -385,7 +389,12 @@ class AccountVLMProvider:
 
     def get_node_token_usage(self) -> dict:
         with self._lock:
-            trackers = (self._cluster_usage, *self._usage.values())
+            trackers = (
+                self._cluster_usage,
+                self._cluster_planner_usage,
+                *self._usage.values(),
+                *self._planner_usage.values(),
+            )
         return TokenUsageTracker.merge(*trackers).to_dict()
 
     async def has_dedicated_query_planner(self, account_id: str) -> bool:

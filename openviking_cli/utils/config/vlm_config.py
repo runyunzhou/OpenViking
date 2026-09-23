@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field, PrivateAttr, ValidationInfo, model_validator
 
+from openviking_cli.utils.config.runtime_field import RuntimeField
+
 
 def _load_codex_auth_module():
     importlib.import_module("openviking.models.vlm")
@@ -56,9 +58,9 @@ def _bind_token_usage_tracker(instance: Any, tracker: Any) -> None:
 class VLMCredential(BaseModel):
     """Single VLM credential configuration for multi-credential failover."""
 
-    id: Optional[str] = Field(default=None, description="Unique identifier for this credential")
-    provider: Optional[str] = Field(default=None, description="Provider type")
-    model: Optional[str] = Field(
+    id: Optional[str] = RuntimeField(default=None, description="Unique identifier for this credential")
+    provider: Optional[str] = RuntimeField(default=None, description="Provider type")
+    model: Optional[str] = RuntimeField(
         default=None,
         description=(
             "Model name (or endpoint id) for this credential. "
@@ -66,26 +68,28 @@ class VLMCredential(BaseModel):
             "to point to a different deployment / endpoint."
         ),
     )
-    api_key: Optional[str] = Field(default=None, description="API key")
-    api_base: Optional[str] = Field(default=None, description="API base URL")
-    api_version: Optional[str] = Field(default=None, description="API version")
-    forward_api_key: Optional[bool] = Field(
+    api_key: Optional[str] = RuntimeField(default=None, description="API key")
+    api_base: Optional[str] = RuntimeField(default=None, description="API base URL")
+    api_version: Optional[str] = RuntimeField(default=None, description="API version")
+    forward_api_key: Optional[bool] = RuntimeField(
         default=None, description="Whether to pass api_key through to LiteLLM"
     )
-    extra_headers: Optional[Dict[str, str]] = Field(default=None, description="Extra HTTP headers")
-    extra_request_body: Optional[Dict[str, Any]] = Field(
+    extra_headers: Optional[Dict[str, str]] = RuntimeField(
+        default=None, description="Extra HTTP headers"
+    )
+    extra_request_body: Optional[Dict[str, Any]] = RuntimeField(
         default=None, description="Extra JSON body fields"
     )
-    reasoning_effort: Optional[str] = Field(
+    reasoning_effort: Optional[str] = RuntimeField(
         default=None,
         description="Reasoning effort for OpenAI-compatible reasoning models",
     )
-    keepalive_expiry: Optional[float] = Field(
+    keepalive_expiry: Optional[float] = RuntimeField(
         default=None,
         ge=0.0,
         description="Idle HTTP connection lifetime for OpenAI-compatible providers",
     )
-    max_tokens: Optional[int] = Field(
+    max_tokens: Optional[int] = RuntimeField(
         default=None,
         gt=0,
         description=(
@@ -791,6 +795,7 @@ class VLMConfig(BaseModel):
         prompt: str = "",
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion."""
@@ -799,6 +804,7 @@ class VLMConfig(BaseModel):
             prompt=prompt,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 
@@ -809,6 +815,7 @@ class VLMConfig(BaseModel):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Union[str, Any]:
         """Get LLM completion asynchronously."""
         effective_thinking = self.thinking if thinking is None else thinking
@@ -818,6 +825,7 @@ class VLMConfig(BaseModel):
             tools=tools,
             tool_choice=tool_choice,
             messages=messages,
+            max_tokens=max_tokens,
         )
 
     def is_available(self) -> bool:
@@ -836,6 +844,7 @@ class VLMConfig(BaseModel):
         images: Optional[list] = None,
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion with images."""
@@ -845,6 +854,7 @@ class VLMConfig(BaseModel):
             images=images,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 
@@ -907,6 +917,7 @@ class VLMConfig(BaseModel):
         images: Optional[list] = None,
         thinking: Optional[bool] = None,
         tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Any] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> Union[str, Any]:
         """Get LLM completion with images asynchronously."""
@@ -916,6 +927,7 @@ class VLMConfig(BaseModel):
             images=images,
             thinking=effective_thinking,
             tools=tools,
+            tool_choice=tool_choice,
             messages=messages,
         )
 

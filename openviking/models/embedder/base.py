@@ -39,6 +39,10 @@ class _SharedQueryEmbedding:
 class QueryEmbeddingCache(dict[Any, _SharedQueryEmbedding]):
     """Own in-flight query work for one request and track its waiters."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._pending_tasks: set[asyncio.Task] = set()
+
     async def run(
         self,
         key: Any,
@@ -58,6 +62,7 @@ class QueryEmbeddingCache(dict[Any, _SharedQueryEmbedding]):
             if entry.waiters == 0 and not entry.task.done():
                 if self.get(key) is entry:
                     self.pop(key, None)
+                self._pending_tasks.add(entry.task)
                 entry.task.cancel()
 
     def _discard_unsuccessful(
@@ -66,16 +71,20 @@ class QueryEmbeddingCache(dict[Any, _SharedQueryEmbedding]):
         entry: _SharedQueryEmbedding,
         done: "asyncio.Task[EmbedResult]",
     ) -> None:
+        self._pending_tasks.discard(done)
         if (done.cancelled() or done.exception() is not None) and self.get(key) is entry:
             self.pop(key, None)
 
     async def close(self) -> None:
-        pending = [entry.task for entry in self.values() if not entry.task.done()]
+        pending = {
+            entry.task for entry in self.values() if not entry.task.done()
+        } | {task for task in self._pending_tasks if not task.done()}
         for task in pending:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
         self.clear()
+        self._pending_tasks.clear()
 
 
 # Request handlers install one cache around the fan-out that issues sibling

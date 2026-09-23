@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 from openviking_cli.utils.config.runtime_field import RuntimeField
 
@@ -14,17 +14,17 @@ from openviking_cli.utils.config.runtime_field import RuntimeField
 class AccountEmbeddingCredential(BaseModel):
     """One Account-owned provider binding; credential arrays replace as a unit."""
 
-    id: Optional[str] = Field(default=None)
-    provider: str = Field(min_length=1)
-    model: Optional[str] = Field(default=None, min_length=1)
-    api_key: Optional[str] = Field(default=None)
-    api_base: Optional[str] = Field(default=None)
-    api_version: Optional[str] = Field(default=None)
-    ak: Optional[str] = Field(default=None)
-    sk: Optional[str] = Field(default=None)
-    region: Optional[str] = Field(default=None)
-    host: Optional[str] = Field(default=None)
-    extra_headers: Optional[Dict[str, str]] = Field(default=None)
+    id: Optional[str] = RuntimeField(default=None)
+    provider: str = RuntimeField(min_length=1)
+    model: Optional[str] = RuntimeField(default=None, min_length=1)
+    api_key: Optional[str] = RuntimeField(default=None)
+    api_base: Optional[str] = RuntimeField(default=None)
+    api_version: Optional[str] = RuntimeField(default=None)
+    ak: Optional[str] = RuntimeField(default=None)
+    sk: Optional[str] = RuntimeField(default=None)
+    region: Optional[str] = RuntimeField(default=None)
+    host: Optional[str] = RuntimeField(default=None)
+    extra_headers: Optional[Dict[str, str]] = RuntimeField(default=None)
 
 
 class AccountEmbeddingModelConfig(BaseModel):

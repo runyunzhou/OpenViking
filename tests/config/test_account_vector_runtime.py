@@ -145,6 +145,19 @@ async def test_update_and_cancel_releases_inflight_resource(runtime):
 
 
 @pytest.mark.asyncio
+async def test_embedding_close_failure_does_not_block_provider_shutdown(runtime):
+    _, _, provider = runtime
+    resource = await provider._resource_for("a")
+    resource.embedder.close = Mock(side_effect=RuntimeError("close failed"))
+
+    await provider.invalidate("a")
+
+    assert resource.retired and resource.closed
+    assert not provider._retired
+    await provider.close()
+
+
+@pytest.mark.asyncio
 async def test_query_cache_keys_include_account_and_current_config(runtime):
     _, manager, provider = runtime
     await manager.patch_account(
@@ -352,6 +365,47 @@ async def test_adapter_close_waits_for_cancelled_threaded_call():
 
 
 @pytest.mark.asyncio
+async def test_vector_facade_closes_all_adapters_after_one_failure():
+    shared_adapter = Mock()
+    shared_async_adapter = _AsyncVectorAdapter(shared_adapter)
+    failing_adapter = Mock()
+    failing_adapter.close.side_effect = RuntimeError("close failed")
+    failing_async_adapter = _AsyncVectorAdapter(failing_adapter)
+    healthy_adapter = Mock()
+    healthy_async_adapter = _AsyncVectorAdapter(healthy_adapter)
+
+    class FakeBackend:
+        def __init__(self, adapter, async_adapter):
+            self._adapter = adapter
+            self._async_adapter = async_adapter
+            self._operation_condition = threading.Condition()
+            self._retired = False
+
+        def _wait_for_operations(self):
+            return None
+
+    facade = object.__new__(VikingVectorIndexBackend)
+    facade._shared_adapter = shared_adapter
+    facade._shared_async_adapter = shared_async_adapter
+    facade._account_backends = {
+        "failing": FakeBackend(failing_adapter, failing_async_adapter),
+        "healthy": FakeBackend(healthy_adapter, healthy_async_adapter),
+    }
+    facade._retiring_backends = set()
+    facade._resolved_backends = {}
+    facade._initializing_accounts = set()
+    facade._root_backend = None
+
+    await facade._close_backends()
+
+    shared_adapter.close.assert_called_once()
+    failing_adapter.close.assert_called_once()
+    healthy_adapter.close.assert_called_once()
+    assert not facade._account_backends
+    assert not facade._retiring_backends
+
+
+@pytest.mark.asyncio
 async def test_remote_random_query_uses_account_dimension(runtime):
     from openviking.storage.vectordb_adapters import create_collection_adapter
     from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
@@ -461,6 +515,27 @@ async def test_ovpack_metadata_and_restore_validation_follow_account(runtime):
             )
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_ovpack_auto_recomputes_without_querying_vector_backend():
+    from openviking.storage.ovpack.vectors import choose_vector_restore_action
+
+    resolver = SimpleNamespace(
+        resolve=AsyncMock(side_effect=AssertionError("resolver should not be called"))
+    )
+    action = await choose_vector_restore_action(
+        manifest={},
+        index_records=[],
+        dense_vectors={},
+        vector_store=SimpleNamespace(upsert=AsyncMock()),
+        vector_config_resolver=resolver,
+        vector_mode="auto",
+        ctx=ctx("a"),
+    )
+
+    assert action == "recompute"
+    resolver.resolve.assert_not_awaited()
 
 
 @pytest.mark.asyncio
