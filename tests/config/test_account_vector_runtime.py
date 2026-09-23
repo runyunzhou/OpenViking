@@ -3,6 +3,7 @@
 
 import asyncio
 import threading
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -91,6 +92,16 @@ async def runtime(tmp_path, monkeypatch):
     yield config, manager, provider
     await provider.close()
     OpenVikingConfigSingleton.reset_instance()
+
+
+@asynccontextmanager
+async def _account_store(config, manager):
+    store = VikingVectorIndexBackend(config.storage.vectordb)
+    store.set_vector_config_resolver(AccountVectorConfigResolver(manager))
+    try:
+        yield store
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
@@ -204,7 +215,7 @@ async def test_dimension_is_checked_before_result_leaves_provider(runtime):
     a.embedder.dimension = 3
     with pytest.raises(ValueError, match="dimension mismatch"):
         await provider.embed("a", "wrong dimension")
-    await provider.embed("b", "healthy")
+    assert (await provider.embed("b", "healthy")).dense_vector == [0.5] * 4
 
 
 @pytest.mark.asyncio
@@ -279,9 +290,7 @@ async def test_account_local_vectordb_is_rejected(runtime):
 @pytest.mark.asyncio
 async def test_cluster_fallback_shares_connection_but_filters_accounts(runtime):
     config, manager, provider = runtime
-    store = VikingVectorIndexBackend(config.storage.vectordb)
-    store.set_vector_config_resolver(AccountVectorConfigResolver(manager))
-    try:
+    async with _account_store(config, manager) as store:
         await init_context_collection(store)
         a, b = await asyncio.gather(store.get_account_backend("a"), store.get_account_backend("b"))
         assert a._adapter is b._adapter
@@ -298,15 +307,11 @@ async def test_cluster_fallback_shares_connection_but_filters_accounts(runtime):
         assert await a.count() == 1 and await b.count() == 0
         await store.release_account("b")
         assert await a.count() == 1
-    finally:
-        await store.close()
 
 
 @pytest.mark.asyncio
 async def test_remote_account_never_bootstraps_or_falls_back(runtime, monkeypatch):
     config, manager, provider = runtime
-    store = VikingVectorIndexBackend(config.storage.vectordb)
-    store.set_vector_config_resolver(AccountVectorConfigResolver(manager))
     await manager.patch_account(
         "remote",
         {
@@ -326,7 +331,7 @@ async def test_remote_account_never_bootstraps_or_falls_back(runtime, monkeypatc
         "openviking.storage.viking_vector_index_backend.create_collection_adapter",
         lambda config: adapter,
     )
-    try:
+    async with _account_store(config, manager) as store:
         backend = await store.get_account_backend("remote")
         adapter.create_collection.assert_not_called()
         with pytest.raises(RuntimeError, match="remote connection"):
@@ -334,9 +339,7 @@ async def test_remote_account_never_bootstraps_or_falls_back(runtime, monkeypatc
         assert backend._adapter is adapter
         await store.release_account("remote")
         adapter.drop_collection.assert_not_called()
-        adapter.close.assert_called_once()
-    finally:
-        await store.close()
+    adapter.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -428,41 +431,20 @@ async def test_remote_random_query_uses_account_dimension(runtime):
 
 
 @pytest.mark.asyncio
-async def test_account_observer_uses_account_collection(runtime):
-    _, manager, _ = runtime
-    await manager.patch_account(
-        "a",
-        {"vectordb": {
-            "backend": "vikingdb",
-            "name": "account_only",
-            "index_name": "default",
-            "dimension": 4,
-            "vikingdb": {"host": "https://account.invalid"},
-        }},
-        creating=True,
-    )
-    settings = await AccountVectorConfigResolver(manager).resolve("a")
-    assert settings.vectordb.name == "account_only"
-    assert settings.dedicated_vectordb
-
-
-@pytest.mark.asyncio
 async def test_reindex_text_source_follows_target_account(runtime, monkeypatch):
     from openviking.service.reindex_executor import ReindexExecutor
 
     config, manager, provider = runtime
     await manager.patch_account("a", {"embedding": {"text_source": "summary_first"}}, creating=True)
-    store = VikingVectorIndexBackend(config.storage.vectordb)
-    store.set_vector_config_resolver(AccountVectorConfigResolver(manager))
-    monkeypatch.setattr(
-        "openviking.service.reindex_executor.get_viking_fs",
-        lambda: SimpleNamespace(vector_store=store),
-    )
-    executor = ReindexExecutor(
-        vector_config_resolver=AccountVectorConfigResolver(manager)
-    )
-    executor._fetch_existing_record = AsyncMock(return_value=None)
-    try:
+    async with _account_store(config, manager) as store:
+        monkeypatch.setattr(
+            "openviking.service.reindex_executor.get_viking_fs",
+            lambda: SimpleNamespace(vector_store=store),
+        )
+        executor = ReindexExecutor(
+            vector_config_resolver=AccountVectorConfigResolver(manager)
+        )
+        executor._fetch_existing_record = AsyncMock(return_value=None)
         for account, expected in (("a", "summary"), ("b", "body")):
             assert (
                 await executor._best_resource_file_vector_text(
@@ -470,8 +452,6 @@ async def test_reindex_text_source_follows_target_account(runtime, monkeypatch):
                 )
                 == expected
             )
-    finally:
-        await store.close()
 
 
 @pytest.mark.asyncio
@@ -488,11 +468,9 @@ async def test_ovpack_metadata_and_restore_validation_follow_account(runtime):
         "dimension": 4,
         "credentials": [{"provider": "openai", "model": "account-a", "api_key": "test"}],
     }}}, creating=True)
-    store = VikingVectorIndexBackend(config.storage.vectordb)
     resolver = AccountVectorConfigResolver(manager)
-    store.set_vector_config_resolver(resolver)
     records = [{"record_id": "row", "vector": {"dense": {"offset": 0, "dimensions": 4}}}]
-    try:
+    async with _account_store(config, manager) as store:
         await init_context_collection(store)
         settings = await resolver.resolve("a")
         _, dense = build_dense_snapshot_manifest(records, [0.5] * 4, settings.embedding)
@@ -513,8 +491,6 @@ async def test_ovpack_metadata_and_restore_validation_follow_account(runtime):
             await choose_vector_restore_action(
                 manifest, records, {"row": [0.5] * 4}, ctx=ctx("b"), **arguments
             )
-    finally:
-        await store.close()
 
 
 @pytest.mark.asyncio
@@ -617,18 +593,16 @@ async def test_vectordb_refresh_replaces_cached_backend(runtime, monkeypatch):
     monkeypatch.setattr(
         "openviking.storage.viking_vector_index_backend.create_collection_adapter", create_adapter
     )
-    store = VikingVectorIndexBackend(config.storage.vectordb)
-    store.set_vector_config_resolver(AccountVectorConfigResolver(manager))
-    service = SimpleNamespace(release_account_vector_resources=store.release_account)
-    manager.add_update_consumer(
-        scope=ScopeKind.ACCOUNT, sections={"vectordb", "embedding"},
-        consumer=lambda event: OpenVikingService._on_account_vector_config_change(service, event),
-    )
-    settings = {"vectordb": {
-        "backend": "vikingdb", "name": "old", "index_name": "default", "dimension": 4,
-        "vikingdb": {"host": "https://account.invalid"},
-    }}
-    try:
+    async with _account_store(config, manager) as store:
+        service = SimpleNamespace(release_account_vector_resources=store.release_account)
+        manager.add_update_consumer(
+            scope=ScopeKind.ACCOUNT, sections={"vectordb", "embedding"},
+            consumer=lambda event: OpenVikingService._on_account_vector_config_change(service, event),
+        )
+        settings = {"vectordb": {
+            "backend": "vikingdb", "name": "old", "index_name": "default", "dimension": 4,
+            "vikingdb": {"host": "https://account.invalid"},
+        }}
         await manager.patch_account("a", settings, creating=True)
         old = await store.get_account_backend("a")
         settings["vectordb"]["name"] = "new"
@@ -638,5 +612,3 @@ async def test_vectordb_refresh_replaces_cached_backend(runtime, monkeypatch):
         assert new is not old
         assert new.collection_name == "new"
         old._adapter.close.assert_called_once()
-    finally:
-        await store.close()

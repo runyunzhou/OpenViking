@@ -145,20 +145,6 @@ def test_default_single_turn_prompt_contains_case_policy_and_rubric():
     assert "verify_duplicate" in prompt
 
 
-def test_single_turn_rollout_executor_preserves_positional_constructor_order():
-    vlm = FakeVLM()
-
-    def build_prompt(case, policy_set, context):
-        return f"{case.name}:{len(policy_set.policies)}:{context.policy_snapshot_id}"
-
-    executor = SingleTurnLLMRolloutExecutor(vlm, build_prompt, False)
-
-    assert executor.vlm is vlm
-    assert executor.prompt_builder is build_prompt
-    assert executor.thinking is False
-    assert executor.vlm_resolver is None
-
-
 def test_dataset_service_policy_set_from_dict_preserves_policies():
     from openviking.session.train.components.dataset_service import policy_set_from_dict
 

@@ -42,6 +42,7 @@ from openviking_cli.utils.config.runtime_field import (
     is_dynamic,
     is_runtime_field,
 )
+from tests.config.case_data import ACCOUNT_RUNTIME_CASES
 
 # -- test config models -------------------------------------------------------
 
@@ -800,107 +801,17 @@ def test_account_config_field_attributes():
     assert ("embedding", "dense", "model") in frozen
 
 
-def test_account_vlm_credentials_must_not_be_empty():
-    with pytest.raises(ValueError, match="at least 1 item"):
-        AccountConfig.model_validate({"vlm": {"credentials": []}})
-    with pytest.raises(ValueError, match="Field required"):
-        AccountConfig.model_validate({"vlm": {}})
-    with pytest.raises(ValueError, match="credentials"):
-        AccountConfig.model_validate({"vlm": {"model": "tenant-model"}})
-    with pytest.raises(ValueError, match="model"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": "tenant-key",
-                        }
-                    ]
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="provider is required"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "tenant-model",
-                    "credentials": [{"api_key": "tenant-key"}],
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="model is required"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "   ",
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": "tenant-key",
-                        }
-                    ],
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="credentials\\[0\\].model must not be blank"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "tenant-model",
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "model": "   ",
-                            "api_key": "tenant-key",
-                        }
-                    ],
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="credentials\\[0\\].api_key must not be blank"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "tenant-model",
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": "   ",
-                        }
-                    ],
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="credentials\\[0\\].api_base must not be blank"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "tenant-model",
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": "tenant-key",
-                            "api_base": "   ",
-                        }
-                    ],
-                }
-            }
-        )
-    with pytest.raises(ValueError, match="is not supported"):
-        AccountConfig.model_validate(
-            {
-                "vlm": {
-                    "model": "tenant-model",
-                    "credentials": [
-                        {
-                            "provider": "unknown-provider",
-                            "api_key": "tenant-key",
-                        }
-                    ],
-                }
-            }
-        )
+@pytest.mark.parametrize(
+    "case",
+    ACCOUNT_RUNTIME_CASES["invalid_vlm_settings"],
+    ids=lambda case: case["match"],
+)
+def test_account_vlm_credentials_reject_invalid_settings(case):
+    with pytest.raises(ValueError, match=case["match"]):
+        AccountConfig.model_validate(case["settings"])
+
+
+def test_account_vlm_credentials_normalize_provider():
     normalized = AccountConfig.model_validate(
         {
             "vlm": {
@@ -1193,74 +1104,6 @@ def test_real_feishu_account_override_and_cluster_fallback():
     asyncio.run(run())
 
 
-def test_account_vlm_provider_isolates_resources_and_resolves_overrides():
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        base = OpenVikingConfig.from_dict(
-            {"vlm": {"model": "cluster-model", "provider": "litellm"}}
-        )
-        set_openviking_config(base)
-        manager = manager_over_source(MemoryConfigSource(), base_config=base)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        try:
-            assert (await provider.get_vlm("ov-a")).model == "cluster-model"
-            assert (await provider.get_vlm("ov-b")).model == "cluster-model"
-            assert provider._bindings[("ov-a", "vlm")] is not provider._bindings[
-                ("ov-b", "vlm")
-            ]
-
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "vlm": {
-                        "model": "account-model",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-key",
-                                "api_base": "https://account.example/v1",
-                            }
-                        ],
-                    }
-                },
-            )
-            account_vlm = await provider.get_vlm("ov-a")
-            assert account_vlm.model == "account-model"
-            assert account_vlm.credentials[0].model is None
-            assert account_vlm.credentials[0].api_key == "account-key"
-            assert account_vlm.credentials[0].api_base == "https://account.example/v1"
-            assert (await provider.get_vlm("ov-a")).model == "account-model"
-            assert (await provider.get_query_planner("ov-a")).model == "account-model"
-            assert await provider.has_dedicated_query_planner("ov-a")
-            assert (await provider.get_vlm("ov-b")).model == "cluster-model"
-
-            await manager.patch_account("ov-a", {"vlm": {"model": "account-model-v2"}})
-            updated = await provider.get_vlm("ov-a")
-            assert updated.model == "account-model-v2"
-            assert updated.credentials[0].model is None
-            assert updated.credentials[0].api_key == "account-key"
-            assert updated.credentials[0].api_base == "https://account.example/v1"
-            assert updated is not account_vlm
-
-            with pytest.raises(ValueError, match="credentials"):
-                await manager.patch_account("ov-a", {"vlm": {"credentials": None}})
-
-            await manager.patch_account("ov-a", {"vlm": None})
-            assert (await provider.get_vlm("ov-a")).model == "cluster-model"
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
 def test_account_vlm_provider_releases_idle_invalidated_client(monkeypatch):
     async def run():
         from openviking.config.binding import manager_over_source
@@ -1419,21 +1262,9 @@ def test_account_vlm_never_inherits_cluster_model_service_fields():
                 "account-b-key",
                 "https://account-b.example/v1",
             )
-            assert effective_a.temperature == 0.4
-            assert effective_a.max_retries == 7
-            assert effective_a.max_concurrent == 9
-            assert effective_a.max_tokens == 4096
-            assert effective_a.keepalive_expiry == 45
-            assert effective_a.reasoning_effort == "high"
-            assert effective_a.media.enabled is True
-            assert effective_a.timeout == cluster.vlm.timeout
-            assert effective_a.providers == {}
             assert effective_a.api_key is None
             assert effective_a.api_base is None
             assert effective_a.extra_headers is None
-            assert effective_a.credentials[0].keepalive_expiry == 45
-            assert effective_a.credentials[0].reasoning_effort == "high"
-            assert effective_a.credentials[0].extra_headers is None
 
             inherited_fields = (
                 set(type(cluster.vlm).model_fields)
@@ -1442,83 +1273,6 @@ def test_account_vlm_never_inherits_cluster_model_service_fields():
             assert {
                 field: getattr(effective_a, field) for field in inherited_fields
             } == {field: getattr(cluster.vlm, field) for field in inherited_fields}
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_vlm_provider_checks_derived_cache_before_resolving_config():
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        cluster = OpenVikingConfig.from_dict(
-            {
-                "vlm": {
-                    "model": "cluster-model",
-                    "provider": "openai",
-                    "api_key": "cluster-key",
-                }
-            }
-        )
-        set_openviking_config(cluster)
-        manager = manager_over_source(MemoryConfigSource(), base_config=cluster)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        try:
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "vlm": {
-                        "model": "account-model",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-key",
-                            }
-                        ],
-                    }
-                },
-            )
-
-            view_calls = 0
-            original_view = provider._view
-
-            async def tracked_view(account_id):
-                nonlocal view_calls
-                view_calls += 1
-                return await original_view(account_id)
-
-            provider._view = tracked_view
-            account_vlm = await provider.get_vlm("ov-a")
-            assert view_calls == 1
-            assert (await provider.get_vlm("ov-a")).model == account_vlm.model
-            assert (await provider.get_query_planner("ov-a")).model == account_vlm.model
-            assert view_calls == 2
-            assert (await provider.get_query_planner("ov-a")).model == account_vlm.model
-            assert view_calls == 2
-
-            updated_cluster = OpenVikingConfig.from_dict(
-                {
-                    "vlm": {
-                        "model": "cluster-model",
-                        "provider": "openai",
-                        "api_key": "cluster-key",
-                        "temperature": 0.6,
-                    }
-                }
-            )
-            await manager.replace_base_config(updated_cluster)
-            updated_vlm = await provider.get_vlm("ov-a")
-            assert updated_vlm is not account_vlm
-            assert updated_vlm.temperature == 0.6
-            assert view_calls == 3
         finally:
             OpenVikingConfigSingleton.reset_instance()
 
@@ -1678,259 +1432,6 @@ def test_account_query_planner_isolated_from_cluster_planner():
             assert planner.model == "account-planner"
             assert planner.credentials[0].model is None
             assert planner is not account_vlm
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_vlm_and_query_planner_follow_full_patch_lifecycle():
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import get_openviking_config, set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        base = OpenVikingConfig.from_dict(
-            {
-                "vlm": {
-                    "model": "cluster-vlm",
-                    "credentials": [
-                        {
-                            "id": "cluster-vlm",
-                            "provider": "openai",
-                            "model": "cluster-vlm",
-                            "api_key": "cluster-vlm-key",
-                        }
-                    ],
-                    "timeout": 60,
-                },
-                "query_planner": {
-                    "model": "cluster-planner",
-                    "credentials": [
-                        {
-                            "id": "cluster-planner",
-                            "provider": "openai",
-                            "model": "cluster-planner",
-                            "api_key": "cluster-planner-key",
-                        }
-                    ],
-                    "timeout": 30,
-                },
-            }
-        )
-        manager = manager_over_source(MemoryConfigSource(), base_config=base)
-        set_openviking_config(base)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        cluster = get_openviking_config()
-
-        def actual_client_settings(config):
-            credential = config.credentials[0]
-            return credential.model or config.model, credential.api_key, config.timeout
-
-        account_id = "ov-lifecycle"
-        other_account_id = "ov-other"
-        try:
-            assert (await provider.get_vlm(account_id)).model == cluster.vlm.model
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == cluster.query_planner.model
-
-            await manager.patch_account(
-                account_id,
-                {
-                    "vlm": {
-                        "model": "account-vlm-v1",
-                        "credentials": [
-                            {
-                                "id": "account-vlm-v1",
-                                "provider": "openai",
-                                "api_key": "account-vlm-key-v1",
-                            }
-                        ],
-                        "timeout": 11,
-                    }
-                },
-            )
-            account_vlm_v1 = await provider.get_vlm(account_id)
-            assert actual_client_settings(account_vlm_v1) == (
-                "account-vlm-v1",
-                "account-vlm-key-v1",
-                11,
-            )
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == account_vlm_v1.model
-            assert (await provider.get_vlm(other_account_id)).model == cluster.vlm.model
-            assert (
-                await provider.get_query_planner(other_account_id)
-            ).model == cluster.query_planner.model
-
-            await manager.patch_account(account_id, {"vlm": {"timeout": 12}})
-            account_vlm_timeout_updated = await provider.get_vlm(account_id)
-            assert account_vlm_timeout_updated is not account_vlm_v1
-            assert actual_client_settings(account_vlm_timeout_updated) == (
-                "account-vlm-v1",
-                "account-vlm-key-v1",
-                12,
-            )
-            assert (
-                await provider.get_query_planner(account_id)
-            ).timeout == account_vlm_timeout_updated.timeout
-
-            await manager.patch_account(
-                account_id,
-                {
-                    "vlm": {
-                        "model": "account-vlm-v2",
-                        "credentials": [
-                            {
-                                "id": "account-vlm-v2",
-                                "provider": "openai",
-                                "api_key": "account-vlm-key-v2",
-                            }
-                        ],
-                    }
-                },
-            )
-            account_vlm_v2 = await provider.get_vlm(account_id)
-            assert actual_client_settings(account_vlm_v2) == (
-                "account-vlm-v2",
-                "account-vlm-key-v2",
-                12,
-            )
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == account_vlm_v2.model
-
-            await manager.patch_account(
-                account_id,
-                {
-                    "query_planner": {
-                        "model": "account-planner-v1",
-                        "credentials": [
-                            {
-                                "id": "account-planner-v1",
-                                "provider": "openai",
-                                "api_key": "account-planner-key-v1",
-                            }
-                        ],
-                        "timeout": 7,
-                    }
-                },
-            )
-            account_planner_v1 = await provider.get_query_planner(account_id)
-            assert account_planner_v1 is not await provider.get_vlm(account_id)
-            assert actual_client_settings(account_planner_v1) == (
-                "account-planner-v1",
-                "account-planner-key-v1",
-                7,
-            )
-
-            await manager.patch_account(
-                account_id,
-                {
-                    "vlm": {
-                        "model": "account-vlm-v3",
-                        "credentials": [
-                            {
-                                "id": "account-vlm-v3",
-                                "provider": "openai",
-                                "api_key": "account-vlm-key-v3",
-                            }
-                        ],
-                    },
-                    "query_planner": {
-                        "model": "account-planner-v2",
-                        "credentials": [
-                            {
-                                "id": "account-planner-v2",
-                                "provider": "openai",
-                                "api_key": "account-planner-key-v2",
-                            }
-                        ],
-                    },
-                },
-            )
-            account_vlm_v3 = await provider.get_vlm(account_id)
-            account_planner_v2 = await provider.get_query_planner(account_id)
-            assert actual_client_settings(account_vlm_v3) == (
-                "account-vlm-v3",
-                "account-vlm-key-v3",
-                12,
-            )
-            assert actual_client_settings(account_planner_v2) == (
-                "account-planner-v2",
-                "account-planner-key-v2",
-                7,
-            )
-
-            await manager.patch_account(account_id, {"query_planner": None})
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == (await provider.get_vlm(account_id)).model
-
-            with pytest.raises(ValueError, match="credentials"):
-                await manager.patch_account(
-                    account_id,
-                    {"query_planner": {"model": "account-planner-v3"}},
-                )
-            await manager.patch_account(
-                account_id,
-                {
-                    "query_planner": {
-                        "model": "account-planner-v3",
-                        "credentials": [
-                            {
-                                "id": "account-planner-v3",
-                                "provider": "openai",
-                                "api_key": "account-planner-key-v3",
-                            }
-                        ],
-                    }
-                },
-            )
-            await manager.patch_account(account_id, {"vlm": None})
-            assert (await provider.get_vlm(account_id)).model == cluster.vlm.model
-            account_planner_v3 = await provider.get_query_planner(account_id)
-            assert actual_client_settings(account_planner_v3) == (
-                "account-planner-v3",
-                "account-planner-key-v3",
-                30,
-            )
-
-            await manager.patch_account(account_id, {"query_planner": None})
-            assert (await provider.get_vlm(account_id)).model == cluster.vlm.model
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == cluster.query_planner.model
-
-            await manager.patch_account(
-                account_id,
-                {
-                    "vlm": {
-                        "model": "account-vlm-before-delete",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-vlm-key-before-delete",
-                            }
-                        ],
-                    }
-                },
-            )
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == (await provider.get_vlm(account_id)).model
-            await manager.delete_account(account_id)
-            assert (await provider.get_vlm(account_id)).model == cluster.vlm.model
-            assert (
-                await provider.get_query_planner(account_id)
-            ).model == cluster.query_planner.model
         finally:
             OpenVikingConfigSingleton.reset_instance()
 

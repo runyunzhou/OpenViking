@@ -1,0 +1,34 @@
+{
+  "invalid_vlm_settings": [
+    {"settings": {"vlm": {"credentials": []}}, "match": "at least 1 item"},
+    {"settings": {"vlm": {}}, "match": "Field required"},
+    {"settings": {"vlm": {"model": "tenant-model"}}, "match": "credentials"},
+    {"settings": {"vlm": {"credentials": [{"provider": "openai", "api_key": "tenant-key"}]}}, "match": "model"},
+    {"settings": {"vlm": {"model": "tenant-model", "credentials": [{"api_key": "tenant-key"}]}}, "match": "provider is required"},
+    {"settings": {"vlm": {"model": "   ", "credentials": [{"provider": "openai", "api_key": "tenant-key"}]}}, "match": "model is required"},
+    {"settings": {"vlm": {"model": "tenant-model", "credentials": [{"provider": "openai", "model": "   ", "api_key": "tenant-key"}]}}, "match": "credentials\\[0\\].model must not be blank"},
+    {"settings": {"vlm": {"model": "tenant-model", "credentials": [{"provider": "openai", "api_key": "   "}]}}, "match": "credentials\\[0\\].api_key must not be blank"},
+    {"settings": {"vlm": {"model": "tenant-model", "credentials": [{"provider": "openai", "api_key": "tenant-key", "api_base": "   "}]}}, "match": "credentials\\[0\\].api_base must not be blank"},
+    {"settings": {"vlm": {"model": "tenant-model", "credentials": [{"provider": "unknown-provider", "api_key": "tenant-key"}]}}, "match": "is not supported"}
+  ],
+  "create_only_vector_patches": [
+    {"vectordb": {"name": "other"}}, {"vectordb": null}, {"vectordb": {}},
+    {"embedding": null}, {"embedding": {"dense": null}},
+    {"embedding": {"dense": {"model": "fixed-model"}}},
+    {"embedding": {"dense": {"dimension": 4}}},
+    {"embedding": {"dense": {"input": "text"}}},
+    {"embedding": {"text_source": "summary_first"}},
+    {"embedding": {"max_input_tokens": 1000}}
+  ],
+  "non_isolation_vector_patches": [
+    {"embedding": {"dense": {"provider": "openai"}}},
+    {"embedding": {"dense": {"api_key": "secret"}}},
+    {"embedding": {"dense": {"batch_size": 64}}},
+    {"embedding": {"dense": {"encoding_format": "float"}}},
+    {"embedding": {"dense": {"extra_body": {}}}},
+    {"embedding": {"allow_metadata_override": true}},
+    {"vectordb": {"path": "/tmp/account"}},
+    {"vectordb": {"cuvs": {"algorithm": "cagra"}}},
+    {"vectordb": {"custom_params": {"x": 1}}}
+  ]
+}

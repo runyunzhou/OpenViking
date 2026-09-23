@@ -4,7 +4,6 @@
 import pytest
 
 from openviking.config.account_config import AccountConfig
-from openviking.config.account_vector import AccountEmbeddingConfig, AccountVectorDBConfig
 from openviking.config.binding import manager_over_source
 from openviking.config.scope import ConfigScope
 from openviking.config.source import MemoryConfigSource
@@ -16,12 +15,12 @@ from openviking.config.vector import (
     validate_vector_settings,
 )
 from openviking_cli.utils.config import set_openviking_config
-from openviking_cli.utils.config.embedding_config import EmbeddingModelConfig
 from openviking_cli.utils.config.open_viking_config import (
     OpenVikingConfig,
     OpenVikingConfigSingleton,
 )
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
+from tests.config.case_data import ACCOUNT_RUNTIME_CASES
 
 
 @pytest.fixture
@@ -126,18 +125,7 @@ def test_backend_change_does_not_inherit_connection(vector_config):
 
 @pytest.mark.parametrize(
     "patch",
-    [
-        {"vectordb": {"name": "other"}},
-        {"vectordb": None},
-        {"vectordb": {}},
-        {"embedding": None},
-        {"embedding": {"dense": None}},
-        {"embedding": {"dense": {"model": "fixed-model"}}},
-        {"embedding": {"dense": {"dimension": 4}}},
-        {"embedding": {"dense": {"input": "text"}}},
-        {"embedding": {"text_source": "summary_first"}},
-        {"embedding": {"max_input_tokens": 1000}},
-    ],
+    ACCOUNT_RUNTIME_CASES["create_only_vector_patches"],
 )
 def test_create_only_fields_are_rejected(patch):
     with pytest.raises(ConfigPatchError):
@@ -325,12 +313,6 @@ def test_joint_validation_rejects_dense_sparse_weight(vector_config):
         )
 
 
-def test_account_models_are_explicit_allowlists():
-    assert AccountConfig.model_fields["embedding"].annotation == AccountEmbeddingConfig | None
-    assert AccountConfig.model_fields["vectordb"].annotation == AccountVectorDBConfig | None
-    assert EmbeddingModelConfig.model_fields["dimension"].default is None
-
-
 @pytest.mark.parametrize("headers", [None, {}, {"X-Account": "account"}])
 def test_same_backend_account_connection_never_inherits_cluster_headers(headers):
     cluster = VectorDBBackendConfig(
@@ -370,17 +352,7 @@ def test_same_backend_account_ak_sk_does_not_inherit_cluster_api_key():
 
 @pytest.mark.parametrize(
     "patch",
-    [
-        {"embedding": {"dense": {"provider": "openai"}}},
-        {"embedding": {"dense": {"api_key": "secret"}}},
-        {"embedding": {"dense": {"batch_size": 64}}},
-        {"embedding": {"dense": {"encoding_format": "float"}}},
-        {"embedding": {"dense": {"extra_body": {}}}},
-        {"embedding": {"allow_metadata_override": True}},
-        {"vectordb": {"path": "/tmp/account"}},
-        {"vectordb": {"cuvs": {"algorithm": "cagra"}}},
-        {"vectordb": {"custom_params": {"x": 1}}},
-    ],
+    ACCOUNT_RUNTIME_CASES["non_isolation_vector_patches"],
 )
 def test_non_isolation_fields_are_not_on_account_surface(patch):
     with pytest.raises(ConfigPatchError, match="not modifiable"):

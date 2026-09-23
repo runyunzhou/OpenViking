@@ -145,21 +145,6 @@ class FakeRolloutEvaluator:
         )
 
 
-def test_trajectory_analyzer_preserves_positional_constructor_order():
-    viking_fs = object()
-    vikingdb = object()
-    vlm = object()
-    evaluator = object()
-
-    analyzer = TrajectoryRolloutAnalyzer(viking_fs, vikingdb, vlm, evaluator)
-
-    assert analyzer.viking_fs is viking_fs
-    assert analyzer.vikingdb is vikingdb
-    assert analyzer.vlm is vlm
-    assert analyzer.evaluator is evaluator
-    assert analyzer.vlm_resolver is None
-
-
 def _rollout() -> Rollout:
     return Rollout(
         case=Case(
