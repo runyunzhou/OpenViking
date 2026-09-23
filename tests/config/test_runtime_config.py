@@ -142,6 +142,32 @@ def test_account_selector_captures_fallback_pair_and_rejects_async():
     asyncio.run(run())
 
 
+def test_manager_remains_usable_across_event_loops():
+    manager, _ = _make_manager(MemoryConfigSource())
+
+    asyncio.run(manager.initialize())
+    asyncio.run(manager.patch_account("a", {"vlm": {"model": "account"}}))
+
+    assert asyncio.run(manager.get_account("a", "vlm")).model == "account"
+
+
+def test_same_account_patches_serialize_across_event_loops():
+    async def patch_in_thread(manager, patch):
+        await asyncio.to_thread(lambda: asyncio.run(manager.patch_account("a", patch)))
+
+    async def run():
+        manager, _ = _make_manager(MemoryConfigSource())
+        await manager.initialize()
+        await asyncio.gather(
+            patch_in_thread(manager, {"vlm": {"model": "account"}}),
+            patch_in_thread(manager, {"memory": {"extraction_enabled": False}}),
+        )
+        assert (await manager.get_account("a", "vlm")).model == "account"
+        assert (await manager.get_account("a", "memory")).extraction_enabled is False
+
+    asyncio.run(run())
+
+
 def test_account_candidate_validator_runs_before_persist_and_once_per_patch():
     async def run():
         source = MemoryConfigSource()
@@ -620,6 +646,126 @@ def test_patch_waits_for_matching_consumers_and_filters_registration():
         release.set()
         await patch_task
         assert seen == ["first"]
+
+    asyncio.run(run())
+
+
+def test_different_account_patches_can_persist_concurrently():
+    class ParallelAccountSource(MemoryConfigSource):
+        def __init__(self):
+            super().__init__()
+            self.entered = set()
+            self.both_entered = asyncio.Event()
+
+        async def update(self, scope, mutate):
+            if scope.kind is ScopeKind.ACCOUNT:
+                self.entered.add(scope.key)
+                if len(self.entered) == 2:
+                    self.both_entered.set()
+                await self.both_entered.wait()
+                current = self._store.get(self._key(scope))
+                updated = mutate(current)
+                self._store[self._key(scope)] = updated
+                return updated
+            return await super().update(scope, mutate)
+
+    async def run():
+        source = ParallelAccountSource()
+        manager, _ = _make_manager(source)
+        await manager.initialize()
+        await asyncio.wait_for(
+            asyncio.gather(
+                manager.patch_account("ov-a", {"vlm": {"model": "a"}}),
+                manager.patch_account("ov-b", {"vlm": {"model": "b"}}),
+            ),
+            timeout=1,
+        )
+
+        assert (await manager.get_account("ov-a", "vlm")).model == "a"
+        assert (await manager.get_account("ov-b", "vlm")).model == "b"
+
+    asyncio.run(run())
+
+
+def test_notifications_follow_publication_order_across_drainers():
+    async def run():
+        manager, _ = _make_manager(MemoryConfigSource())
+        await manager.initialize()
+        seen = []
+
+        async def consumer(event):
+            seen.append(event.new_config.vlm.model)
+
+        manager.add_update_consumer(
+            scope=ScopeKind.CLUSTER,
+            sections={"vlm"},
+            consumer=consumer,
+        )
+        original_drain = manager._drain_notifications
+        first_waiting = asyncio.Event()
+        release_first = asyncio.Event()
+        drain_calls = 0
+
+        async def delayed_first_drain():
+            nonlocal drain_calls
+            drain_calls += 1
+            if drain_calls == 1:
+                first_waiting.set()
+                await release_first.wait()
+            await original_drain()
+
+        manager._drain_notifications = delayed_first_drain
+        first = asyncio.create_task(manager.patch_cluster({"vlm": {"model": "one"}}))
+        await first_waiting.wait()
+        await manager.patch_cluster({"vlm": {"model": "two"}})
+        release_first.set()
+        await first
+
+        assert seen == ["one", "two"]
+
+    asyncio.run(run())
+
+
+def test_refresh_notification_precedes_later_patch_notification():
+    async def run():
+        source = MemoryConfigSource()
+        manager, _ = _make_manager(source)
+        await manager.initialize()
+        await manager.get_account("ov-a", "vlm")
+        await source.update(
+            ConfigScope.account("ov-a"),
+            lambda _: {"vlm": {"model": "refresh"}},
+        )
+        seen = []
+
+        async def consumer(event):
+            seen.append(event.new_config.vlm.model)
+
+        manager.add_update_consumer(
+            scope=ScopeKind.ACCOUNT,
+            sections={"vlm"},
+            consumer=consumer,
+        )
+        original_drain = manager._drain_notifications
+        refresh_waiting = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def delayed_refresh_drain():
+            with manager._notification_queue_lock:
+                has_pending = bool(manager._notification_queue)
+            if has_pending and not refresh_waiting.is_set():
+                refresh_waiting.set()
+                await release_refresh.wait()
+            await original_drain()
+
+        manager._drain_notifications = delayed_refresh_drain
+        refreshing = asyncio.create_task(manager.refresh_once())
+        await refresh_waiting.wait()
+        await manager.patch_account("ov-a", {"vlm": {"model": "patch"}})
+        release_refresh.set()
+        await refreshing
+
+        assert seen == ["refresh", "patch"]
 
     asyncio.run(run())
 

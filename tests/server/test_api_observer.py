@@ -3,6 +3,8 @@
 
 """Tests for observer endpoints (/api/v1/observer/*)."""
 
+import asyncio
+
 import httpx
 
 
@@ -56,6 +58,15 @@ async def test_observer_models(client: httpx.AsyncClient):
     assert "is_healthy" in result
 
 
+async def test_observer_models_structured(client: httpx.AsyncClient):
+    resp = await client.get("/api/v1/observer/models", params={"format": "json"})
+
+    assert resp.status_code == 200
+    status = resp.json()["result"]["status"]
+    assert isinstance(status, dict)
+    assert {"account_id", "embedding_dimension", "vlm", "embedding", "rerank"} <= status.keys()
+
+
 async def test_observer_system(client: httpx.AsyncClient):
     """GET /api/v1/observer/system should return full system status."""
     resp = await client.get("/api/v1/observer/system")
@@ -80,3 +91,20 @@ async def test_observer_system_structured(client: httpx.AsyncClient):
     queue = result["components"]["queue"]
     assert "status" in queue
     assert isinstance(queue["status"], dict)
+
+
+async def test_async_observer_routes_do_not_use_sync_bridge(client, monkeypatch):
+    def fail_sync_bridge(*args, **kwargs):
+        raise AssertionError("async observer route used run_async")
+
+    monkeypatch.setattr("openviking.service.debug_service.run_async", fail_sync_bridge)
+
+    async with asyncio.timeout(10):
+        responses = await asyncio.gather(
+            client.get("/api/v1/observer/queue"),
+            client.get("/api/v1/observer/lock"),
+            client.get("/api/v1/observer/filesystem"),
+            client.get("/api/v1/observer/system"),
+        )
+
+    assert all(response.status_code == 200 for response in responses)

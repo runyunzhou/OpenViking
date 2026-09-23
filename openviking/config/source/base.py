@@ -36,7 +36,13 @@ class ConfigSourceContext:
 
 @runtime_checkable
 class ConfigSource(Protocol):
-    """Storage and change awareness for scoped configuration documents."""
+    """Storage and change awareness for scoped configuration documents.
+
+    A source instance may be called concurrently from different threads and
+    event loops. Implementations must synchronize mutable state accordingly and
+    must not rely on loop-affine clients or asyncio primitives unless they
+    dispatch those operations to their owning loop internally.
+    """
 
     async def load(self, scope: ConfigScope) -> Optional[dict]:
         """Read the explicitly stored settings for one scope.

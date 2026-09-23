@@ -3,7 +3,7 @@
 """
 Debug Service - provides system status query and health check.
 """
-
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -151,7 +151,7 @@ class ObserverService:
         """Check if both vikingdb and config dependencies are set."""
         return self._vikingdb is not None and self._config is not None
 
-    def get_queue_status(self, *, format: str = "table") -> ComponentStatus:
+    async def get_queue_status_async(self, *, format: str = "table") -> ComponentStatus:
         """Get queue status."""
         try:
             qm = get_queue_manager()
@@ -164,9 +164,13 @@ class ObserverService:
             )
         observer = QueueObserver(qm)
         try:
-            status = observer.get_status_json() if format == "json" else observer.get_status_table()
-            is_healthy = observer.is_healthy()
-            has_errors = observer.has_errors()
+            status = (
+                await observer.get_status_json_async()
+                if format == "json"
+                else await observer.get_status_table_async()
+            )
+            has_errors = await observer.has_active_errors_async()
+            is_healthy = not has_errors
         except Exception as exc:
             logger.warning("Queue observer status unavailable: %s", exc)
             if format == "json":
@@ -192,6 +196,10 @@ class ObserverService:
             has_errors=has_errors,
             status=status,
         )
+
+    def get_queue_status(self, *, format: str = "table") -> ComponentStatus:
+        """Synchronous compatibility wrapper for non-async callers."""
+        return run_async(self.get_queue_status_async(format=format))
 
     @property
     def queue(self) -> ComponentStatus:
@@ -280,12 +288,16 @@ class ObserverService:
             embedding_instance=embedding_instance,
             rerank_instance=rerank_instance,
         )
+        status = observer.get_status_json() if format == "json" else observer.get_status_table()
+        if format == "json":
+            status = {"scope": scope, **status}
+        else:
+            status = f"Scope: {scope}\n{status}"
         return ComponentStatus(
             name="models",
             is_healthy=observer.is_healthy(),
             has_errors=observer.has_errors(),
-            status=f"Scope: {scope}\n"
-            + (observer.get_status_json() if format == "json" else observer.get_status_table()),
+            status=status,
         )
 
     async def account_models(
@@ -303,12 +315,22 @@ class ObserverService:
                 embedding_instance=self._embedding_provider.bind(ctx.account_id),
             )
             status = observer.get_status_json() if format == "json" else observer.get_status_table()
+            if format == "json":
+                status = {
+                    "account_id": ctx.account_id,
+                    "embedding_dimension": embedding_status.dimension,
+                    **status,
+                }
+            else:
+                status = (
+                    f"Account: {ctx.account_id}\n"
+                    f"Embedding dimension: {embedding_status.dimension}\n{status}"
+                )
             return ComponentStatus(
                 name="models",
                 is_healthy=True,
                 has_errors=False,
-                status=f"Account: {ctx.account_id}\n"
-                f"Embedding dimension: {embedding_status.dimension}\n{status}",
+                status=status,
             )
         except Exception as exc:
             logger.warning(
@@ -367,13 +389,20 @@ class ObserverService:
     async def account_system(
         self, ctx: RequestContext, *, format: str = "table"
     ) -> SystemStatus:
+        queue, vikingdb, models, lock, filesystem = await asyncio.gather(
+            self.get_queue_status_async(format=format),
+            self.account_vikingdb(ctx, format=format),
+            self.account_models(ctx, format=format),
+            self.get_lock_status_async(format=format),
+            self.get_filesystem_status_async(format=format),
+        )
         components = {
-            "queue": self.get_queue_status(format=format),
-            "vikingdb": await self.account_vikingdb(ctx, format=format),
-            "models": await self.account_models(ctx, format=format),
-            "lock": self.get_lock_status(format=format),
+            "queue": queue,
+            "vikingdb": vikingdb,
+            "models": models,
+            "lock": lock,
             "retrieval": self.get_retrieval_status(format=format),
-            "filesystem": self.get_filesystem_status(format=format),
+            "filesystem": filesystem,
         }
         return SystemStatus(
             is_healthy=all(component.is_healthy for component in components.values()),
@@ -388,39 +417,13 @@ class ObserverService:
     @property
     def lock(self) -> ComponentStatus:
         """Get lock system status via pathlock_observe snapshot."""
-        try:
-            viking_fs = get_viking_fs()
-            snapshot = run_async(viking_fs._async_agfs.pathlock_observe())
-        except Exception:
-            return ComponentStatus(
-                name="lock",
-                is_healthy=False,
-                has_errors=True,
-                status=_lock_not_initialized_status("table"),
-            )
-        active = snapshot.get("active_locks", 0)
-        waiting = snapshot.get("waiting_locks", 0)
-        stale = snapshot.get("stale_locks_removed", 0)
-        conflicts = snapshot.get("conflicts", [])
-        lines = [
-            f"Active locks: {active}",
-            f"Waiting locks: {waiting}",
-            f"Stale locks removed: {stale}",
-            f"Conflicts: {len(conflicts)}",
-        ]
-        # Conflicts and stale removals are retained diagnostics, not current failures.
-        return ComponentStatus(
-            name="lock",
-            is_healthy=True,
-            has_errors=False,
-            status="\n".join(lines),
-        )
+        return self.get_lock_status()
 
-    def get_lock_status(self, *, format: str = "table") -> ComponentStatus:
+    async def get_lock_status_async(self, *, format: str = "table") -> ComponentStatus:
         """Get lock system status via pathlock_observe snapshot."""
         try:
             viking_fs = get_viking_fs()
-            snapshot = run_async(viking_fs._async_agfs.pathlock_observe())
+            snapshot = await viking_fs._async_agfs.pathlock_observe()
         except Exception:
             return ComponentStatus(
                 name="lock",
@@ -455,6 +458,10 @@ class ObserverService:
             status=status,
         )
 
+    def get_lock_status(self, *, format: str = "table") -> ComponentStatus:
+        """Synchronous compatibility wrapper for non-async callers."""
+        return run_async(self.get_lock_status_async(format=format))
+
     @property
     def retrieval(self) -> ComponentStatus:
         """Get retrieval quality status."""
@@ -479,23 +486,26 @@ class ObserverService:
     @property
     def filesystem(self) -> ComponentStatus:
         """Get filesystem operation status."""
+        return self.get_filesystem_status()
+
+    async def get_filesystem_status_async(self, *, format: str = "table") -> ComponentStatus:
+        """Get filesystem operation status."""
         observer = FilesystemObserver()
+        status = (
+            await observer.get_status_json_async()
+            if format == "json"
+            else await observer.get_status_table_async()
+        )
         return ComponentStatus(
             name="filesystem",
             is_healthy=observer.is_healthy(),
             has_errors=observer.has_errors(),
-            status=observer.get_status_table(),
+            status=status,
         )
 
     def get_filesystem_status(self, *, format: str = "table") -> ComponentStatus:
-        """Get filesystem operation status."""
-        observer = FilesystemObserver()
-        return ComponentStatus(
-            name="filesystem",
-            is_healthy=observer.is_healthy(),
-            has_errors=observer.has_errors(),
-            status=observer.get_status_json() if format == "json" else observer.get_status_table(),
-        )
+        """Synchronous compatibility wrapper for non-async callers."""
+        return run_async(self.get_filesystem_status_async(format=format))
 
     async def get_filesystem_stats(self, mount_path: Optional[str] = None) -> dict:
         """

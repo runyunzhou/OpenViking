@@ -159,7 +159,12 @@ class AccountBoundVLM:
 
 
 class AccountVLMProvider:
-    """Select, cache, borrow and retire Account VLM resources."""
+    """Select, cache, borrow and retire Account VLM resources.
+
+    Cluster fallback keeps pre-materialization Account documents working.
+    New provisioning should persist complete Account-owned model settings
+    instead of introducing additional runtime dependencies on Cluster config.
+    """
 
     def __init__(
         self,

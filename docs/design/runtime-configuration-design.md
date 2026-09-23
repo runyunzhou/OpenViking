@@ -34,6 +34,18 @@ New configuration must not use it; business resolvers should explicitly combine
 the independently published Account and Cluster models when that is the desired
 behavior.
 
+Runtime fallback in the current VLM and vector resolvers also keeps existing
+Account documents usable when those documents predate complete Account settings.
+This is a migration compatibility path, not the target lifecycle for new
+configuration. New Account provisioning and new Account-scoped features should
+use Cluster configuration only as a creation template: materialize a complete
+Account-owned configuration during create, persist it with create-if-absent
+semantics, and thereafter change it only through that Account's API. Later
+Cluster changes then define defaults for future Accounts and do not implicitly
+change existing Accounts. Until existing Account documents are migrated or
+materialized, their missing sections continue to use the current resolver
+fallback behavior.
+
 Cluster-versus-Account scope comes from the model declaring the field, not from `RuntimeField` itself. A plain `Field` is outside the runtime API surface.
 
 Current runtime field declarations:
@@ -185,8 +197,10 @@ This distinction prevents a transient storage failure from replacing a known-goo
 
 The old Account `settings` endpoints, the Agent Evolution endpoint, and
 declarative whole-section fallback remain compatibility adapters. New Account
-features should read Account configuration directly and implement any Cluster
-default in their business resolver.
+features should read complete Account-owned configuration directly. Cluster
+defaults should be materialized by Account provisioning rather than introduced
+as new runtime fallback dependencies. Existing resolver fallback remains until
+pre-materialization Account documents have been migrated.
 
 Extended Account sections should not be written while old replicas share the same Account directory if those replicas reject unknown fields in `setting.json`.
 

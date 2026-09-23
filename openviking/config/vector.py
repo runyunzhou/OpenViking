@@ -192,7 +192,9 @@ class AccountVectorConfigResolver:
 def resolve_account_vector_settings(account: Any, cluster: Any) -> VectorRuntimeSettings:
     # Account and Cluster remain independent publications. Choosing Cluster
     # when an Account section is absent is vector-domain behavior, not generic
-    # RuntimeField fallback.
+    # RuntimeField fallback. This path also keeps pre-materialization Account
+    # documents working; new Account provisioning should snapshot defaults into
+    # Account-owned settings instead of adding further runtime Cluster coupling.
     embedding = resolve_effective_embedding(cluster.embedding, account.embedding)
     vectordb = resolve_effective_vectordb(cluster.storage.vectordb, account.vectordb)
     if account.vectordb is None:

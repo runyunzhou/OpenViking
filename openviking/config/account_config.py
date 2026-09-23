@@ -9,6 +9,12 @@ Some existing fields still declare the deprecated ``RuntimeField.fallback``
 compatibility behavior. It can only select a complete Cluster section when the
 Account section is absent. New defaults and any field-level composition belong
 in business resolvers, not in this model or the generic configuration manager.
+
+Runtime Cluster fallback also remains necessary for Account documents created
+before complete settings were materialized. It is a migration constraint, not
+the target model for new configuration. New provisioning flows should copy
+Cluster defaults into a complete Account-owned configuration at creation time;
+later Cluster changes must not alter that Account implicitly.
 """
 
 from __future__ import annotations
@@ -125,7 +131,9 @@ class AccountConfig(BaseModel):
     configuration needed for that section; business resolvers may use Cluster
     configuration only when the corresponding Account section is absent.
     The few ``fallback`` declarations below are legacy whole-section
-    compatibility behavior and should not be copied to new fields.
+    compatibility behavior and should not be copied to new fields. New Account
+    creation should materialize defaults instead of introducing new runtime
+    dependencies on Cluster configuration.
     """
 
     # Account-level settings with active business consumers.

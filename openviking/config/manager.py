@@ -25,16 +25,18 @@ imports neither ``OpenVikingConfig`` nor ``AccountConfig`` directly.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
-import weakref
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Generic, Iterable, Optional, TypeVar
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.config.merge import apply_three_state_patch, diff_sections
 from openviking.config.scope import ConfigScope, ScopeKind
 from openviking.config.source.base import ConfigSource
-from openviking.service.task_tracker_concurrency import OwnerLoopDispatcher, run_to_completion
+from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool, run_to_completion
 from openviking_cli.utils.config.runtime_field import fallback_of, resolve_fallback
 from openviking_cli.utils.logger import get_logger
 
@@ -156,7 +158,7 @@ class _ConsumerRegistration:
 
 @dataclass
 class _AccountEntry(Generic[A]):
-    """One account's cached state under the manager's owner loop.
+    """One account's cached state protected by the publication lock.
 
     ``config`` is the constructed, already-validated account model;
     ``last_access`` drives idle eviction.
@@ -198,7 +200,6 @@ class RuntimeConfigManager(Generic[C, A]):
         account_candidate_validators: Iterable[AccountCandidateValidator[C, A]] = (),
     ) -> None:
         self._source = source
-        self._dispatcher = OwnerLoopDispatcher()
         # Immutable startup baseline. Cluster overrides are always rebuilt from
         # this object, never from the previously published effective config.
         self._base_config = base_config
@@ -214,17 +215,17 @@ class RuntimeConfigManager(Generic[C, A]):
         self._validate_request = validate_request
         # Domain validators run before persistence and never mutate publications.
         self._account_candidate_validators = tuple(account_candidate_validators)
-        # Per-account cache; only touched on the owner loop.
+        # Per-account cache; publication_lock protects cross-loop snapshots.
         self._accounts: dict[str, _AccountEntry[A]] = {}
         self._persisted_settings: dict[ConfigScope, Optional[dict]] = {}
         self._consumers: list[_ConsumerRegistration] = []
         # Per-scope local locks serialize same-node concurrent PATCHes so two
         # requests mutating the same scope can't interleave read-merge-write.
-        self._scope_locks: weakref.WeakValueDictionary[tuple, asyncio.Lock] = (
-            weakref.WeakValueDictionary()
-        )
-        self._publish_lock = asyncio.Lock()
-        self._notification_lock = asyncio.Lock()
+        self._scope_locks = KeyedAsyncLockPool[tuple]()
+        self._publication_lock = threading.RLock()
+        self._notification_lock = AsyncSemaphore()
+        self._notification_queue_lock = threading.Lock()
+        self._notification_queue: deque[ConfigChangeEvent] = deque()
         self._refresh_task: Optional[asyncio.Task] = None
 
     # -- consumers ------------------------------------------------------------
@@ -251,19 +252,16 @@ class RuntimeConfigManager(Generic[C, A]):
 
     async def initialize(self) -> None:
         """Load cluster defaults before serving requests."""
-        self._dispatcher.bind_current_loop()
         await self._refresh_scope(ConfigScope.cluster(), reason=ConfigChangeReason.UPDATE)
 
     async def replace_base_config(self, base_config: C) -> ConfigChangeEvent:
         """Replace the startup baseline without persisting runtime settings."""
-        return await self._dispatcher.run(
-            lambda: run_to_completion(lambda: self._replace_base_config(base_config))
-        )
+        return await run_to_completion(lambda: self._replace_base_config(base_config))
 
     async def _replace_base_config(self, base_config: C) -> ConfigChangeEvent:
         scope = ConfigScope.cluster()
         async with self._lock_for(scope):
-            async with self._publish_lock:
+            with self._publication_lock:
                 self._base_config = base_config
                 persisted_settings = self._persisted_settings.get(scope)
                 candidate = self._build_candidate(scope, persisted_settings)
@@ -273,7 +271,8 @@ class RuntimeConfigManager(Generic[C, A]):
                     candidate,
                     reason=ConfigChangeReason.UPDATE,
                 )
-        await self._notify(event)
+                self._enqueue_notification(event)
+        await self._drain_notifications()
         return event
 
     # -- account loading -----------------------------------------------------
@@ -285,17 +284,19 @@ class RuntimeConfigManager(Generic[C, A]):
         "loaded, no settings"; a read/decrypt/validate failure raises and does
         not fall back to another Account's configuration.
         """
-        entry = self._accounts.get(account_id)
-        if entry is not None:
-            entry.last_access = time.monotonic()
-            return
+        with self._publication_lock:
+            entry = self._accounts.get(account_id)
+            if entry is not None:
+                entry.last_access = time.monotonic()
+                return
         scope = ConfigScope.account(account_id)
         async with self._lock_for(scope):
-            if account_id in self._accounts:
-                self._accounts[account_id].last_access = time.monotonic()
-                return
+            with self._publication_lock:
+                if account_id in self._accounts:
+                    self._accounts[account_id].last_access = time.monotonic()
+                    return
             persisted_settings = await self._source.load(scope)
-            async with self._publish_lock:
+            with self._publication_lock:
                 self._accounts[account_id] = _AccountEntry(
                     config=self._build_account_candidate(persisted_settings),
                     last_access=time.monotonic(),
@@ -314,16 +315,18 @@ class RuntimeConfigManager(Generic[C, A]):
         Selectors must be synchronous and perform no I/O or configuration
         mutations. Loading and cancellation have the same contract as get_account.
         """
-        return await self._dispatcher.run(
-            lambda: run_to_completion(lambda: self._resolve_account(account_id, resolver))
-        )
+        return await run_to_completion(lambda: self._resolve_account(account_id, resolver))
 
     async def _resolve_account(
         self, account_id: str, resolver: Callable[[AccountConfigView[C, A]], T]
     ) -> T:
-        await self._ensure_loaded(account_id)
-        # No await between capturing the publications and running the selector.
-        view = AccountConfigView(self._accounts[account_id].config, self._get_config())
+        while True:
+            await self._ensure_loaded(account_id)
+            with self._publication_lock:
+                entry = self._accounts.get(account_id)
+                if entry is not None:
+                    view = AccountConfigView(entry.config, self._get_config())
+                    break
         result = resolver(view)
         import inspect
 
@@ -337,7 +340,7 @@ class RuntimeConfigManager(Generic[C, A]):
         """Read the settings stored for exactly one scope."""
         import copy
 
-        return copy.deepcopy(await self._dispatcher.run(lambda: self._source.load(scope)) or {})
+        return copy.deepcopy(await self._source.load(scope) or {})
 
     def validate_initial_settings(self, account_id: str, settings: dict) -> None:
         """Validate creation-time settings without persisting them."""
@@ -351,38 +354,33 @@ class RuntimeConfigManager(Generic[C, A]):
     async def patch_cluster(self, patch: dict) -> ConfigChangeEvent:
         """Apply a three-state PATCH to the Cluster settings and publish."""
         scope = ConfigScope.cluster()
-        return await self._dispatcher.run(
-            lambda: run_to_completion(lambda: self._patch(scope, patch))
-        )
+        return await run_to_completion(lambda: self._patch(scope, patch))
 
     async def patch_account(
         self, account_id: str, patch: dict, *, creating: bool = False
     ) -> ConfigChangeEvent:
         """Apply a three-state PATCH to one Account configuration and publish."""
         scope = ConfigScope.account(account_id)
-        return await self._dispatcher.run(
-            lambda: run_to_completion(lambda: self._patch(scope, patch, creating=creating))
-        )
+        return await run_to_completion(lambda: self._patch(scope, patch, creating=creating))
 
     async def delete_account(self, account_id: str) -> ConfigChangeEvent:
         """Delete one Account configuration and evict all manager-owned state."""
         scope = ConfigScope.account(account_id)
-        return await self._dispatcher.run(
-            lambda: run_to_completion(lambda: self._delete_account(scope))
-        )
+        return await run_to_completion(lambda: self._delete_account(scope))
 
     async def _delete_account(self, scope: ConfigScope) -> ConfigChangeEvent:
         assert scope.key is not None
         async with self._lock_for(scope):
             await self._source.delete(scope)
-            async with self._publish_lock:
+            with self._publication_lock:
                 event = self._publish(
                     scope,
                     None,
                     None,
                     reason=ConfigChangeReason.EVICT,
                 )
-        await self._notify(event)
+                self._enqueue_notification(event)
+        await self._drain_notifications()
         return event
 
     async def _patch(
@@ -399,16 +397,17 @@ class RuntimeConfigManager(Generic[C, A]):
             # Phase 3: publish only the already-built candidate. Account and
             # Cluster publications are independent; a Cluster pointer change
             # never rebuilds the AccountConfig candidate.
-            async with self._publish_lock:
+            with self._publication_lock:
                 event = self._publish(
                     scope,
                     prepared.persisted_settings,
                     prepared.candidate,
                     reason=ConfigChangeReason.UPDATE,
                 )
+                self._enqueue_notification(event)
 
         # Phase 4: consumers observe a completed publication.
-        await self._notify(event)
+        await self._drain_notifications()
         return event
 
     def _validate_patch_request(
@@ -593,29 +592,38 @@ class RuntimeConfigManager(Generic[C, A]):
             reason=reason,
         )
 
-    async def _notify(self, event: ConfigChangeEvent) -> None:
-        """Await matching consumers in registration order after publication."""
+    def _enqueue_notification(self, event: ConfigChangeEvent) -> None:
+        """Queue one event while the publication lock still defines its order."""
         is_evict = event.reason is ConfigChangeReason.EVICT
         if not event.changed_sections and not is_evict:
             return
-        async with self._notification_lock:
-            for registration in self._consumers:
-                if registration.scope is not event.scope.kind:
-                    continue
-                if not is_evict and registration.sections.isdisjoint(event.changed_sections):
-                    continue
-                try:
-                    await registration.consumer(event)
-                except Exception:
-                    logger.exception("Config change consumer failed")
+        with self._notification_queue_lock:
+            self._notification_queue.append(event)
 
-    def _lock_for(self, scope: ConfigScope) -> asyncio.Lock:
+    async def _drain_notifications(self) -> None:
+        """Deliver published events in mutation order without holding write locks."""
+        async with self._notification_lock:
+            while True:
+                with self._notification_queue_lock:
+                    if not self._notification_queue:
+                        return
+                    event = self._notification_queue.popleft()
+                is_evict = event.reason is ConfigChangeReason.EVICT
+                for registration in self._consumers:
+                    if registration.scope is not event.scope.kind:
+                        continue
+                    if not is_evict and registration.sections.isdisjoint(
+                        event.changed_sections
+                    ):
+                        continue
+                    try:
+                        await registration.consumer(event)
+                    except Exception:
+                        logger.exception("Config change consumer failed")
+
+    def _lock_for(self, scope: ConfigScope):
         key = (scope.kind.value, scope.key)
-        lock = self._scope_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._scope_locks[key] = lock
-        return lock
+        return self._scope_locks.acquire(key)
 
     # -- periodic refresh ----------------------------------------------------
 
@@ -644,8 +652,8 @@ class RuntimeConfigManager(Generic[C, A]):
                 logger.exception("Runtime config refresh iteration failed")
 
     async def refresh_once(self) -> None:
-        """Run one refresh on the configuration owner's loop."""
-        await self._dispatcher.run(self._refresh_once)
+        """Reload all active configuration scopes once."""
+        await run_to_completion(self._refresh_once)
 
     async def _refresh_once(self) -> None:
         """Reload cluster + hot accounts once, publishing any observed change.
@@ -656,13 +664,15 @@ class RuntimeConfigManager(Generic[C, A]):
         being reloaded. On load or publish failure the last effective value is
         kept, and the next refresh retries the active scope.
         """
-        async with self._publish_lock:
+        with self._publication_lock:
             evictions = self._evict_cold_accounts()
-        for event in evictions:
-            await self._notify(event)
-        scopes = [ConfigScope.cluster()] + [
-            ConfigScope.account(account_id) for account_id in list(self._accounts)
-        ]
+            for event in evictions:
+                self._enqueue_notification(event)
+        await self._drain_notifications()
+        with self._publication_lock:
+            scopes = [ConfigScope.cluster()] + [
+                ConfigScope.account(account_id) for account_id in self._accounts
+            ]
         for scope in scopes:
             try:
                 await self._refresh_scope(scope, reason=ConfigChangeReason.UPDATE)
@@ -681,26 +691,27 @@ class RuntimeConfigManager(Generic[C, A]):
     ) -> None:
         async with self._lock_for(scope):
             persisted_settings = await self._source.load(scope)
-            if (
-                scope in self._persisted_settings
-                and self._persisted_settings[scope] == persisted_settings
-            ):
-                return
-            candidate = self._build_candidate(
-                scope,
-                persisted_settings,
-                changed_sections=None,
-                old_settings=_NO_OLD_SETTINGS,
-                creating=False,
-            )
-            async with self._publish_lock:
+            with self._publication_lock:
+                if (
+                    scope in self._persisted_settings
+                    and self._persisted_settings[scope] == persisted_settings
+                ):
+                    return
+                candidate = self._build_candidate(
+                    scope,
+                    persisted_settings,
+                    changed_sections=None,
+                    old_settings=_NO_OLD_SETTINGS,
+                    creating=False,
+                )
                 if scope.kind is ScopeKind.ACCOUNT:
                     assert scope.key is not None
                     if scope.key not in self._accounts:
                         # A refresh must not resurrect an evicted/never-loaded account.
                         return
                 event = self._publish(scope, persisted_settings, candidate, reason=reason)
-        await self._notify(event)
+                self._enqueue_notification(event)
+        await self._drain_notifications()
 
     def _evict_cold_accounts(self) -> list[ConfigChangeEvent]:
         now = time.monotonic()
