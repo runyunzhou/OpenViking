@@ -6,12 +6,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from openviking.parse.parsers.code.ast import SkeletonExtractionResult
 from openviking.parse.parsers.constants import (
     FILE_TYPE_CODE,
     FILE_TYPE_DOCUMENTATION,
     FILE_TYPE_OTHER,
 )
-from openviking.parse.parsers.code.ast import SkeletonExtractionResult
 from openviking.parse.parsers.media.utils import get_media_type
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 

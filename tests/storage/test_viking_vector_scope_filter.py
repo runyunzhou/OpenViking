@@ -1,6 +1,7 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: Apache-2.0
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -74,6 +75,16 @@ class _RecordingAsyncAdapter:
     async def call(self, method_name, **kwargs):
         self.calls.append((method_name, kwargs))
         return []
+
+
+def _single_account_backend(async_adapter, account_id: str | None):
+    backend = object.__new__(_SingleAccountBackend)
+    backend._bound_account_id = account_id
+    backend._operation_condition = threading.Condition()
+    backend._operations = {}
+    backend._retired = False
+    backend._async_adapter = async_adapter
+    return backend
 
 
 @pytest.mark.asyncio
@@ -425,9 +436,7 @@ def test_actor_peer_target_retains_account_and_exact_target_scope():
 
 @pytest.mark.asyncio
 async def test_search_by_random_propagates_adapter_errors():
-    backend = object.__new__(_SingleAccountBackend)
-    backend._bound_account_id = None
-    backend._async_adapter = _FailingAsyncAdapter()
+    backend = _single_account_backend(_FailingAsyncAdapter(), None)
 
     with pytest.raises(RuntimeError, match="search_by_random failed"):
         await backend.search_by_random(filter=Eq("uri", "viking://resources/a.md"))
@@ -435,9 +444,7 @@ async def test_search_by_random_propagates_adapter_errors():
 
 @pytest.mark.asyncio
 async def test_search_by_random_reuses_account_filter_for_raw_dsl():
-    backend = object.__new__(_SingleAccountBackend)
-    backend._bound_account_id = "acct"
-    backend._async_adapter = _RecordingAsyncAdapter()
+    backend = _single_account_backend(_RecordingAsyncAdapter(), "acct")
     raw_filter = {"op": "must", "field": "uri", "conds": ["viking://resources"]}
 
     await backend.search_by_random(filter=raw_filter)
