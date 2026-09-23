@@ -27,12 +27,11 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from collections import deque
+from concurrent.futures import Future as ConcurrentFuture
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Generic, Iterable, Optional, TypeVar
 
-from openviking.concurrency import AsyncSemaphore
 from openviking.config.merge import apply_three_state_patch, diff_sections
 from openviking.config.scope import ConfigScope, ScopeKind
 from openviking.config.source.base import ConfigSource
@@ -176,6 +175,15 @@ class _PreparedPatch:
     candidate: Any
 
 
+@dataclass(frozen=True)
+class _PendingNotification:
+    """One notification ordered after the previous event for its scope."""
+
+    event: ConfigChangeEvent
+    predecessor: Optional[ConcurrentFuture[None]]
+    completion: ConcurrentFuture[None]
+
+
 class RuntimeConfigManager(Generic[C, A]):
     """Coordinate scoped config patching/publication over a :class:`ConfigSource`.
 
@@ -223,10 +231,10 @@ class RuntimeConfigManager(Generic[C, A]):
         # requests mutating the same scope can't interleave read-merge-write.
         self._scope_locks = KeyedAsyncLockPool[tuple]()
         self._publication_lock = threading.RLock()
-        self._notification_lock = AsyncSemaphore()
-        self._notification_queue_lock = threading.Lock()
-        self._notification_queue: deque[ConfigChangeEvent] = deque()
+        self._notification_tails: dict[ConfigScope, ConcurrentFuture[None]] = {}
+        self._refresh_task_lock = threading.Lock()
         self._refresh_task: Optional[asyncio.Task] = None
+        self._refresh_task_loop: Optional[asyncio.AbstractEventLoop] = None
 
     # -- consumers ------------------------------------------------------------
 
@@ -271,8 +279,8 @@ class RuntimeConfigManager(Generic[C, A]):
                     candidate,
                     reason=ConfigChangeReason.UPDATE,
                 )
-                self._enqueue_notification(event)
-        await self._drain_notifications()
+                notification = self._chain_notification(event)
+        await self._notify_in_order(notification)
         return event
 
     # -- account loading -----------------------------------------------------
@@ -379,8 +387,8 @@ class RuntimeConfigManager(Generic[C, A]):
                     None,
                     reason=ConfigChangeReason.EVICT,
                 )
-                self._enqueue_notification(event)
-        await self._drain_notifications()
+                notification = self._chain_notification(event)
+        await self._notify_in_order(notification)
         return event
 
     async def _patch(
@@ -404,10 +412,10 @@ class RuntimeConfigManager(Generic[C, A]):
                     prepared.candidate,
                     reason=ConfigChangeReason.UPDATE,
                 )
-                self._enqueue_notification(event)
+                notification = self._chain_notification(event)
 
-        # Phase 4: consumers observe a completed publication.
-        await self._drain_notifications()
+        # Phase 4: consumers run outside write locks, in publication order.
+        await self._notify_in_order(notification)
         return event
 
     def _validate_patch_request(
@@ -592,34 +600,52 @@ class RuntimeConfigManager(Generic[C, A]):
             reason=reason,
         )
 
-    def _enqueue_notification(self, event: ConfigChangeEvent) -> None:
-        """Queue one event while the publication lock still defines its order."""
+    def _chain_notification(
+        self, event: ConfigChangeEvent
+    ) -> Optional[_PendingNotification]:
+        """Link an event to the preceding notification for the same scope."""
+        is_evict = event.reason is ConfigChangeReason.EVICT
+        if not event.changed_sections and not is_evict:
+            return None
+        completion: ConcurrentFuture[None] = ConcurrentFuture()
+        pending = _PendingNotification(
+            event=event,
+            predecessor=self._notification_tails.get(event.scope),
+            completion=completion,
+        )
+        self._notification_tails[event.scope] = completion
+        return pending
+
+    async def _notify_in_order(
+        self, pending: Optional[_PendingNotification]
+    ) -> None:
+        """Deliver one event after its scope predecessor, without write locks."""
+        if pending is None:
+            return
+        if pending.predecessor is not None:
+            await asyncio.wrap_future(pending.predecessor)
+        try:
+            await self._notify(pending.event)
+        finally:
+            pending.completion.set_result(None)
+            with self._publication_lock:
+                if self._notification_tails.get(pending.event.scope) is pending.completion:
+                    self._notification_tails.pop(pending.event.scope, None)
+
+    async def _notify(self, event: ConfigChangeEvent) -> None:
+        """Await matching consumers in registration order for one scope."""
         is_evict = event.reason is ConfigChangeReason.EVICT
         if not event.changed_sections and not is_evict:
             return
-        with self._notification_queue_lock:
-            self._notification_queue.append(event)
-
-    async def _drain_notifications(self) -> None:
-        """Deliver published events in mutation order without holding write locks."""
-        async with self._notification_lock:
-            while True:
-                with self._notification_queue_lock:
-                    if not self._notification_queue:
-                        return
-                    event = self._notification_queue.popleft()
-                is_evict = event.reason is ConfigChangeReason.EVICT
-                for registration in self._consumers:
-                    if registration.scope is not event.scope.kind:
-                        continue
-                    if not is_evict and registration.sections.isdisjoint(
-                        event.changed_sections
-                    ):
-                        continue
-                    try:
-                        await registration.consumer(event)
-                    except Exception:
-                        logger.exception("Config change consumer failed")
+        for registration in self._consumers:
+            if registration.scope is not event.scope.kind:
+                continue
+            if not is_evict and registration.sections.isdisjoint(event.changed_sections):
+                continue
+            try:
+                await registration.consumer(event)
+            except Exception:
+                logger.exception("Config change consumer failed")
 
     def _lock_for(self, scope: ConfigScope):
         key = (scope.kind.value, scope.key)
@@ -628,18 +654,35 @@ class RuntimeConfigManager(Generic[C, A]):
     # -- periodic refresh ----------------------------------------------------
 
     def start_refresh_loop(self, interval_secs: float = REFRESH_INTERVAL_SECS) -> None:
-        if self._refresh_task is None or self._refresh_task.done():
-            self._refresh_task = asyncio.create_task(self._refresh_loop(interval_secs))
+        loop = asyncio.get_running_loop()
+        with self._refresh_task_lock:
+            if self._refresh_task is None or self._refresh_task.done():
+                self._refresh_task = loop.create_task(self._refresh_loop(interval_secs))
+                self._refresh_task_loop = loop
 
     async def stop_refresh_loop(self) -> None:
-        task = self._refresh_task
-        self._refresh_task = None
-        if task is not None:
+        with self._refresh_task_lock:
+            task = self._refresh_task
+            owner_loop = self._refresh_task_loop
+        if task is None or owner_loop is None:
+            return
+
+        async def cancel_and_wait() -> None:
             task.cancel()
             try:
                 await task
             except asyncio.CancelledError:
                 pass
+
+        if asyncio.get_running_loop() is owner_loop:
+            await cancel_and_wait()
+        else:
+            future = asyncio.run_coroutine_threadsafe(cancel_and_wait(), owner_loop)
+            await asyncio.wrap_future(future)
+        with self._refresh_task_lock:
+            if self._refresh_task is task:
+                self._refresh_task = None
+                self._refresh_task_loop = None
 
     async def _refresh_loop(self, interval_secs: float) -> None:
         while True:
@@ -665,10 +708,9 @@ class RuntimeConfigManager(Generic[C, A]):
         kept, and the next refresh retries the active scope.
         """
         with self._publication_lock:
-            evictions = self._evict_cold_accounts()
-            for event in evictions:
-                self._enqueue_notification(event)
-        await self._drain_notifications()
+            account_ids = list(self._accounts)
+        for account_id in account_ids:
+            await self._evict_account_if_cold(account_id)
         with self._publication_lock:
             scopes = [ConfigScope.cluster()] + [
                 ConfigScope.account(account_id) for account_id in self._accounts
@@ -710,26 +752,26 @@ class RuntimeConfigManager(Generic[C, A]):
                         # A refresh must not resurrect an evicted/never-loaded account.
                         return
                 event = self._publish(scope, persisted_settings, candidate, reason=reason)
-                self._enqueue_notification(event)
-        await self._drain_notifications()
+                notification = self._chain_notification(event)
+        await self._notify_in_order(notification)
 
-    def _evict_cold_accounts(self) -> list[ConfigChangeEvent]:
-        now = time.monotonic()
-        cold = [
-            account_id
-            for account_id, entry in self._accounts.items()
-            if now - entry.last_access > ACCOUNT_IDLE_TTL_SECS
-        ]
-        events: list[ConfigChangeEvent] = []
-        for account_id in cold:
-            entry = self._accounts.pop(account_id)
-            self._persisted_settings.pop(ConfigScope.account(account_id), None)
-            events.append(
-                self._account_event(
+    async def _evict_account_if_cold(self, account_id: str) -> None:
+        scope = ConfigScope.account(account_id)
+        async with self._lock_for(scope):
+            with self._publication_lock:
+                entry = self._accounts.get(account_id)
+                if (
+                    entry is None
+                    or time.monotonic() - entry.last_access <= ACCOUNT_IDLE_TTL_SECS
+                ):
+                    return
+                self._accounts.pop(account_id)
+                self._persisted_settings.pop(scope, None)
+                event = self._account_event(
                     account_id,
                     entry.config,
                     None,
                     reason=ConfigChangeReason.EVICT,
                 )
-            )
-        return events
+                notification = self._chain_notification(event)
+        await self._notify_in_order(notification)

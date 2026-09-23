@@ -5,6 +5,7 @@ Tests for DebugService and ObserverService.
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 from openviking.service.debug_service import (
@@ -470,6 +471,48 @@ class TestObserverService:
 
         assert status is expected
         mock_get_status.assert_called_once_with()
+
+    async def test_account_models_json_failure_remains_structured(self):
+        embedding_provider = MagicMock()
+        embedding_provider.get_status = AsyncMock(side_effect=RuntimeError("embedding down"))
+        service = ObserverService(
+            embedding_provider=embedding_provider,
+            vlm_resolver=MagicMock(),
+        )
+
+        status = await service.account_models(
+            SimpleNamespace(account_id="ov-a"),
+            format="json",
+        )
+
+        assert status.status == {
+            "account_id": "ov-a",
+            "embedding_dimension": None,
+            "vlm": [],
+            "embedding": [],
+            "rerank": [],
+            "error": "embedding down",
+        }
+
+    async def test_account_vikingdb_json_failure_remains_structured(self):
+        vikingdb = MagicMock()
+        vikingdb.get_account_backend = AsyncMock(side_effect=RuntimeError("database down"))
+        service = ObserverService(vikingdb=vikingdb)
+
+        status = await service.account_vikingdb(
+            SimpleNamespace(account_id="ov-a"),
+            format="json",
+        )
+
+        assert status.status == {
+            "account_id": "ov-a",
+            "backend": None,
+            "collection": None,
+            "index": None,
+            "dimension": None,
+            "vector_count": 0,
+            "error": "database down",
+        }
 
     @patch("openviking.service.debug_service.get_viking_fs", side_effect=RuntimeError())
     def test_lock_json_status_without_dependency_is_structured(self, _mock_get_viking_fs):

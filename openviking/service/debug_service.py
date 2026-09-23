@@ -303,10 +303,12 @@ class ObserverService:
     async def account_models(
         self, ctx: RequestContext, *, format: str = "table"
     ) -> ComponentStatus:
+        embedding_dimension = None
         try:
             if self._embedding_provider is None:
                 raise RuntimeError("Account embedding provider is not initialized")
             embedding_status = await self._embedding_provider.get_status(ctx.account_id)
+            embedding_dimension = embedding_status.dimension
             if self._vlm_resolver is None:
                 raise RuntimeError("Account VLM resolver is not initialized")
             vlm = await self._vlm_resolver.get_vlm(ctx.account_id)
@@ -343,7 +345,18 @@ class ObserverService:
                 name="models",
                 is_healthy=False,
                 has_errors=True,
-                status=f"Account: {ctx.account_id}\nModels unavailable: {exc}",
+                status=(
+                    {
+                        "account_id": ctx.account_id,
+                        "embedding_dimension": embedding_dimension,
+                        "vlm": [],
+                        "embedding": [],
+                        "rerank": [],
+                        "error": str(exc),
+                    }
+                    if format == "json"
+                    else f"Account: {ctx.account_id}\nModels unavailable: {exc}"
+                ),
             )
 
     async def account_vikingdb(
@@ -383,7 +396,19 @@ class ObserverService:
                 name="vikingdb",
                 is_healthy=False,
                 has_errors=True,
-                status=f"Account: {ctx.account_id}\nVectorDB unavailable: {exc}",
+                status=(
+                    {
+                        "account_id": ctx.account_id,
+                        "backend": None,
+                        "collection": None,
+                        "index": None,
+                        "dimension": None,
+                        "vector_count": 0,
+                        "error": str(exc),
+                    }
+                    if format == "json"
+                    else f"Account: {ctx.account_id}\nVectorDB unavailable: {exc}"
+                ),
             )
 
     async def account_system(
