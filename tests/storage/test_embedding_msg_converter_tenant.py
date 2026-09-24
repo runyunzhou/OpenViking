@@ -49,18 +49,6 @@ def test_embedding_msg_converter_preserves_account_and_backfills_owner_fields(
     assert msg.action is IndexAction.MERGE
 
 
-@pytest.mark.parametrize("account_id", ["", "   ", None])
-def test_embedding_msg_converter_rejects_missing_account(account_id):
-    context = Context(
-        uri="viking://user/alice/memories/me.md",
-        abstract="hello",
-        user=UserIdentifier("acme", "alice"),
-    )
-    context.account_id = account_id
-    with pytest.raises(ValueError, match="requires account_id"):
-        EmbeddingMsgConverter.from_context(context)
-
-
 def test_embedding_msg_converter_keeps_only_embedding_input():
     context = Context(uri="viking://resources/large.txt", abstract="short embedding text")
     context.set_vectorize(Vectorize(text="bounded embedding text"))

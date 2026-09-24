@@ -12,11 +12,11 @@ from openviking.storage.acl import AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
 from openviking.storage.expr import And, Eq, In, Or, PathScope, RawDSL
 from openviking.storage.viking_vector_index_backend import (
+    VikingVectorIndexBackend,
     _SingleAccountBackend,
 )
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
-from tests.storage.vector_test_utils import ConfiguredVectorBackend as VikingVectorIndexBackend
 
 
 def _ctx(*, role: Role = Role.USER, actor_peer_id: str | None = None) -> RequestContext:
@@ -179,7 +179,9 @@ def test_mixed_visible_and_outside_targets_keep_original_tenant_filter():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_mode", [{}, {"acl_mode": None}, {"acl_mode": "none"}])
-async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, legacy_mode):
+async def test_tenant_search_enforces_visible_roots_and_shared_acl(
+    vector_backend_factory, tmp_path, legacy_mode
+):
     ctx = _ctx()
     own_uri = "viking://user/alice/resources/notes"
     cross_user_uri = "viking://user/bob/resources/notes"
@@ -260,7 +262,7 @@ async def test_tenant_search_enforces_visible_roots_and_shared_acl(tmp_path, leg
         },
     ]
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local", name="context", dimension=4, path=str(tmp_path / "vectors")
         )

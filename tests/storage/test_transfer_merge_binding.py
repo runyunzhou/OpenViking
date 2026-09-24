@@ -22,7 +22,6 @@ from openviking_cli.exceptions import InvalidArgumentError, PermissionDeniedErro
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils.config.agfs_config import AGFSConfig
 from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
-from tests.storage.vector_test_utils import ConfiguredVectorBackend as VikingVectorIndexBackend
 
 
 class _EnabledAclConfig:
@@ -47,10 +46,10 @@ def root_ctx():
 
 
 @pytest_asyncio.fixture
-async def indexed_fs(binding_fs, tmp_path):
+async def indexed_fs(vector_backend_factory, binding_fs, tmp_path):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is unavailable")
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local", name="context", dimension=4, path=str(tmp_path / "vectors")
         )

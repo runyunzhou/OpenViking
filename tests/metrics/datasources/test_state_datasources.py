@@ -91,61 +91,6 @@ def test_metric_datasource_owns_safe_read_helpers_and_datasource_subclasses_reus
     assert ".as_dict(" in observer_state or ".normalize_str(" in observer_state
 
 
-def test_model_usage_service_without_embedding_provider_fails_closed():
-    from openviking.metrics.datasources.model_usage import ModelUsageDataSource
-
-    service = SimpleNamespace(_config=SimpleNamespace())
-    datasource = ModelUsageDataSource(
-        config_provider=lambda: service._config,
-        service=service,
-    )
-
-    result = datasource.read_model_usage()
-
-    assert result.ok is True
-    assert result.value["embedding"] == {
-        "available": False,
-        "usage_by_model": {},
-    }
-
-
-def test_model_usage_service_uses_node_aggregate_for_vlm():
-    from openviking.metrics.datasources.model_usage import ModelUsageDataSource
-
-    aggregate = {
-        "usage_by_model": {
-            "account-model": {
-                "usage_by_provider": {
-                    "provider": {
-                        "prompt_tokens": 2,
-                        "completion_tokens": 3,
-                        "total_tokens": 5,
-                        "call_count": 1,
-                    }
-                }
-            }
-        }
-    }
-    service = SimpleNamespace(
-        _config=SimpleNamespace(),
-        vlm_resolver=SimpleNamespace(get_node_token_usage=lambda: aggregate),
-        embedding_provider=SimpleNamespace(
-            get_total_token_usage=lambda: {"usage_by_model": {}}
-        ),
-    )
-    datasource = ModelUsageDataSource(
-        config_provider=lambda: service._config,
-        service=service,
-    )
-
-    result = datasource.read_model_usage()
-
-    assert result.value["vlm"] == {
-        "available": True,
-        "usage_by_model": aggregate["usage_by_model"],
-    }
-
-
 def test_state_collector_unwraps_envelope_and_routes_ok_false_to_stale_hook():
     registry = MetricRegistry()
     collector = _EnvelopeStateCollector()

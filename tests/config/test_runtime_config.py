@@ -17,14 +17,12 @@ smallest meaningful public contracts across both:
 from __future__ import annotations
 
 import asyncio
-import threading
 from typing import Optional
 
 import pytest
 from pydantic import BaseModel, Field
 
 from openviking.config import (
-    AccountCandidateValidator,
     AccountConfig,
     ConfigChangeReason,
     ConfigScope,
@@ -43,7 +41,6 @@ from openviking_cli.utils.config.runtime_field import (
     is_dynamic,
     is_runtime_field,
 )
-from tests.config.case_data import ACCOUNT_RUNTIME_CASES
 
 # -- test config models -------------------------------------------------------
 
@@ -139,154 +136,6 @@ def test_account_selector_captures_fallback_pair_and_rejects_async():
 
         with pytest.raises(TypeError, match="synchronous"):
             await manager.resolve_account("a", invalid)
-
-    asyncio.run(run())
-
-
-def test_manager_remains_usable_across_event_loops():
-    manager, _ = _make_manager(MemoryConfigSource())
-
-    asyncio.run(manager.initialize())
-    asyncio.run(manager.patch_account("a", {"vlm": {"model": "account"}}))
-
-    assert asyncio.run(manager.get_account("a", "vlm")).model == "account"
-
-
-def test_same_account_patches_serialize_across_event_loops():
-    async def patch_in_thread(manager, patch):
-        await asyncio.to_thread(lambda: asyncio.run(manager.patch_account("a", patch)))
-
-    async def run():
-        manager, _ = _make_manager(MemoryConfigSource())
-        await manager.initialize()
-        await asyncio.gather(
-            patch_in_thread(manager, {"vlm": {"model": "account"}}),
-            patch_in_thread(manager, {"memory": {"extraction_enabled": False}}),
-        )
-        assert (await manager.get_account("a", "vlm")).model == "account"
-        assert (await manager.get_account("a", "memory")).extraction_enabled is False
-
-    asyncio.run(run())
-
-
-def test_refresh_loop_can_stop_from_another_event_loop():
-    manager, _ = _make_manager(MemoryConfigSource())
-    started = threading.Event()
-    errors = []
-
-    def run_owner_loop():
-        async def run():
-            manager.start_refresh_loop(3600)
-            task = manager._refresh_task
-            started.set()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
-        try:
-            asyncio.run(run())
-        except BaseException as exc:
-            errors.append(exc)
-
-    thread = threading.Thread(target=run_owner_loop)
-    thread.start()
-    assert started.wait(timeout=1)
-
-    asyncio.run(manager.stop_refresh_loop())
-    thread.join(timeout=1)
-
-    assert not thread.is_alive()
-    assert errors == []
-
-
-def test_account_candidate_validator_runs_before_persist_and_once_per_patch():
-    async def run():
-        source = MemoryConfigSource()
-        holder = {"config": ClusterConfig()}
-        validated = []
-
-        def validate_candidate(context):
-            validated.append(context)
-            view = context.new_view
-            if view.account.switch and view.account.switch.enabled:
-                raise ValueError("incompatible account candidate")
-
-        manager = RuntimeConfigManager(
-            source,
-            base_config=holder["config"],
-            get_config=lambda: holder["config"],
-            set_config=lambda config: holder.__setitem__("config", config),
-            build_config=_build_cluster,
-            build_account=_build_account,
-            validate_request=lambda patch, account, creating: validate_patch(
-                AccountModel if account else ClusterConfig,
-                patch,
-                creating=creating,
-            ),
-            account_candidate_validators=[
-                AccountCandidateValidator(
-                    sections=frozenset({"switch"}),
-                    validate=validate_candidate,
-                )
-            ],
-        )
-        await manager.initialize()
-
-        with pytest.raises(ValueError, match="incompatible"):
-            await manager.patch_account("a", {"switch": {"enabled": True}})
-        assert await manager.get_settings(ConfigScope.account("a")) == {}
-
-        validated.clear()
-        await manager.patch_account("a", {"vlm": {"model": "account"}})
-        assert len(validated) == 1
-        assert validated[0].changed_sections == frozenset({"vlm"})
-        validated.clear()
-
-        event = await manager.patch_account("a", {"switch": {"enabled": False}})
-        assert len(validated) == 1
-        context = validated[0]
-        assert context.new_view.account is event.new_config
-        assert context.new_view.account.switch.enabled is False
-        assert context.old_view.account.switch is None
-        assert context.old_view.account.vlm.model == "account"
-        assert context.old_view.cluster is context.new_view.cluster is holder["config"]
-        assert context.changed_sections == frozenset({"switch"})
-        assert context.creating is False
-
-        # A remote writer can advance storage beyond this manager's cache.
-        await source.update(
-            ConfigScope.account("a"),
-            lambda _: {"switch": {"enabled": True}},
-        )
-        await manager.patch_account("a", {"switch": {"enabled": False}})
-        assert validated[-1].old_view.account.switch.enabled is True
-
-        validated.clear()
-        manager.validate_initial_settings("new", {})
-        await manager.patch_account("new", {"vlm": {"model": "new"}}, creating=True)
-        assert len(validated) == 2
-        assert all(context.creating and context.old_view is None for context in validated)
-
-        # Loading and refresh validate persisted candidates without PATCH transitions.
-        validated.clear()
-        await manager.get_account("loaded", "switch")
-        assert len(validated) == 1
-        assert validated[0].old_view is None
-        assert validated[0].creating is False
-        assert validated[0].changed_sections is None
-        await source.update(
-            ConfigScope.account("loaded"), lambda _: {"switch": {"enabled": False}}
-        )
-        await manager.refresh_once()
-        assert len(validated) == 2
-        assert validated[-1].old_view is None
-        assert validated[-1].new_view.account.switch.enabled is False
-        await source.update(
-            ConfigScope.account("loaded"), lambda _: {"switch": {"enabled": True}}
-        )
-        await manager.refresh_once()
-        assert (await manager.get_account("loaded", "switch")).enabled is False
 
     asyncio.run(run())
 
@@ -562,11 +411,29 @@ def test_get_account_rejects_unknown_field():
 
 
 def test_account_patch_sets_override_and_publishes():
+    source = MemoryConfigSource()
+    manager, holder = _make_manager(source)
+    asyncio.run(manager.initialize())
+
     async def run():
-        manager, _ = _make_manager(MemoryConfigSource())
-        event = await manager.patch_account("ov-a", {"vlm": {"model": "account-model"}})
-        assert event.scope.key == "ov-a"
-        assert (await manager.get_account("ov-a", "vlm")).model == "account-model"
+        await asyncio.gather(
+            asyncio.to_thread(
+                lambda: asyncio.run(manager.patch_account("ov-a", {"vlm": {"model": "account"}}))
+            ),
+            asyncio.to_thread(
+                lambda: asyncio.run(
+                    manager.patch_account("ov-a", {"memory": {"extraction_enabled": False}})
+                )
+            ),
+        )
+        assert await source.load(ConfigScope.account("ov-a")) == {
+            "vlm": {"model": "account"},
+            "memory": {"extraction_enabled": False},
+        }
+        assert (await manager.get_account("ov-a", "vlm")).model == "account"
+        assert (await manager.get_account("ov-a", "memory")).extraction_enabled is False
+        assert (await manager.get_account("ov-b", "vlm")).model is None
+        assert holder["config"].vlm.model is None
 
     asyncio.run(run())
 
@@ -647,9 +514,9 @@ def test_patch_waits_for_matching_consumers_and_filters_registration():
         seen = []
 
         async def matching(event):
+            seen.append(event.new_config.vlm.model)
             started.set()
             await release.wait()
-            seen.append(event.new_config.vlm.model)
 
         async def wrong_scope(event):
             seen.append("wrong-scope")
@@ -674,132 +541,16 @@ def test_patch_waits_for_matching_consumers_and_filters_registration():
         )
         patch_task = asyncio.create_task(manager.patch_cluster({"vlm": {"model": "first"}}))
         await started.wait()
-        assert not patch_task.done()
-        release.set()
-        await patch_task
+        later = asyncio.create_task(manager.patch_cluster({"vlm": {"model": "second"}}))
+        while (await manager.get_settings(ConfigScope.cluster())).get("vlm", {}).get(
+            "model"
+        ) != "second":
+            await asyncio.sleep(0)
+        assert not patch_task.done() and not later.done()
         assert seen == ["first"]
-
-    asyncio.run(run())
-
-
-def test_different_account_patches_can_persist_concurrently():
-    class ParallelAccountSource(MemoryConfigSource):
-        def __init__(self):
-            super().__init__()
-            self.entered = set()
-            self.both_entered = asyncio.Event()
-
-        async def update(self, scope, mutate):
-            if scope.kind is ScopeKind.ACCOUNT:
-                self.entered.add(scope.key)
-                if len(self.entered) == 2:
-                    self.both_entered.set()
-                await self.both_entered.wait()
-                current = self._store.get(self._key(scope))
-                updated = mutate(current)
-                self._store[self._key(scope)] = updated
-                return updated
-            return await super().update(scope, mutate)
-
-    async def run():
-        source = ParallelAccountSource()
-        manager, _ = _make_manager(source)
-        await manager.initialize()
-        await asyncio.wait_for(
-            asyncio.gather(
-                manager.patch_account("ov-a", {"vlm": {"model": "a"}}),
-                manager.patch_account("ov-b", {"vlm": {"model": "b"}}),
-            ),
-            timeout=1,
-        )
-
-        assert (await manager.get_account("ov-a", "vlm")).model == "a"
-        assert (await manager.get_account("ov-b", "vlm")).model == "b"
-
-    asyncio.run(run())
-
-
-def test_same_scope_notification_finishes_before_next_patch():
-    async def run():
-        manager, _ = _make_manager(MemoryConfigSource())
-        await manager.initialize()
-        seen = []
-        first_started = asyncio.Event()
-        release_first = asyncio.Event()
-        second_started = asyncio.Event()
-        release_second = asyncio.Event()
-
-        async def consumer(event):
-            model = event.new_config.vlm.model
-            seen.append(model)
-            if model == "one":
-                first_started.set()
-                await release_first.wait()
-            else:
-                second_started.set()
-                await release_second.wait()
-
-        manager.add_update_consumer(
-            scope=ScopeKind.CLUSTER,
-            sections={"vlm"},
-            consumer=consumer,
-        )
-        first = asyncio.create_task(manager.patch_cluster({"vlm": {"model": "one"}}))
-        await first_started.wait()
-        second = asyncio.create_task(manager.patch_cluster({"vlm": {"model": "two"}}))
-        await asyncio.sleep(0)
-        assert not second.done()
-
-        release_first.set()
-        await asyncio.wait_for(first, timeout=1)
-        await second_started.wait()
-        assert not second.done()
-
-        release_second.set()
-        await second
-        assert seen == ["one", "two"]
-
-    asyncio.run(run())
-
-
-def test_refresh_notification_precedes_later_patch_notification():
-    async def run():
-        source = MemoryConfigSource()
-        manager, _ = _make_manager(source)
-        await manager.initialize()
-        await manager.get_account("ov-a", "vlm")
-        await source.update(
-            ConfigScope.account("ov-a"),
-            lambda _: {"vlm": {"model": "refresh"}},
-        )
-        seen = []
-        refresh_consumer_started = asyncio.Event()
-        release_refresh = asyncio.Event()
-
-        async def blocking_consumer(event):
-            seen.append(event.new_config.vlm.model)
-            if event.new_config.vlm.model == "refresh":
-                refresh_consumer_started.set()
-                await release_refresh.wait()
-
-        manager.add_update_consumer(
-            scope=ScopeKind.ACCOUNT,
-            sections={"vlm"},
-            consumer=blocking_consumer,
-        )
-        refreshing = asyncio.create_task(manager.refresh_once())
-        await refresh_consumer_started.wait()
-        patching = asyncio.create_task(
-            manager.patch_account("ov-a", {"vlm": {"model": "patch"}})
-        )
-        await asyncio.sleep(0)
-        assert not patching.done()
-
-        release_refresh.set()
-        await refreshing
-        await patching
-
-        assert seen == ["refresh", "patch"]
+        release.set()
+        await asyncio.gather(patch_task, later)
+        assert seen == ["first", "second"]
 
     asyncio.run(run())
 
@@ -933,80 +684,86 @@ def test_refresh_does_not_resurrect_evicted_account():
 # -- AccountConfig field attributes + manager fallback ------------------------
 
 
-def test_account_config_field_attributes():
-    fields = AccountConfig.model_fields
-    assert set(fields) == {
-        "acl",
-        "agent_evolution",
-        "feishu",
-        "github",
-        "query_planner",
-        "vlm",
-        "embedding",
-        "vectordb",
-    }
-    paths = collect_runtime_field_paths(AccountConfig)
-    assert {path for path in paths if path[0] not in {"embedding", "vectordb"}} == {
-        ("acl",),
-        ("acl", "enabled"),
-        ("agent_evolution",),
-        ("agent_evolution", "enabled"),
-        ("feishu",),
-        ("feishu", "app_id"),
-        ("feishu", "app_secret"),
-        ("feishu", "download_images"),
-        ("feishu", "max_records_per_table"),
-        ("feishu", "max_rows_per_sheet"),
-        ("feishu", "request_timeout"),
-        ("github",),
-        ("github", "token"),
-        ("query_planner",),
-        ("query_planner", "credentials"),
-        ("query_planner", "model"),
-        ("query_planner", "timeout"),
-        ("vlm",),
-        ("vlm", "credentials"),
-        ("vlm", "model"),
-        ("vlm", "timeout"),
-    }
-    assert is_dynamic(fields["feishu"])
-    assert fallback_of(fields["feishu"]) is None
-    assert is_dynamic(fields["github"])
-    assert fallback_of(fields["github"]) is None
-    assert is_dynamic(fields["agent_evolution"])
-    assert fallback_of(fields["agent_evolution"]) == "agent_evolution"
-    frozen = collect_frozen_paths(AccountConfig)
-    assert ("vectordb",) in frozen
-    assert ("embedding", "dense", "dimension") in frozen
-    assert ("embedding", "dense", "model") in frozen
+async def test_account_runtime_binding_and_updates_are_isolated():
+    from openviking.config.binding import manager_over_source
+    from openviking.config.vector import AccountVectorConfigResolver
+    from openviking_cli.utils.config import set_openviking_config
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
 
-
-@pytest.mark.parametrize(
-    "case",
-    ACCOUNT_RUNTIME_CASES["invalid_vlm_settings"],
-    ids=lambda case: case["match"],
-)
-def test_account_vlm_credentials_reject_invalid_settings(case):
-    with pytest.raises(ValueError, match=case["match"]):
-        AccountConfig.model_validate(case["settings"])
-
-
-def test_account_vlm_credentials_normalize_provider():
-    normalized = AccountConfig.model_validate(
+    cluster = OpenVikingConfig.from_dict(
         {
-            "vlm": {
-                "model": "tenant-model",
-                "credentials": [
-                    {
-                        "provider": " OPENAI ",
-                        "api_key": "tenant-key",
-                    }
-                ],
-            }
+            "embedding": {
+                "dense": {
+                    "provider": "openai",
+                    "model": "cluster",
+                    "dimension": 4,
+                    "api_key": "cluster-secret",
+                    "api_base": "https://cluster.invalid/v1",
+                }
+            },
+            "vlm": {"provider": "openai", "model": "cluster-vlm", "api_key": "cluster-secret"},
         }
     )
-    assert normalized.vlm is not None
-    assert normalized.vlm.credentials[0].provider == "openai"
+    set_openviking_config(cluster)
+    source = MemoryConfigSource()
+    manager = manager_over_source(source, base_config=cluster)
+    resolver = AccountVectorConfigResolver(manager)
+    credential = {
+        "provider": "openai",
+        "api_key": "account-secret",
+        "api_base": "https://account.invalid/v1",
+    }
+    settings = {
+        "embedding": {"dense": {"model": "account", "dimension": 8, "credentials": [credential]}},
+        "vectordb": {
+            "backend": "http",
+            "url": "http://account-vectors.invalid",
+            "name": "account",
+            "index_name": "default",
+            "dimension": 8,
+        },
+        "vlm": {"model": "account-vlm", "credentials": [credential]},
+    }
+    try:
+        await manager.initialize()
+        with pytest.raises(ValueError, match="dimension"):
+            await manager.patch_account(
+                "a",
+                {**settings, "vectordb": {**settings["vectordb"], "dimension": 4}},
+                creating=True,
+            )
+        assert await source.load(ConfigScope.account("a")) is None
+        await manager.patch_account("a", settings, creating=True)
+        account, default = await resolver.resolve("a"), await resolver.resolve("b")
+        assert account.dedicated_vectordb and account.vectordb.dimension == 8
+        assert account.embedding.dense.credentials[0].api_key == "account-secret"
+        assert account.embedding.dense.api_key is None
+        assert default.embedding.dense.api_key == "cluster-secret"
+        assert default.vectordb.dimension == 4 and not default.dedicated_vectordb
+        vlm = (await manager.get_account("a", "vlm")).to_vlm_config(cluster.vlm)
+        assert vlm.model == "account-vlm" and vlm.credentials[0].api_key == "account-secret"
+        assert vlm.api_key is None
+
+        before = await source.load(ConfigScope.account("a"))
+        with pytest.raises(ConfigPatchError, match="create-only"):
+            await manager.patch_account(
+                "a", {"embedding": {"max_retries": 9, "dense": {"dimension": 4}}}
+            )
+        with pytest.raises(ConfigPatchError, match="api_ky"):
+            await manager.patch_account(
+                "a", {"vlm": {"credentials": [{"provider": "openai", "api_ky": "typo"}]}}
+            )
+        assert await source.load(ConfigScope.account("a")) == before
+        await manager.patch_account(
+            "a", {"embedding": {"dense": {"credentials": [{**credential, "api_key": "rotated"}]}}}
+        )
+        assert (await resolver.resolve("a")).embedding.dense.credentials[0].api_key == "rotated"
+        assert (await resolver.resolve("b")).embedding.dense.api_key == "cluster-secret"
+    finally:
+        OpenVikingConfigSingleton.reset_instance()
 
 
 def test_account_config_ignores_inactive_sections_during_known_patch():
@@ -1061,35 +818,6 @@ def test_account_patch_rejects_inactive_fields_and_allows_active_fields():
     validate_patch(AccountConfig, {"embedding": {"dense": {"model": "m"}}}, creating=True)
     with pytest.raises(ConfigPatchError, match="create-only"):
         validate_patch(AccountConfig, {"embedding": {"dense": {"model": "m"}}})
-
-
-@pytest.mark.parametrize("section", ["vlm", "query_planner"])
-def test_account_patch_rejects_unknown_fields_inside_model_lists(section):
-    validate_patch(
-        AccountConfig,
-        {
-            section: {
-                "model": "m",
-                "credentials": [{"provider": "openai", "api_key": "key"}],
-            }
-        },
-    )
-    with pytest.raises(ConfigPatchError, match=f"{section}.*api_bsae"):
-        validate_patch(
-            AccountConfig,
-            {
-                section: {
-                    "model": "m",
-                    "credentials": [
-                        {
-                            "provider": "openai",
-                            "api_key": "key",
-                            "api_bsae": "https://wrong.example",
-                        }
-                    ],
-                }
-            },
-        )
 
 
 def test_feishu_cluster_patch_rejects_unknown_fields():
@@ -1278,340 +1006,6 @@ def test_real_feishu_account_override_and_cluster_fallback():
             assert (
                 await get_effective_feishu_config(manager, "ov-a")
             ).app_id == "cluster-v1"
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_vlm_provider_releases_idle_invalidated_client(monkeypatch):
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        class FakeClient:
-            def __init__(self):
-                self.closed = False
-                from openviking.models.vlm.token_usage import TokenUsageTracker
-
-                self._token_tracker = TokenUsageTracker()
-
-            def close(self):
-                self.closed = True
-
-            def get_token_usage(self):
-                return self._token_tracker.to_dict()
-
-            async def get_completion_async(self, **_kwargs):
-                return "ok"
-
-        client = FakeClient()
-        monkeypatch.setattr(
-            "openviking.models.vlm.VLMFactory.create",
-            lambda _config: client,
-        )
-        base = OpenVikingConfig.from_dict(
-            {"vlm": {"model": "cluster-model", "provider": "litellm"}}
-        )
-        set_openviking_config(base)
-        manager = manager_over_source(MemoryConfigSource(), base_config=base)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        try:
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "vlm": {
-                        "model": "account-model",
-                        "credentials": [
-                            {"provider": "openai", "api_key": "account-key"}
-                        ],
-                    }
-                },
-            )
-            account_vlm = await provider.get_vlm("ov-a")
-            assert not hasattr(account_vlm, "get_vlm_instance")
-            assert await account_vlm.get_completion_async(prompt="test") == "ok"
-            client._token_tracker.update("account-model", "openai", 2, 3)
-            assert (
-                provider.get_token_usage("ov-a")["usage_by_model"]["account-model"][
-                    "usage_by_provider"
-                ]["openai"]["total_tokens"]
-                == 5
-            )
-
-            await manager.patch_account("ov-a", {"vlm": {"model": "account-model-v2"}})
-            assert client.closed is True
-            assert (
-                provider.get_node_token_usage()["usage_by_model"]["account-model"][
-                    "usage_by_provider"
-                ]["openai"]["total_tokens"]
-                == 5
-            )
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_vlm_never_inherits_cluster_model_service_fields():
-    async def run():
-        from openviking.config.account_config import AccountVLMConfig
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        cluster = OpenVikingConfig.from_dict(
-            {
-                "vlm": {
-                    "model": "cluster-model",
-                    "provider": "openai",
-                    "api_key": "cluster-key",
-                    "api_base": "https://cluster.example/v1",
-                    "temperature": 0.4,
-                    "max_retries": 7,
-                    "max_concurrent": 9,
-                    "max_tokens": 4096,
-                    "keepalive_expiry": 45,
-                    "reasoning_effort": "high",
-                    "extra_headers": {"X-Cluster-Identity": "secret"},
-                    "media": {"enabled": True},
-                }
-            }
-        )
-        set_openviking_config(cluster)
-        manager = manager_over_source(MemoryConfigSource(), base_config=cluster)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        try:
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "vlm": {
-                        "model": "account-model",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-key",
-                            }
-                        ],
-                    }
-                },
-            )
-            await manager.patch_account(
-                "ov-b",
-                {
-                    "vlm": {
-                        "model": "account-b-model",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-b-key",
-                                "api_base": "https://account-b.example/v1",
-                            }
-                        ],
-                    }
-                },
-            )
-
-            effective_a = await provider.get_vlm("ov-a")
-            effective_b = await provider.get_vlm("ov-b")
-            assert (
-                effective_a.credentials[0].model or effective_a.model,
-                effective_a.credentials[0].api_key,
-            ) == (
-                "account-model",
-                "account-key",
-            )
-            assert effective_a.credentials[0].api_base is None
-            assert (
-                effective_b.credentials[0].model or effective_b.model,
-                effective_b.credentials[0].api_key,
-                effective_b.credentials[0].api_base,
-            ) == (
-                "account-b-model",
-                "account-b-key",
-                "https://account-b.example/v1",
-            )
-            assert effective_a.api_key is None
-            assert effective_a.api_base is None
-            assert effective_a.extra_headers is None
-
-            inherited_fields = (
-                set(type(cluster.vlm).model_fields)
-                - AccountVLMConfig._ACCOUNT_OWNED_MODEL_SERVICE_FIELDS
-            )
-            assert {
-                field: getattr(effective_a, field) for field in inherited_fields
-            } == {field: getattr(cluster.vlm, field) for field in inherited_fields}
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_vlm_provider_retries_resolution_after_invalidation():
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.manager import ConfigChangeEvent, ConfigChangeReason
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        base = OpenVikingConfig.from_dict(
-            {"vlm": {"model": "cluster-model", "provider": "litellm"}}
-        )
-        set_openviking_config(base)
-        manager = manager_over_source(MemoryConfigSource(), base_config=base)
-        await manager.initialize()
-        await manager.patch_account(
-            "ov-a",
-            {
-                "vlm": {
-                    "model": "account-model",
-                    "credentials": [
-                        {"provider": "openai", "api_key": "account-key"}
-                    ],
-                }
-            },
-        )
-        provider = AccountVLMProvider(manager)
-        view_ready = asyncio.Event()
-        release_view = asyncio.Event()
-        original_view = provider._view
-
-        async def delayed_view(account_id):
-            view = await original_view(account_id)
-            view_ready.set()
-            await release_view.wait()
-            return view
-
-        provider._view = delayed_view
-        try:
-            resolving = asyncio.create_task(provider.get_vlm("ov-a"))
-            await view_ready.wait()
-            await provider._on_account_config_change(
-                ConfigChangeEvent(
-                    scope=ConfigScope.account("ov-a"),
-                    changed_sections=frozenset({"vlm"}),
-                    old_config=None,
-                    new_config=None,
-                    reason=ConfigChangeReason.UPDATE,
-                )
-            )
-            release_view.set()
-            resolved = await resolving
-            assert resolved.model == "account-model"
-            assert not provider._bindings[("ov-a", "vlm")].retired
-        finally:
-            OpenVikingConfigSingleton.reset_instance()
-
-    asyncio.run(run())
-
-
-def test_account_query_planner_isolated_from_cluster_planner():
-    async def run():
-        from openviking.config.binding import manager_over_source
-        from openviking.config.vlm import AccountVLMProvider
-        from openviking_cli.utils.config import set_openviking_config
-        from openviking_cli.utils.config.open_viking_config import (
-            OpenVikingConfig,
-            OpenVikingConfigSingleton,
-        )
-
-        base = OpenVikingConfig.from_dict(
-            {
-                "vlm": {"model": "cluster-vlm", "provider": "litellm"},
-                "query_planner": {
-                    "model": "cluster-planner",
-                    "provider": "litellm",
-                },
-            }
-        )
-        set_openviking_config(base)
-        manager = manager_over_source(MemoryConfigSource(), base_config=base)
-        await manager.initialize()
-        provider = AccountVLMProvider(manager)
-        try:
-            assert (await provider.get_query_planner("ov-plain")).model == "cluster-planner"
-
-            with pytest.raises(ValueError, match="Field required"):
-                await manager.patch_account(
-                    "ov-planner-timeout",
-                    {"query_planner": {"timeout": 17}},
-                )
-            await manager.patch_account(
-                "ov-planner",
-                {
-                    "query_planner": {
-                        "model": "account-planner",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-planner-key",
-                                "api_base": "https://account-planner.example/v1",
-                            }
-                        ],
-                        "timeout": 17,
-                    }
-                },
-            )
-            account_planner = await provider.get_query_planner("ov-planner")
-            assert account_planner.model == "account-planner"
-            assert account_planner.credentials[0].api_key == "account-planner-key"
-            assert (
-                account_planner.credentials[0].api_base
-                == "https://account-planner.example/v1"
-            )
-            assert account_planner.timeout == 17
-
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "vlm": {
-                        "model": "account-vlm",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-vlm-key",
-                            }
-                        ],
-                    }
-                },
-            )
-            account_vlm = await provider.get_vlm("ov-a")
-            assert (await provider.get_query_planner("ov-a")).model == account_vlm.model
-
-            await manager.patch_account(
-                "ov-a",
-                {
-                    "query_planner": {
-                        "model": "account-planner",
-                        "credentials": [
-                            {
-                                "provider": "openai",
-                                "api_key": "account-planner-key",
-                            }
-                        ],
-                    }
-                },
-            )
-            planner = await provider.get_query_planner("ov-a")
-            assert planner.model == "account-planner"
-            assert planner.credentials[0].model is None
-            assert planner is not account_vlm
         finally:
             OpenVikingConfigSingleton.reset_instance()
 

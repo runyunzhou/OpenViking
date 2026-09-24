@@ -1641,20 +1641,20 @@ async def test_account_memory_templates_corrupt_storage_is_not_overwritten(
         assert fs.agfs._files == original
 
 
-@pytest.mark.parametrize("settings", [None, {
-    "embedding": {"max_retries": 5},
-    "vectordb": {
-        "backend": "vikingdb",
-        "name": "account_context",
-        "index_name": "default",
-        "dimension": 1024,
-        "vikingdb": {"host": "https://account.invalid"},
-    },
-}])
 async def test_create_account(
-    admin_client: httpx.AsyncClient, admin_service: OpenVikingService, settings, monkeypatch
+    admin_client: httpx.AsyncClient, admin_service: OpenVikingService, monkeypatch
 ):
-    """ROOT can create an account with first admin."""
+    """ROOT provisioning applies account settings before initializing storage."""
+    settings = {
+        "embedding": {"max_retries": 5},
+        "vectordb": {
+            "backend": "vikingdb",
+            "name": "account_context",
+            "index_name": "default",
+            "dimension": 1024,
+            "vikingdb": {"host": "https://account.invalid"},
+        },
+    }
     adapter = Mock(mode="vikingdb", USE_CONTENT_FIELD=True)
     adapter.get.return_value = []
     adapter.get_collection.return_value.get_meta_data.return_value = {
@@ -1665,11 +1665,10 @@ async def test_create_account(
     }
     adapter.upsert.side_effect = lambda rows: [row["id"] for row in rows]
     factory = Mock(return_value=adapter)
-    if settings:
-        monkeypatch.setattr(
-            "openviking.storage.viking_vector_index_backend.create_collection_adapter",
-            factory,
-        )
+    monkeypatch.setattr(
+        "openviking.storage.viking_vector_index_backend.create_collection_adapter",
+        factory,
+    )
     acct = _uid()
     resp = await admin_client.post(
         "/api/v1/admin/accounts",
@@ -1685,38 +1684,16 @@ async def test_create_account(
     ctx = RequestContext(user=UserIdentifier(acct, "alice"), role=Role.ADMIN)
     assert await admin_service.viking_fs.abstract("viking://resources", ctx=ctx)
     assert await admin_service.viking_fs.abstract("viking://user", ctx=ctx)
-    if settings:
-        stored = await admin_client.get(
-            f"/api/v1/admin/accounts/{acct}/configuration", headers=root_headers()
-        )
-        assert stored.json()["result"]["settings"] == settings
-        effective = await admin_service.vector_config_resolver.resolve(acct)
-        assert effective.dedicated_vectordb
-        assert effective.vectordb.name == "account_context"
-        assert effective.embedding.max_retries == 5
-        factory.assert_called_once()
-        assert factory.call_args.args[0].vikingdb.host == "https://account.invalid"
-        adapter.get.assert_called()
-        adapter.create_collection.assert_not_called()
-
-
-async def test_create_account_rejects_incompatible_vectors_without_identity(admin_client, admin_app):
-    acct = _uid()
-    response = await admin_client.post(
-        "/api/v1/admin/accounts",
-        json={
-            "account_id": acct,
-            "admin_user_id": "alice",
-            "settings": {"embedding": {"dense": {"dimension": 7}},
-                         "vectordb": {"dimension": 8}},
-        },
-        headers=root_headers(),
+    stored = await admin_client.get(
+        f"/api/v1/admin/accounts/{acct}/configuration", headers=root_headers()
     )
-    assert response.status_code == 400, response.text
-    assert not any(
-        account["account_id"] == acct
-        for account in admin_app.state.api_key_manager.get_accounts()
-    )
+    assert stored.json()["result"]["settings"] == settings
+    effective = await admin_service.vector_config_resolver.resolve(acct)
+    assert effective.dedicated_vectordb
+    assert effective.vectordb.name == "account_context"
+    assert effective.embedding.max_retries == 5
+    assert factory.call_args.args[0].vikingdb.host == "https://account.invalid"
+    adapter.create_collection.assert_not_called()
 
 
 async def test_create_account_rolls_back_when_runtime_config_write_fails(

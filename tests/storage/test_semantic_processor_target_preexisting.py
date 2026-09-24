@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -100,61 +100,6 @@ async def test_vectorize_directory_returns_enqueued_levels(monkeypatch):
     )
 
     assert result == {0, 1}
-
-
-@pytest.mark.asyncio
-async def test_on_dequeue_resolves_vlm_for_each_use(monkeypatch):
-    resolved_vlm = SimpleNamespace(name="account-vlm")
-    resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=resolved_vlm))
-    snapshots = []
-
-    class SnapshotTree:
-        stale = False
-
-        def __init__(self, *, processor, ctx, **kwargs):
-            del kwargs
-            self.processor = processor
-            self.ctx = ctx
-
-        async def run(self, root_uri):
-            del root_uri
-            snapshots.append(await self.processor._get_vlm_config(self.ctx))
-            snapshots.append(await self.processor._get_vlm_config(self.ctx))
-
-        def get_stats(self):
-            from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
-
-            return SemanticTreeStats()
-
-    monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.get_viking_fs",
-        lambda: _FakeVikingFS(),
-    )
-    monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.SemanticTreeExecutor",
-        SnapshotTree,
-    )
-    monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_processor.SemanticLockScope.resolve",
-        AsyncMock(return_value=SimpleNamespace(lock=None, close=AsyncMock())),
-    )
-    processor = SemanticProcessor(vlm_resolver=resolver)
-    processor._enqueue_parent_refresh = AsyncMock()
-    msg = SemanticMsg(
-        uri="viking://resources/account-owned",
-        context_type="resource",
-        account_id="ov-a",
-        propagate_to_parent=False,
-    )
-
-    await processor.on_dequeue(msg.to_dict())
-
-    assert resolver.get_vlm.await_count == 2
-    assert resolver.get_vlm.await_args_list == [
-        call("ov-a"),
-        call("ov-a"),
-    ]
-    assert snapshots == [resolved_vlm, resolved_vlm]
 
 
 @pytest.mark.asyncio

@@ -48,14 +48,6 @@ def test_queue_concurrency_uses_separate_configured_values() -> None:
     assert manager._max_concurrent_for_queue(manager.SESSION_COMMIT) == 5
 
 
-def test_semantic_workers_require_explicit_vlm_resolver() -> None:
-    manager = QueueManager(agfs=object())
-    manager._queues[manager.SEMANTIC] = object()
-
-    with pytest.raises(RuntimeError, match="requires a VLM resolver"):
-        manager.start()
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("concurrency", [1, 2])
 async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(

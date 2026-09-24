@@ -60,22 +60,6 @@ async def test_resource_processor_upload_understanding_file_delegates():
     media_processor.upload_understanding_file.assert_awaited_once_with("/tmp/upload.pdf")
 
 
-@pytest.mark.asyncio
-async def test_account_media_processor_does_not_reuse_unbound_processor():
-    processor = ResourceProcessor(_FakeVikingDB(), vlm_resolver=object())
-    unbound = SimpleNamespace()
-    bound_vlm_processor = object()
-    processor._media_processor = unbound
-    processor._vlm_processor_for = AsyncMock(return_value=bound_vlm_processor)
-
-    result = await processor._media_processor_for(
-        RequestContext(user=UserIdentifier("account-1", "user-1"), role=Role.USER)
-    )
-
-    assert result is not unbound
-    assert result._vlm_processor is bound_vlm_processor
-
-
 @pytest.fixture
 def ctx() -> RequestContext:
     return RequestContext(

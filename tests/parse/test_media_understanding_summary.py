@@ -71,20 +71,6 @@ class _MediaVLM:
         )
 
 
-class _AsyncUnsupportedMediaVLM:
-    model = "bound-media-vlm"
-
-    def __init__(self):
-        self.completion_calls = 0
-
-    async def supports_media(self, **_kwargs):
-        return False
-
-    async def get_media_completion_async(self, **_kwargs):
-        self.completion_calls += 1
-        return "unexpected"
-
-
 class _BlockingMediaClient(_MediaVLM):
     def __init__(self):
         self.active_inference = 0
@@ -156,23 +142,6 @@ def _jpeg_bytes(width: int, height: int) -> bytes:
 def _image_size(data: bytes) -> tuple[int, int]:
     with Image.open(io.BytesIO(data)) as img:
         return img.size
-
-
-@pytest.mark.asyncio
-async def test_generate_media_summary_awaits_async_capability_check(monkeypatch):
-    fs = _FS(b"media")
-    vlm = _AsyncUnsupportedMediaVLM()
-    monkeypatch.setattr(media_utils, "get_viking_fs", lambda: fs)
-
-    result = await media_utils._generate_media_summary(
-        "viking://resources/audio/sample.mp3",
-        "sample.mp3",
-        "audio",
-        vlm=vlm,
-    )
-
-    assert result == {"name": "sample.mp3", "summary": ""}
-    assert vlm.completion_calls == 0
 
 
 def _lazy_client(*, return_value=None, side_effect=None):

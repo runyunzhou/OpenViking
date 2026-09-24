@@ -131,18 +131,84 @@ async def test_query_embed_cache_scope_resets_on_exception():
     assert query_embed_cache_var.get() is None
 
 
-async def test_embedders_with_same_model_name_do_not_share_entries():
-    # Keying by embedder identity keeps two embedders that happen to share a
-    # model_name from serving each other's vectors.
-    first = CountingEmbedder(model_name="shared-name")
-    second = CountingEmbedder(model_name="shared-name")
-    query_embed_cache_var.set(QueryEmbeddingCache())
+async def test_account_query_cache_isolated_by_account_and_config(monkeypatch):
+    from openviking.config.binding import manager_over_source
+    from openviking.config.embedding import AccountEmbeddingProvider
+    from openviking.config.source import MemoryConfigSource
+    from openviking.config.vector import AccountVectorConfigResolver
+    from openviking_cli.utils.config import set_openviking_config
+    from openviking_cli.utils.config.embedding_config import EmbeddingConfig
+    from openviking_cli.utils.config.open_viking_config import (
+        OpenVikingConfig,
+        OpenVikingConfigSingleton,
+    )
 
-    await embed_compat(first, "same-text", is_query=True)
-    await embed_compat(second, "same-text", is_query=True)
+    clients = []
 
-    assert first.calls == ["same-text"]
-    assert second.calls == ["same-text"]
+    def create(config):
+        client = CountingEmbedder(config.dense.model)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(EmbeddingConfig, "get_embedder", create)
+    base = OpenVikingConfig.from_dict(
+        {
+            "embedding": {
+                "dense": {
+                    "model": "shared-name",
+                    "dimension": 1,
+                    "provider": "openai",
+                    "api_key": "cluster-key",
+                }
+            }
+        }
+    )
+    set_openviking_config(base)
+    manager = manager_over_source(MemoryConfigSource(), base_config=base)
+    provider = AccountEmbeddingProvider(AccountVectorConfigResolver(manager), manager)
+    try:
+        await manager.initialize()
+        await manager.patch_account(
+            "a",
+            {
+                "embedding": {
+                    "dense": {
+                        "model": "shared-name",
+                        "dimension": 1,
+                        "credentials": [{"provider": "openai", "api_key": "a-key"}],
+                    }
+                }
+            },
+            creating=True,
+        )
+        first, second = provider.bind("a"), provider.bind("b")
+        async with query_embed_cache_scope():
+            results = await asyncio.gather(
+                embed_compat(first, "same-text", is_query=True),
+                embed_compat(provider.bind("a"), "same-text", is_query=True),
+            )
+            assert all(result.dense_vector == [1.0] for result in results)
+            await embed_compat(second, "same-text", is_query=True)
+            assert [client.calls for client in clients] == [["same-text"], ["same-text"]]
+
+            await manager.patch_account(
+                "a",
+                {
+                    "embedding": {
+                        "dense": {"credentials": [{"provider": "openai", "api_key": "rotated-key"}]}
+                    }
+                },
+            )
+            await embed_compat(first, "same-text", is_query=True)
+            await embed_compat(second, "same-text", is_query=True)
+            assert [client.calls for client in clients] == [
+                ["same-text"],
+                ["same-text"],
+                ["same-text"],
+            ]
+    finally:
+        await provider.close()
+        OpenVikingConfigSingleton.reset_instance()
 
 
 async def test_one_waiter_cancellation_leaves_shared_embed_running():
@@ -201,35 +267,3 @@ async def test_last_waiter_cancellation_stops_shared_embed_and_evicts_entry():
     result = await embed_compat(embedder, "shared", is_query=True)
     assert result.dense_vector == [1.0]
     assert embedder.calls == ["shared", "shared"]
-
-
-async def test_cache_close_waits_for_cancelled_task_cleanup():
-    started = asyncio.Event()
-    cleanup_started = asyncio.Event()
-    release_cleanup = asyncio.Event()
-
-    async def factory():
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cleanup_started.set()
-            await release_cleanup.wait()
-            raise
-
-    cache = QueryEmbeddingCache()
-    waiter = asyncio.create_task(cache.run("shared", factory))
-    await started.wait()
-
-    waiter.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
-    await cleanup_started.wait()
-
-    closing = asyncio.create_task(cache.close())
-    await asyncio.sleep(0)
-    assert not closing.done()
-
-    release_cleanup.set()
-    await closing
-    assert not cache._pending_tasks

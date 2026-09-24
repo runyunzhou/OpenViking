@@ -49,6 +49,7 @@ from openviking.storage.vectordb_adapters.local_adapter import LocalCollectionAd
 from openviking.storage.viking_vector_index_backend import (
     VIKINGDB_CONTENT_MAX_SIZE,
     UpsertOptions,
+    VikingVectorIndexBackend,
     _SingleAccountBackend,
 )
 from openviking_cli.exceptions import InternalError
@@ -56,7 +57,6 @@ from openviking_cli.utils.config.vectordb_config import (
     VectorDBBackendConfig,
     VolcengineConfig,
 )
-from tests.storage.vector_test_utils import ConfiguredVectorBackend as VikingVectorIndexBackend
 
 
 class TextEmbeddingHandler(ProductionTextEmbeddingHandler):
@@ -2075,11 +2075,13 @@ async def test_single_account_backend_partial_update_does_not_fill_omitted_text_
 
 
 @pytest.mark.asyncio
-async def test_local_backend_update_preserves_omitted_fields_end_to_end(tmp_path):
+async def test_local_backend_update_preserves_omitted_fields_end_to_end(
+    vector_backend_factory, tmp_path
+):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local",
             name="context",
@@ -2132,11 +2134,13 @@ async def test_local_backend_update_preserves_omitted_fields_end_to_end(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_local_backend_update_can_clear_string_field_end_to_end(tmp_path):
+async def test_local_backend_update_can_clear_string_field_end_to_end(
+    vector_backend_factory, tmp_path
+):
     if not getattr(vectordb_engine, "PersistStore", None):
         pytest.skip("local persistent vectordb engine is not available in this environment")
 
-    backend = VikingVectorIndexBackend(
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(
             backend="local",
             name="context",
@@ -2671,8 +2675,10 @@ async def test_single_account_backend_upsert_without_partial_update_keeps_legacy
 
 
 @pytest.mark.asyncio
-async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_account_backend():
-    backend = VikingVectorIndexBackend(
+async def test_viking_vector_index_backend_upsert_partial_update_delegates_to_account_backend(
+    vector_backend_factory,
+):
+    backend = vector_backend_factory(
         config=VectorDBBackendConfig(backend="local", name="context", dimension=2)
     )
     ctx = SimpleNamespace(account_id="acc1")
