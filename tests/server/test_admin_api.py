@@ -1381,14 +1381,7 @@ async def test_account_memory_templates_reach_live_prompts(
     for user, peer in (("alice", None), ("bob", None), ("bob", "customer")):
         prompt = await prompt_for(account_id, user, peer)
         assert "CUSTOM_ACCOUNT_SCOPE EN" in prompt
-        # Preserve the Python protocol's existing static field contract. This
-        # change does not add a language context to that separate path.
-        expected_field = (
-            body["fields"][0]["description"]
-            if output_format == "python"
-            else "ACCOUNT_FIELD EN en"
-        )
-        assert expected_field in prompt
+        assert "ACCOUNT_FIELD EN en" in prompt
     assert "CUSTOM_ACCOUNT_SCOPE" not in await prompt_for("other-account", "alice")
     assert registry.get("profile").description == base_description
     assert (await lightweight_admin_client.delete(url, headers=headers)).status_code == 200
@@ -3274,7 +3267,8 @@ async def test_trusted_mode_create_account_lists_current_account_metadata(
 
     manager = trusted_admin_app.state.api_key_manager
     account = next(item for item in manager.get_accounts() if item["account_id"] == acct)
-    assert set(account) == {"account_id", "created_at", "user_count"}
+    assert set(account) == {"account_id", "created_at", "user_count", "status"}
+    assert account["status"] == "active"
 
 
 async def test_user_page_summary_and_search_preserve_legacy_response(
