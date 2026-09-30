@@ -13,13 +13,13 @@ from starlette.requests import Request
 
 from openviking.server.auth import resolve_identity
 from openviking.server.config import ServerConfig
-from openviking.server.identity import Role
+from openviking.server.identity import ResolvedIdentity, Role
 from openviking.server.oauth.provider import (
     ACCESS_TOKEN_PREFIX,
     OpenVikingOAuthProvider,
 )
 from openviking.server.oauth.storage import OAuthStore
-from openviking_cli.exceptions import PermissionDeniedError, UnauthenticatedError
+from openviking_cli.exceptions import UnauthenticatedError
 
 
 def _make_request(
@@ -94,15 +94,40 @@ class _StubKeyManager:
 
         return ResolvedIdentity(role=Role.USER, account_id="api-acct", user_id="api-user")
 
-    def get_user_key_fingerprint(self, account_id: str, user_id: str) -> Optional[str]:
+    async def get_user_key_fingerprint(self, account_id: str, user_id: str) -> Optional[str]:
         if self._fps is None:
             return self._default_fp
         return self._fps.get((account_id, user_id))
 
-    def get_user_role(self, account_id: str, user_id: str) -> Role:
+    async def get_registered_user_role(self, account_id: str, user_id: str) -> Role | None:
         if self._roles is None:
             return self._default_role
         return self._roles.get((account_id, user_id), self._default_role)
+
+    def is_root_key(self, key):
+        return False
+
+    async def verify(self, key):
+        identity = self.resolve(key)
+        return identity.account_id, identity.user_id
+
+    async def resolve_oauth_identity(self, account_id, user_id, role):
+        local_role = Role(await self.get_registered_user_role(account_id, user_id) or Role.USER)
+        if role.rank > local_role.rank:
+            raise UnauthenticatedError(
+                "OAuth token's embedded role exceeds the user's current role; "
+                "please re-authorize the client."
+            )
+        return ResolvedIdentity(
+            role=role,
+            account_id=account_id,
+            user_id=user_id,
+            from_oauth=True,
+        )
+
+    async def resolve_identity(self, key):
+        identity = self.resolve(key)
+        return identity
 
 
 @pytest_asyncio.fixture
@@ -208,7 +233,7 @@ async def test_oauth_path_skipped_when_disabled(store):
 
 
 @pytest.mark.asyncio
-async def test_oauth_user_role_rejects_account_override(provider, store):
+async def test_oauth_user_role_ignores_account_override(provider, store):
     """A USER OAuth token cannot impersonate another tenant via header."""
     token = await _mint_token(provider, store, account_id="tenant-a", user_id="alice", role="user")
     request = _make_request(
@@ -217,13 +242,14 @@ async def test_oauth_user_role_rejects_account_override(provider, store):
         oauth_provider=provider,
         extra_headers={"x-openviking-account": "tenant-b"},
     )
-    with pytest.raises(PermissionDeniedError):
-        await resolve_identity(
-            request,
-            x_api_key=None,
-            authorization=f"Bearer {token}",
-            x_openviking_account="tenant-b",
-        )
+    identity = await resolve_identity(
+        request,
+        x_api_key=None,
+        authorization=f"Bearer {token}",
+        x_openviking_account="tenant-b",
+    )
+    assert (identity.account_id, identity.user_id) == ("tenant-a", "alice")
+    assert "x-openviking-account" not in request.headers
 
 
 @pytest.mark.asyncio
