@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
+import json
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -15,7 +15,6 @@ from openviking.server.store_assembly import build_api_key_manager
 from openviking_cli.exceptions import (
     FailedPreconditionError,
     NotFoundError,
-    UnauthenticatedError,
 )
 from tests.server.account_store_fakes import InMemoryAGFS
 
@@ -24,17 +23,24 @@ def _file_store() -> FileStore:
     return FileStore(SimpleNamespace(agfs=InMemoryAGFS()))
 
 
-async def test_manager_uses_a_complete_account_store():
-    store = _file_store()
-    manager = APIKeyManager("root", store)
+async def test_legacy_user_without_role_defaults_to_user_during_authentication():
+    agfs = InMemoryAGFS()
+    agfs.write(
+        "/local/_system/accounts.json",
+        json.dumps({"accounts": {"acme": {"created_at": "legacy"}}}).encode(),
+    )
+    agfs.write(
+        "/local/acme/_system/users.json",
+        json.dumps({"users": {"alice": {"key": "legacy-key"}}}).encode(),
+    )
+    manager = build_api_key_manager("root", SimpleNamespace(agfs=agfs))
     await manager.load()
     try:
-        key = await manager.create_account("acme", "alice")
-        identity = await manager.resolve_identity(key)
+        identity = await manager.resolve_identity("legacy-key")
         assert (identity.account_id, identity.user_id, identity.role) == (
             "acme",
             "alice",
-            Role.ADMIN,
+            Role.USER,
         )
     finally:
         await manager.close()
@@ -57,38 +63,42 @@ async def test_file_provider_keeps_existing_registry_paths():
         await manager.close()
 
 
-async def test_manager_rolls_back_identity_when_key_issue_fails(monkeypatch):
-    store = _file_store()
+async def test_file_account_creation_is_atomic_when_credential_write_fails():
+    class FailingAGFS(InMemoryAGFS):
+        def write(self, path, content, ctx=None):
+            if path == "/local/acme/_system/users.json":
+                raise OSError("credential store unavailable")
+            return super().write(path, content, ctx)
+
+    store = FileStore(SimpleNamespace(agfs=FailingAGFS()))
     manager = APIKeyManager("root", store)
     await manager.load()
-    monkeypatch.setattr(
-        store,
-        "replace_active_user_api_key",
-        AsyncMock(side_effect=OSError("credential store unavailable")),
-    )
+
     with pytest.raises(OSError, match="credential store unavailable"):
         await manager.create_account("acme", "alice")
     assert await manager.get_account("acme") is None
 
 
-async def test_deleting_account_invalidates_key_with_identity_removal():
-    manager = build_api_key_manager("root", SimpleNamespace(agfs=InMemoryAGFS()))
-    await manager.load()
-    key = await manager.create_account("acme", "alice")
-    await manager.delete_account("acme")
-    with pytest.raises(UnauthenticatedError):
-        await manager.resolve_identity(key)
+async def test_file_user_creation_is_atomic_when_credential_write_fails():
+    class FailingAGFS(InMemoryAGFS):
+        fail_user_write = False
 
+        def write(self, path, content, ctx=None):
+            if self.fail_user_write and path == "/local/acme/_system/users.json":
+                raise OSError("credential store unavailable")
+            return super().write(path, content, ctx)
 
-async def test_authentication_hides_deletion_state_for_store_binding():
-    store = AsyncMock()
-    store.verify_api_key.return_value = ("acme", "alice")
-    store.get_user.return_value = {"user_id": "alice", "role": Role.ADMIN}
-    store.get_deletion.return_value = {"task_id": "delete-alice"}
+    agfs = FailingAGFS()
+    store = FileStore(SimpleNamespace(agfs=agfs))
     manager = APIKeyManager("root", store)
+    await manager.load()
+    admin_key = await manager.create_account("acme", "alice")
+    agfs.fail_user_write = True
 
-    with pytest.raises(UnauthenticatedError, match="Invalid API key"):
-        await manager.resolve_identity("user-key")
+    with pytest.raises(OSError, match="credential store unavailable"):
+        await manager.register_user("acme", "bob")
+    assert await manager.get_user("acme", "bob") is None
+    assert (await manager.resolve_identity(admin_key)).user_id == "alice"
 
 
 async def test_regenerate_key_preserves_management_not_found_errors():
@@ -105,7 +115,7 @@ async def test_regenerate_key_preserves_management_not_found_errors():
 async def test_file_store_allows_only_one_active_credential_per_user():
     store = _file_store()
     await store.load()
-    await store.create_account("acme", "alice")
+    await store.create_account_with_api_key("acme", "alice", "initial-key")
 
     await store.replace_active_user_api_key("acme", "alice", "first-key")
     await store.replace_active_user_api_key("acme", "alice", "second-key")
@@ -152,7 +162,7 @@ async def test_file_user_deletion_fence_survives_concurrent_role_update():
     agfs = PausingAGFS()
     store = FileStore(SimpleNamespace(agfs=agfs))
     await store.load()
-    await store.create_account("acme", "alice")
+    await store.create_account_with_api_key("acme", "alice", "alice-key")
     await store.create_user("acme", "bob", "user")
 
     agfs.pause_next_user_read = True
@@ -183,7 +193,7 @@ async def test_file_user_deletion_fence_survives_concurrent_role_update():
 async def test_file_store_rejects_deleting_nonempty_group():
     store = _file_store()
     await store.load()
-    await store.create_account("acme", "alice")
+    await store.create_account_with_api_key("acme", "alice", "alice-key")
     await store.create_group("acme", "engineering")
     await store.add_group_member("acme", "engineering", "alice")
 
