@@ -1816,10 +1816,9 @@ prefix；加密模式可为同一列表工作流解密展示 key。`credential_s
 
 Provider 不会创建或迁移数据库表。启动服务前，应通过现有 DBA 或部署流程手工创建
 `openviking/server/account_stores/sql/init.sql` 中定义的规范化表。后续经评审的
-schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`。初始化
-脚本使用默认表前缀 `ov_accounts`；如配置了
-`account_store.params.table`，执行前只替换初始化脚本中反引号包裹的
-`ov_accounts` 表标识符。约束名和索引名保持固定，不依赖配置的表名。
+schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`。
+五张 `ov_accounts*` 表的名称固定；多个 OpenViking resource 共用数据库时，
+通过 `OV_RESOURCE_ID` 隔离部署，不使用不同表前缀。
 
 ```json
 {
@@ -1842,12 +1841,11 @@ schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`�
 `redis_mysql` 需要安装 `redis-mysql` extra，并在参数中嵌套同一份 MySQL 配置。
 它默认以固定 60 秒 TTL 缓存 API Key 绑定、User、每个 User 的 Group ID 和删除记录。
 缓存重建与同一 Account 的修改共用 Redis 租约，正常缓存命中不获取该租约。修改会先
-提交 MySQL，再最多等待 30 秒获取租约并在返回前失效相关缓存；等待超时后会撤销当前
-租约、重新加锁并完成失效，然后正常返回已提交的 MySQL 结果。缓存回填同时维护 Account
+提交 MySQL，再失效相关缓存。Redis 不可用时 MySQL 修改仍会成功，遗留缓存最多保持到
+固定 TTL 到期。缓存回填同时维护 Account
 级、按过期时间排序的 key 索引；每次写入已索引缓存时会清理过期成员，因此删除或重建
 Account 时只会清理该 Account 当前的 User、Group、删除记录和凭据缓存。API Key 绑定会
 校验 Account 和 User 的凭据 fence，所以正常的换 Key、吊销和删 User 会使旧绑定失效。
-若 MySQL 修改后 Redis 不可用，遗留缓存最多保持到固定 TTL 到期。
 
 ```json
 {

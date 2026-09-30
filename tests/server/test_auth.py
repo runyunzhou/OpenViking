@@ -1396,6 +1396,11 @@ async def test_trusted_identity_registration_retries_failed_batch_without_exceed
         await plugin.shutdown()
 
 
+def test_trusted_identity_registration_config_allows_disabling():
+    config = ServerConfig(trusted_identity_flush_interval_seconds=0)
+    assert config.trusted_identity_flush_interval_seconds == 0
+
+
 def test_trusted_identity_registration_config_rejects_invalid_limits():
     with pytest.raises(ValueError):
         ServerConfig(trusted_identity_flush_interval_seconds=-1)
@@ -1450,12 +1455,17 @@ async def test_trusted_mode_with_root_api_key_accepts_matching_api_key():
     assert identity.user_id == "alice"
 
 
-async def test_trusted_mode_root_key_allows_admin_role_header(auth_app):
+async def test_trusted_mode_root_key_allows_admin_role_header(auth_app, monkeypatch):
     """Trusted upstreams with the root key may assert ADMIN role for tenant routes."""
     manager = auth_app.state.api_key_manager
     account_id = _uid()
     await manager.create_account(account_id, "owner")
     await manager.register_user(account_id, "alice", "user")
+
+    async def fail_role_lookup(*_args):
+        raise AssertionError("asserted roles must not read the account store")
+
+    monkeypatch.setattr(manager, "get_registered_user_role", fail_role_lookup)
 
     request = _make_request(
         "/api/v1/resources",

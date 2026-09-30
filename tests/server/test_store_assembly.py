@@ -29,6 +29,11 @@ def test_unknown_account_store_is_rejected():
         )
 
 
+def test_unknown_account_store_is_rejected_during_config_validation():
+    with pytest.raises(ValueError, match="account_store.provider must be one of"):
+        AccountStoreConfig(provider="missing")
+
+
 def test_account_store_config_selects_provider_after_normalization():
     config = ServerConfig(account_store=AccountStoreConfig(provider=" FILE "))
     store = build_account_store(

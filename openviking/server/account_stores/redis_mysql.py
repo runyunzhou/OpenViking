@@ -231,6 +231,18 @@ class RedisMySQLAccountStore(AccountStore):
         digest_input = self._resource_id + "\0" + api_key
         return self._key(account_id, f"binding:{_digest(digest_input)}")
 
+    def _negative_binding_key(self, account_id: str, api_key: str, user_id_hint: str | None) -> str:
+        digest_input = self._resource_id + "\0" + api_key + "\0" + (user_id_hint or "")
+        return self._key(account_id, f"binding-miss:{_digest(digest_input)}")
+
+    def _binding_cache_keys(
+        self, account_id: str, api_key: str, user_id: str
+    ) -> tuple[str, str]:
+        return (
+            self._binding_key(account_id, api_key),
+            self._negative_binding_key(account_id, api_key, user_id),
+        )
+
     async def _delete(self, *keys: str) -> None:
         assert self._redis is not None
         if keys:
@@ -476,37 +488,49 @@ class RedisMySQLAccountStore(AccountStore):
         return keys
 
     async def _cached_binding(
-        self, account_id: str, api_key: str
+        self,
+        account_id: str,
+        api_key: str,
+        user_id_hint: str | None,
     ) -> tuple[bool, tuple[str, str] | None]:
         binding = _decode(await self._redis.get(self._binding_key(account_id, api_key)))
         hit, value = self._read_nullable(binding)
-        if not hit:
-            return False, None
-        if value is None:
+        if hit and value is None:
             return True, None
-        if not isinstance(value, dict):
-            return False, None
-        try:
-            account_id = str(value["account_id"])
-            user_id = str(value["user_id"])
-            account_fence = str(value["account_fence"])
-            user_fence = str(value["user_fence"])
-        except (KeyError, TypeError, ValueError):
-            return False, None
-        current_account_fence = _decode(
-            await self._redis.get(self._account_credential_fence_key(account_id))
+        if isinstance(value, dict):
+            try:
+                binding_account_id = str(value["account_id"])
+                user_id = str(value["user_id"])
+                account_fence = str(value["account_fence"])
+                user_fence = str(value["user_fence"])
+            except (KeyError, TypeError, ValueError):
+                pass
+            else:
+                if user_id_hint is None or user_id == user_id_hint:
+                    current_account_fence = _decode(
+                        await self._redis.get(
+                            self._account_credential_fence_key(binding_account_id)
+                        )
+                    )
+                    current_user_fence = _decode(
+                        await self._redis.get(
+                            self._user_credential_fence_key(binding_account_id, user_id)
+                        )
+                    )
+                    if (
+                        current_account_fence is not None
+                        and current_user_fence is not None
+                        and current_account_fence.get("value") == account_fence
+                        and current_user_fence.get("value") == user_fence
+                    ):
+                        return True, (binding_account_id, user_id)
+        negative = _decode(
+            await self._redis.get(
+                self._negative_binding_key(account_id, api_key, user_id_hint)
+            )
         )
-        current_user_fence = _decode(
-            await self._redis.get(self._user_credential_fence_key(account_id, user_id))
-        )
-        if (
-            current_account_fence is None
-            or current_user_fence is None
-            or current_account_fence.get("value") != account_fence
-            or current_user_fence.get("value") != user_fence
-        ):
-            return False, None
-        return True, (account_id, user_id)
+        negative_hit, negative_value = self._read_nullable(negative)
+        return (True, None) if negative_hit and negative_value is None else (False, None)
 
     async def _cache_binding(
         self,
@@ -514,12 +538,13 @@ class RedisMySQLAccountStore(AccountStore):
         token: str,
         api_key: str,
         binding: tuple[str, str] | None,
+        user_id_hint: str | None,
     ) -> None:
         if binding is None:
             await self._set_if_locked(
                 account_id,
                 token,
-                self._binding_key(account_id, api_key),
+                self._negative_binding_key(account_id, api_key, user_id_hint),
                 self._nullable_payload(None),
                 index=False,
             )
@@ -577,14 +602,22 @@ class RedisMySQLAccountStore(AccountStore):
                 api_key, account_id_hint=None, user_id_hint=user_id_hint
             )
         try:
-            hit, binding = await self._cached_binding(account_id_hint, api_key)
+            hit, binding = await self._cached_binding(
+                account_id_hint,
+                api_key,
+                user_id_hint,
+            )
             if hit:
                 return binding
         except Exception:
             logger.exception("Redis API-key cache read failed; falling back to MySQL")
         try:
             async with self._account_lock(account_id_hint) as token:
-                hit, binding = await self._cached_binding(account_id_hint, api_key)
+                hit, binding = await self._cached_binding(
+                    account_id_hint,
+                    api_key,
+                    user_id_hint,
+                )
                 if hit:
                     return binding
                 binding = await self._mysql.verify_api_key(
@@ -598,6 +631,7 @@ class RedisMySQLAccountStore(AccountStore):
                         token,
                         api_key,
                         binding,
+                        user_id_hint,
                     )
                 except Exception:
                     logger.exception("Failed to populate Redis API-key cache")
@@ -662,7 +696,7 @@ class RedisMySQLAccountStore(AccountStore):
                 admin_user_id,
                 api_key,
             ),
-            lambda: (self._binding_key(account_id, api_key),),
+            lambda: self._binding_cache_keys(account_id, api_key, admin_user_id),
             account_wide=True,
         )
 
@@ -704,7 +738,7 @@ class RedisMySQLAccountStore(AccountStore):
                 user_id,
                 credentials=True,
             )
-            + (self._binding_key(account_id, api_key),),
+            + self._binding_cache_keys(account_id, api_key, user_id),
         )
 
     async def list_users_page(self, account_id: str, **kwargs) -> UsersPage:
@@ -812,8 +846,8 @@ class RedisMySQLAccountStore(AccountStore):
             lambda: self._mysql.replace_active_user_api_key(account_id, user_id, api_key),
             lambda: (
                 self._user_credential_fence_key(account_id, user_id),
-                self._binding_key(account_id, api_key),
-            ),
+            )
+            + self._binding_cache_keys(account_id, api_key, user_id),
         )
 
     async def revoke_active_api_keys(

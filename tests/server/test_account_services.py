@@ -10,11 +10,14 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import delete
+from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from openviking.server.account_stores import mysql as mysql_store_module
-from openviking.server.account_stores.mysql import MySQLAccountStore
+from openviking.server.account_stores.mysql import MySQLAccountStore, _substring_pattern
+from openviking.server.account_stores.mysql_schema import Account, Base, Group, GroupMember
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.identity import Role
@@ -133,6 +136,45 @@ async def test_file_store_allows_only_one_active_credential_per_user():
     assert active == ("acme", "alice")
 
 
+async def test_file_hashing_never_persists_plaintext_credentials():
+    agfs = InMemoryAGFS()
+    manager = build_api_key_manager(
+        "root",
+        SimpleNamespace(agfs=agfs),
+        api_key_hashing_enabled=True,
+    )
+    await manager.load()
+    account_key = await manager.create_account("acme", "alice")
+    user_key = await manager.register_user("acme", "bob")
+    rotated_key = await manager.regenerate_key("acme", "bob")
+
+    users = json.loads(agfs._files["/local/acme/_system/users.json"])["users"]
+    assert users["alice"]["key"].startswith("$argon2")
+    assert users["bob"]["key"].startswith("$argon2")
+    assert account_key.encode() not in agfs._files["/local/acme/_system/users.json"]
+    assert user_key.encode() not in agfs._files["/local/acme/_system/users.json"]
+    assert rotated_key.encode() not in agfs._files["/local/acme/_system/users.json"]
+
+
+async def test_file_load_migrates_plaintext_credential_to_argon2():
+    agfs = InMemoryAGFS()
+    plaintext = build_api_key_manager("root", SimpleNamespace(agfs=agfs))
+    await plaintext.load()
+    key = await plaintext.create_account("acme", "alice")
+
+    hashed = build_api_key_manager(
+        "root",
+        SimpleNamespace(agfs=agfs),
+        api_key_hashing_enabled=True,
+    )
+    await hashed.load()
+
+    users = json.loads(agfs._files["/local/acme/_system/users.json"])["users"]
+    assert users["alice"]["key"].startswith("$argon2")
+    assert key.encode() not in agfs._files["/local/acme/_system/users.json"]
+    assert (await hashed.resolve_identity(key)).user_id == "alice"
+
+
 async def test_file_management_user_read_refreshes_only_explicitly():
     fs = SimpleNamespace(agfs=InMemoryAGFS())
     writer = build_api_key_manager("root", fs)
@@ -205,6 +247,76 @@ def test_mysql_requires_resource_id(monkeypatch):
         MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
 
 
+def test_mysql_substring_filter_escapes_sql_wildcards():
+    assert _substring_pattern("alice") == "%alice%"
+    assert _substring_pattern("a_b%=c") == "%a=_b=%==c%"
+
+
+def test_mysql_schema_uses_fixed_tables_and_scoped_memberships():
+    assert set(Base.metadata.tables) == {
+        "ov_accounts",
+        "ov_accounts_users",
+        "ov_accounts_groups",
+        "ov_accounts_group_members",
+        "ov_accounts_credentials",
+    }
+    membership = GroupMember.__table__
+    assert "account_pk" in membership.c
+    assert all(
+        {"resource_id", "account_pk"}.issubset(
+            {element.parent.name for element in constraint.elements}
+        )
+        for constraint in membership.foreign_key_constraints
+    )
+
+
+def test_mysql_rejects_removed_table_parameter(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    with pytest.raises(InvalidArgumentError, match="Unknown MySQL account store parameters: table"):
+        MySQLAccountStore(
+            params={
+                "user": "unused",
+                "password": "unused",
+                "database": "unused",
+                "table": "tenant_accounts",
+            }
+        )
+
+
+async def test_mysql_verification_excludes_deleting_identities(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+    statements = []
+
+    class Result:
+        def all(self):
+            return []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def execute(self, statement):
+            statements.append(
+                str(
+                    statement.compile(
+                        dialect=mysql.dialect(),
+                        compile_kwargs={"literal_binds": True},
+                    )
+                )
+            )
+            return Result()
+
+    store._sessions = lambda: Session()
+
+    assert await store.verify_api_key("key", account_id_hint="acme") is None
+    statement = statements[0]
+    assert statement.count("deletion_task_id IS NULL") == 2
+
+
 async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypatch):
     monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
     store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
@@ -226,7 +338,7 @@ async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypa
 
         async def execute(self, statement):
             table = statement.get_final_froms()[0].name
-            if table == store._tables["groups"]:
+            if table == Group.__tablename__:
                 raise OperationalError(
                     str(statement),
                     {},
@@ -266,7 +378,6 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
     encryption_key = base64.urlsafe_b64encode(b"k" * 32).decode()
     params = {
         **json.loads(raw),
-        "table": f"ov_test_{uuid4().hex}",
         "credential_encryption_key": encryption_key,
     }
     first = build_api_key_manager(
@@ -283,7 +394,10 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
     )
     setup_engine = create_async_engine(first._store._url, **first._store._engine_options)
     async with setup_engine.begin() as connection:
-        await connection.run_sync(first._store._models.Base.metadata.create_all)
+        await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            delete(Account).where(Account.resource_id == first._store._resource_id)
+        )
     await setup_engine.dispose()
     await first.load()
     await second.load()
@@ -335,6 +449,8 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
         assert await second.get_user_group_ids("acme", "alice") == ("engineering",)
     finally:
         async with first._store._engine.begin() as connection:
-            await connection.run_sync(first._store._models.Base.metadata.drop_all)
+            await connection.execute(
+                delete(Account).where(Account.resource_id == first._store._resource_id)
+            )
         await second.close()
         await first.close()

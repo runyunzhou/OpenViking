@@ -194,16 +194,16 @@ class TrustedAuthPlugin(AuthPlugin):
         if effective_account_id and effective_user_id:
             _validate_trusted_identity(effective_account_id, effective_user_id)
 
-        local_role = None
-        if self._api_key_manager and effective_account_id and effective_user_id:
-            local_role = await self._api_key_manager.get_registered_user_role(
-                effective_account_id, effective_user_id
-            )
-        trusted_role = Role.USER
         if asserted_role is not None:
             trusted_role = asserted_role
-        elif local_role is not None:
-            trusted_role = local_role
+            local_role = None
+        else:
+            local_role = None
+            if self._api_key_manager and effective_account_id and effective_user_id:
+                local_role = await self._api_key_manager.get_registered_user_role(
+                    effective_account_id, effective_user_id
+                )
+            trusted_role = local_role or Role.USER
 
         identity = ResolvedIdentity(
             role=trusted_role,

@@ -1855,11 +1855,9 @@ The provider never creates or migrates database tables. Create the normalized
 tables in `openviking/server/account_stores/sql/init.sql` through your normal
 DBA or deployment process before starting the server. Future reviewed schema
 changes are stored as ordered SQL files in
-`openviking/server/account_stores/sql/changes/`. The initialization script uses
-the default `ov_accounts` prefix. When using `account_store.params.table`,
-replace only the backtick-quoted `ov_accounts` table identifiers in the
-initialization script. Constraint and index names are stable and independent of
-the configured table names.
+`openviking/server/account_stores/sql/changes/`. The five `ov_accounts*` table
+names are fixed; use `OV_RESOURCE_ID` rather than separate table prefixes to
+isolate OpenViking deployments that share a database.
 
 ```json
 {
@@ -1883,17 +1881,15 @@ the configured table names.
 parameters. It caches API-key bindings, users, per-user group IDs, and deletion
 records for a fixed 60 seconds by default. Cache fills and account mutations
 share an account-scoped Redis lease; normal cache hits do not acquire that
-lease. Mutations commit to MySQL first, then wait up to 30 seconds for the lease
-and invalidate affected cache entries before returning. If that wait times out,
-the provider revokes the current lease, reacquires it, and invalidates before
-returning the committed MySQL result. Cache fills also maintain an
+lease. Mutations commit to MySQL first, then invalidate affected cache entries.
+If Redis is unavailable, the MySQL mutation still succeeds and stale cache
+entries remain valid only until their fixed TTL expires. Cache fills also
+maintain an
 account-scoped, expiry-scored key index. Each indexed cache fill removes expired
 index members, allowing account deletion or recreation to clear only that
 account's current cached users, groups, deletion records, and credential data.
 API-key bindings are checked against account and user credential fences, so
 normal key replacement, revocation, and user deletion invalidate old bindings.
-If Redis is unavailable after a MySQL mutation, any stale cache entry remains
-valid only until its fixed TTL expires.
 
 ```json
 {
