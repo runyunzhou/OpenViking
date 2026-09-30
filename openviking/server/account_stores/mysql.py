@@ -37,9 +37,11 @@ from openviking.server.account_stores.models import (
     UserSummary,
 )
 from openviking.server.account_stores.mysql_schema import (
-    AccountStoreModels,
-    make_account_store_models,
-    validate_table_prefix,
+    Account,
+    Credential,
+    Group,
+    GroupMember,
+    User,
 )
 from openviking.server.identity import Role
 from openviking_cli.exceptions import (
@@ -83,6 +85,13 @@ def _like_pattern(pattern: str) -> str:
     return "".join(escaped)
 
 
+def _substring_pattern(value: str) -> str:
+    escaped = "".join(
+        "=" + character if character in {"%", "_", "="} else character for character in value
+    )
+    return f"%{escaped}%"
+
+
 def _timestamp(value: datetime) -> str:
     return value.isoformat()
 
@@ -111,12 +120,6 @@ class MySQLAccountStore(AccountStore):
 
     def __init__(self, *, params: dict[str, object] | None = None) -> None:
         values = dict(params or {})
-        try:
-            table_prefix = validate_table_prefix(values.pop("table", "ov_accounts"))
-        except ValueError as exc:
-            raise InvalidArgumentError(str(exc)) from None
-        self._models: AccountStoreModels = make_account_store_models(table_prefix)
-        self._tables = self._models.table_names
         self._resource_id = os.environ.get("OV_RESOURCE_ID", "").strip()
         if not self._resource_id:
             raise InvalidArgumentError("OV_RESOURCE_ID is required for MySQL account storage")
@@ -208,7 +211,6 @@ class MySQLAccountStore(AccountStore):
         *,
         sequence: int,
     ):
-        Credential = self._models.Credential
         return Credential(
             credential_id=uuid4().hex,
             resource_id=self._resource_id,
@@ -290,13 +292,7 @@ class MySQLAccountStore(AccountStore):
             engine = create_async_engine(self._url, **self._engine_options)
             sessions = async_sessionmaker(engine, expire_on_commit=False)
             async with sessions() as session:
-                for model in (
-                    self._models.Account,
-                    self._models.User,
-                    self._models.Group,
-                    self._models.GroupMember,
-                    self._models.Credential,
-                ):
+                for model in (Account, User, Group, GroupMember, Credential):
                     await session.execute(select(*model.__table__.columns).limit(1))
         except ImportError:
             raise RuntimeError("MySQL account storage requires openviking[mysql]") from None
@@ -339,7 +335,6 @@ class MySQLAccountStore(AccountStore):
                 yield session
 
     async def _lock_account(self, session: AsyncSession, account_id: str):
-        Account = self._models.Account
         account = await session.scalar(
             select(Account)
             .where(
@@ -353,7 +348,6 @@ class MySQLAccountStore(AccountStore):
         return account
 
     async def _lock_user(self, session: AsyncSession, account, user_id: str):
-        User = self._models.User
         user = await session.scalar(
             select(User)
             .where(
@@ -378,7 +372,6 @@ class MySQLAccountStore(AccountStore):
     async def _protect_last_admin(self, session: AsyncSession, account, user) -> None:
         if user.role != Role.ADMIN or user.deletion_task_id:
             return
-        User = self._models.User
         count = await session.scalar(
             select(func.count())
             .select_from(User)
@@ -403,7 +396,6 @@ class MySQLAccountStore(AccountStore):
         }
 
     async def get_account(self, account_id: str) -> AccountSummary | None:
-        Account, User = self._models.Account, self._models.User
         async with self._session_factory() as session:
             row = (
                 await session.execute(
@@ -425,7 +417,6 @@ class MySQLAccountStore(AccountStore):
         return self._account_summary(*row) if row else None
 
     async def get_user(self, account_id: str, user_id: str) -> UserSummary | None:
-        Account, User = self._models.Account, self._models.User
         async with self._session_factory() as session:
             user = await session.scalar(
                 select(User)
@@ -452,12 +443,9 @@ class MySQLAccountStore(AccountStore):
     ) -> None:
         _validate(account_id, validate_account_id)
         _validate(admin_user_id, validate_user_id)
-        Account, User = self._models.Account, self._models.User
         try:
             async with self._transaction() as session:
-                account = Account(
-                    resource_id=self._resource_id, account_id=account_id
-                )
+                account = Account(resource_id=self._resource_id, account_id=account_id)
                 session.add(account)
                 await session.flush()
                 user = User(
@@ -483,7 +471,6 @@ class MySQLAccountStore(AccountStore):
     async def create_user(self, account_id: str, user_id: str, role: str) -> None:
         _validate(user_id, validate_user_id)
         role = _validate_role(role)
-        User = self._models.User
         try:
             async with self._transaction() as session:
                 account = await self._lock_account(session, account_id)
@@ -509,7 +496,6 @@ class MySQLAccountStore(AccountStore):
     ) -> None:
         _validate(user_id, validate_user_id)
         role = _validate_role(role)
-        User = self._models.User
         try:
             async with self._transaction() as session:
                 account = await self._lock_account(session, account_id)
@@ -545,12 +531,16 @@ class MySQLAccountStore(AccountStore):
         page: int = 1,
         query_filter: str | None = None,
     ) -> list[AccountSummary]:
-        Account, User = self._models.Account, self._models.User
         predicates = [Account.resource_id == self._resource_id]
         if name_filter:
             predicates.append(Account.account_id.like(_like_pattern(name_filter), escape="="))
         if query := (query_filter or "").strip():
-            predicates.append(func.lower(Account.account_id).like(f"%{query.casefold()}%"))
+            predicates.append(
+                func.lower(Account.account_id).like(
+                    _substring_pattern(query.casefold()),
+                    escape="=",
+                )
+            )
         statement = (
             select(Account, func.count(User.user_pk))
             .outerjoin(
@@ -579,16 +569,13 @@ class MySQLAccountStore(AccountStore):
         page: int = 1,
         query_filter: str | None = None,
     ) -> UsersPage:
-        User, Credential = self._models.User, self._models.Credential
         async with self._session_factory() as session:
             # One HTTP response must derive its rows and summary from one MVCC snapshot.
-            await session.connection(
-                execution_options={"isolation_level": "REPEATABLE READ"}
-            )
+            await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
             account = await session.scalar(
-                select(self._models.Account).where(
-                    self._models.Account.resource_id == self._resource_id,
-                    self._models.Account.account_id == account_id,
+                select(Account).where(
+                    Account.resource_id == self._resource_id,
+                    Account.account_id == account_id,
                 )
             )
             if account is None:
@@ -624,7 +611,12 @@ class MySQLAccountStore(AccountStore):
             if role_filter:
                 filters.append(User.role == role_filter)
             if query := (query_filter or "").strip():
-                filters.append(func.lower(User.user_id).like(f"%{query.casefold()}%"))
+                filters.append(
+                    func.lower(User.user_id).like(
+                        _substring_pattern(query.casefold()),
+                        escape="=",
+                    )
+                )
             total = await session.scalar(select(func.count()).select_from(User).where(*filters))
             statement = select(User).where(*filters).order_by(User.created_at, User.user_pk)
             if limit is not None:
@@ -680,7 +672,6 @@ class MySQLAccountStore(AccountStore):
                 _validate(user_id, validate_user_id)
         created_accounts = 0
         created_users = 0
-        Account, User = self._models.Account, self._models.User
         for account_id, user_ids in identities.items():
             if not user_ids:
                 continue
@@ -813,14 +804,13 @@ class MySQLAccountStore(AccountStore):
         if user_id is None:
             async with self._session_factory() as session:
                 account = await session.scalar(
-                    select(self._models.Account).where(
-                        self._models.Account.resource_id == self._resource_id,
-                        self._models.Account.account_id == account_id,
+                    select(Account).where(
+                        Account.resource_id == self._resource_id,
+                        Account.account_id == account_id,
                     )
                 )
             return _deletion(account) if account else None
 
-        Account, User = self._models.Account, self._models.User
         async with self._session_factory() as session:
             row = (
                 await session.execute(
@@ -845,7 +835,6 @@ class MySQLAccountStore(AccountStore):
         return _deletion(account) or (_deletion(user) if user else None)
 
     async def iter_deletions(self) -> list[tuple[str, str | None, DeletionRecord]]:
-        Account, User = self._models.Account, self._models.User
         async with self._session_factory() as session:
             accounts = (
                 await session.scalars(
@@ -878,7 +867,6 @@ class MySQLAccountStore(AccountStore):
 
     async def create_group(self, account_id: str, group_id: str) -> GroupSummary:
         _validate(group_id, lambda value: validate_identifier_part(value, "group_id"))
-        Group = self._models.Group
         try:
             async with self._transaction() as session:
                 account = await self._lock_account(session, account_id)
@@ -897,9 +885,9 @@ class MySQLAccountStore(AccountStore):
 
     async def _account_for_read(self, session: AsyncSession, account_id: str):
         account = await session.scalar(
-            select(self._models.Account).where(
-                self._models.Account.resource_id == self._resource_id,
-                self._models.Account.account_id == account_id,
+            select(Account).where(
+                Account.resource_id == self._resource_id,
+                Account.account_id == account_id,
             )
         )
         if account is None:
@@ -907,7 +895,6 @@ class MySQLAccountStore(AccountStore):
         return account
 
     async def get_groups(self, account_id: str) -> list[GroupSummary]:
-        Group, GroupMember = self._models.Group, self._models.GroupMember
         async with self._session_factory() as session:
             account = await self._account_for_read(session, account_id)
             rows = (
@@ -917,6 +904,7 @@ class MySQLAccountStore(AccountStore):
                         GroupMember,
                         and_(
                             GroupMember.resource_id == Group.resource_id,
+                            GroupMember.account_pk == Group.account_pk,
                             GroupMember.group_pk == Group.group_pk,
                         ),
                     )
@@ -931,7 +919,6 @@ class MySQLAccountStore(AccountStore):
         return [GroupSummary(group_id=group_id, member_count=count) for group_id, count in rows]
 
     async def get_group_members(self, account_id: str, group_id: str) -> list[str]:
-        Group, GroupMember, User = (self._models.Group, self._models.GroupMember, self._models.User)
         async with self._session_factory() as session:
             account = await self._account_for_read(session, account_id)
             group = await session.scalar(
@@ -951,11 +938,13 @@ class MySQLAccountStore(AccountStore):
                             GroupMember,
                             and_(
                                 GroupMember.resource_id == User.resource_id,
+                                GroupMember.account_pk == User.account_pk,
                                 GroupMember.user_pk == User.user_pk,
                             ),
                         )
                         .where(
                             GroupMember.resource_id == self._resource_id,
+                            GroupMember.account_pk == account.account_pk,
                             GroupMember.group_pk == group.group_pk,
                         )
                         .order_by(User.user_id)
@@ -964,12 +953,6 @@ class MySQLAccountStore(AccountStore):
             )
 
     async def get_user_group_ids(self, account_id: str, user_id: str) -> tuple[str, ...]:
-        Account, User, Group, GroupMember = (
-            self._models.Account,
-            self._models.User,
-            self._models.Group,
-            self._models.GroupMember,
-        )
         async with self._session_factory() as session:
             group_ids = (
                 await session.scalars(
@@ -986,6 +969,7 @@ class MySQLAccountStore(AccountStore):
                         GroupMember,
                         and_(
                             GroupMember.resource_id == User.resource_id,
+                            GroupMember.account_pk == User.account_pk,
                             GroupMember.user_pk == User.user_pk,
                         ),
                     )
@@ -993,6 +977,7 @@ class MySQLAccountStore(AccountStore):
                         Group,
                         and_(
                             Group.resource_id == GroupMember.resource_id,
+                            Group.account_pk == GroupMember.account_pk,
                             Group.group_pk == GroupMember.group_pk,
                         ),
                     )
@@ -1007,7 +992,6 @@ class MySQLAccountStore(AccountStore):
         return tuple(group_id for group_id in group_ids if group_id is not None)
 
     async def add_group_member(self, account_id: str, group_id: str, user_id: str) -> bool:
-        Group, GroupMember = self._models.Group, self._models.GroupMember
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             self._require_active(account)
@@ -1028,6 +1012,7 @@ class MySQLAccountStore(AccountStore):
                 await session.scalar(
                     select(GroupMember.group_pk).where(
                         GroupMember.resource_id == self._resource_id,
+                        GroupMember.account_pk == account.account_pk,
                         GroupMember.group_pk == group.group_pk,
                         GroupMember.user_pk == user.user_pk,
                     )
@@ -1037,6 +1022,7 @@ class MySQLAccountStore(AccountStore):
                 session.add(
                     GroupMember(
                         resource_id=self._resource_id,
+                        account_pk=account.account_pk,
                         group_pk=group.group_pk,
                         user_pk=user.user_pk,
                     )
@@ -1044,7 +1030,6 @@ class MySQLAccountStore(AccountStore):
         return True
 
     async def remove_group_member(self, account_id: str, group_id: str, user_id: str) -> bool:
-        Group, GroupMember, User = (self._models.Group, self._models.GroupMember, self._models.User)
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             self._require_active(account)
@@ -1065,11 +1050,13 @@ class MySQLAccountStore(AccountStore):
                     User,
                     and_(
                         User.resource_id == GroupMember.resource_id,
+                        User.account_pk == GroupMember.account_pk,
                         User.user_pk == GroupMember.user_pk,
                     ),
                 )
                 .where(
                     GroupMember.resource_id == self._resource_id,
+                    GroupMember.account_pk == account.account_pk,
                     GroupMember.group_pk == group.group_pk,
                     User.account_pk == account.account_pk,
                     User.user_id == user_id,
@@ -1081,7 +1068,6 @@ class MySQLAccountStore(AccountStore):
             return True
 
     async def delete_group(self, account_id: str, group_id: str) -> None:
-        Group, GroupMember = self._models.Group, self._models.GroupMember
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             self._require_active(account)
@@ -1101,6 +1087,7 @@ class MySQLAccountStore(AccountStore):
                 .select_from(GroupMember)
                 .where(
                     GroupMember.resource_id == self._resource_id,
+                    GroupMember.account_pk == account.account_pk,
                     GroupMember.group_pk == group.group_pk,
                 )
             ):
@@ -1110,7 +1097,6 @@ class MySQLAccountStore(AccountStore):
     async def replace_active_user_api_key(
         self, account_id: str, user_id: str, api_key: str
     ) -> None:
-        Credential = self._models.Credential
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             self._require_active(account)
@@ -1153,15 +1139,12 @@ class MySQLAccountStore(AccountStore):
         account_id_hint: str | None = None,
         user_id_hint: str | None = None,
     ) -> tuple[str, str] | None:
-        Account, User, Credential = (
-            self._models.Account,
-            self._models.User,
-            self._models.Credential,
-        )
         predicates = [
             Credential.resource_id == self._resource_id,
             Credential.lookup_digest == _credential_digest(api_key),
             Credential.revoked.is_(False),
+            Account.deletion_task_id.is_(None),
+            User.deletion_task_id.is_(None),
         ]
         if account_id_hint is not None:
             predicates.append(Account.account_id == account_id_hint)
@@ -1194,13 +1177,12 @@ class MySQLAccountStore(AccountStore):
         return None
 
     async def revoke_active_api_keys(self, account_id: str, user_id: str | None = None) -> None:
-        User, Credential = self._models.User, self._models.Credential
         async with self._transaction() as session:
             account = await session.scalar(
-                select(self._models.Account)
+                select(Account)
                 .where(
-                    self._models.Account.resource_id == self._resource_id,
-                    self._models.Account.account_id == account_id,
+                    Account.resource_id == self._resource_id,
+                    Account.account_id == account_id,
                 )
                 .with_for_update()
             )
@@ -1227,11 +1209,6 @@ class MySQLAccountStore(AccountStore):
             )
 
     async def get_user_key_fingerprint(self, account_id: str, user_id: str) -> str | None:
-        Account, User, Credential = (
-            self._models.Account,
-            self._models.User,
-            self._models.Credential,
-        )
         async with self._session_factory() as session:
             material = await session.scalar(
                 select(Credential.material)

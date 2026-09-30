@@ -109,11 +109,23 @@ class FakeMySQLAuthority:
     async def close(self):
         return None
 
-    async def verify_api_key(self, api_key: str, **_kwargs):
+    async def verify_api_key(
+        self,
+        api_key: str,
+        *,
+        account_id_hint: str | None = None,
+        user_id_hint: str | None = None,
+    ):
         self.calls["verify"] += 1
         return (
             ("acme", "alice")
-            if self.account_exists and self.user_exists and api_key == self.api_key
+            if (
+                self.account_exists
+                and self.user_exists
+                and api_key == self.api_key
+                and account_id_hint in (None, "acme")
+                and user_id_hint in (None, "alice")
+            )
             else None
         )
 
@@ -264,6 +276,32 @@ async def test_verify_api_key_caches_public_binding_read():
     assert mysql.calls["verify"] == 1
 
 
+async def test_cached_binding_respects_user_id_hint():
+    api_key = _api_key()
+    store, mysql = _store(api_key)
+    await store.load()
+
+    assert await store.verify_api_key(
+        api_key,
+        account_id_hint="acme",
+        user_id_hint="alice",
+    ) == ("acme", "alice")
+    assert (
+        await store.verify_api_key(
+            api_key,
+            account_id_hint="acme",
+            user_id_hint="bob",
+        )
+        is None
+    )
+    assert await store.verify_api_key(
+        api_key,
+        account_id_hint="acme",
+        user_id_hint="alice",
+    ) == ("acme", "alice")
+    assert mysql.calls["verify"] == 2
+
+
 async def test_concurrent_user_cache_misses_query_mysql_once():
     store, mysql = _store(_api_key())
     await store.load()
@@ -334,6 +372,38 @@ async def test_write_lock_timeout_revokes_stale_lease_before_invalidation():
     )
 
 
+async def test_invalidation_failure_does_not_block_mysql_mutation():
+    store, mysql = _store(_api_key())
+    await store.load()
+    assert await store.get_user("acme", "alice") is not None
+
+    async def fail_invalidation(*_args):
+        raise ConnectionError("redis unavailable")
+
+    store._delete_and_unindex = fail_invalidation
+
+    await store.set_role("acme", "alice", Role.USER)
+
+    assert mysql.user["role"] == Role.USER
+    assert store._user_key("acme", "alice") in store._redis.values
+
+
+async def test_redis_outage_does_not_block_mysql_mutation():
+    store, mysql = _store(_api_key())
+    await store.load()
+
+    async def unavailable(*_args, **_kwargs):
+        raise ConnectionError("redis unavailable")
+
+    store._redis.set = unavailable
+    store._redis.delete = unavailable
+    store._redis.eval = unavailable
+
+    await store.set_role("acme", "alice", Role.USER)
+
+    assert mysql.user["role"] == Role.USER
+
+
 async def test_api_key_manager_uses_cached_public_store_reads():
     api_key = _api_key()
     store, mysql = _store(api_key)
@@ -361,6 +431,8 @@ async def test_replacing_key_invalidates_cached_binding_and_prior_negative():
     await store.load()
     assert await store.verify_api_key(old_key, account_id_hint="acme", user_id_hint="alice")
     assert await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint="alice") is None
+    assert await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint="alice") is None
+    assert mysql.calls["verify"] == 2
     assert store._binding_key("acme", new_key) not in await store._redis.zrange(
         store._cache_keys_index_key("acme"),
         0,
