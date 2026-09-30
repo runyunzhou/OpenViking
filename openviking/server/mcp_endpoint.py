@@ -195,7 +195,7 @@ class _IdentityASGIMiddleware:
             actor_peer_id = normalize_actor_peer_header(
                 request.headers.get("x-openviking-actor-peer")
             )
-            ctx = _build_request_context(
+            ctx = await _build_request_context(
                 request,
                 identity,
                 actor_peer_id=actor_peer_id,

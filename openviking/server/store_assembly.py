@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+# SPDX-License-Identifier: AGPL-3.0
+"""Application-scoped dependency binding for complete account stores."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, cast
+
+from openviking.server.account_stores.base import AccountStore
+from openviking.server.account_stores.registry import new_account_store_registry
+from openviking.server.api_keys.legacy import FileStore
+from openviking.storage.viking_fs import VikingFS
+
+if TYPE_CHECKING:
+    from openviking.server.api_keys.new import APIKeyManager
+
+
+def build_api_key_manager(
+    root_key: str,
+    viking_fs: VikingFS | None,
+    *,
+    api_key_hashing_enabled: bool = False,
+    account_store_provider: str = "file",
+    account_store_params: dict[str, object] | None = None,
+    account_store_watch_enabled: bool = False,
+    account_store_watch_interval_seconds: float = 30.0,
+    account_store: AccountStore | None = None,
+) -> APIKeyManager:
+    """Assemble the API key facade over one complete account store."""
+    from openviking.server.api_keys.new import APIKeyManager
+
+    provider = account_store_provider.strip().lower()
+    store = build_account_store(
+        viking_fs=viking_fs,
+        api_key_hashing_enabled=api_key_hashing_enabled,
+        account_store_provider=provider,
+        account_store_params=account_store_params,
+        account_store_watch_enabled=account_store_watch_enabled,
+        account_store_watch_interval_seconds=account_store_watch_interval_seconds,
+        account_store=account_store,
+    )
+    return APIKeyManager(root_key, store)
+
+
+def build_account_store(
+    *,
+    viking_fs: VikingFS | None,
+    api_key_hashing_enabled: bool,
+    account_store_provider: str,
+    account_store_params: dict[str, object] | None,
+    account_store_watch_enabled: bool,
+    account_store_watch_interval_seconds: float,
+    account_store: AccountStore | None = None,
+) -> AccountStore:
+    """Create one complete account store from the configured provider."""
+    if account_store is not None:
+        return account_store
+
+    provider = account_store_provider.strip().lower()
+    registry = new_account_store_registry()
+    if provider == "file":
+        file_system = cast(VikingFS, viking_fs)
+        registry.bind(
+            "file",
+            lambda *, params: FileStore(
+                viking_fs=file_system,
+                params=params,
+                api_key_hashing_enabled=api_key_hashing_enabled,
+                watch_enabled=account_store_watch_enabled,
+                watch_interval_seconds=account_store_watch_interval_seconds,
+            ),
+        )
+    return registry.create(provider, params=dict(account_store_params or {}))

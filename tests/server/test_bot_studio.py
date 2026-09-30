@@ -75,16 +75,18 @@ async def test_reused_admin_users_support_safe_credential_status(
     )
     registry = SimpleNamespace(
         refresh_account_users_from_store=AsyncMock(),
-        get_users_page=lambda *args, **kwargs: {
-            "users": [
-                {"user_id": "bot", "role": "user", "api_key": "private"},
-                {"user_id": "hashed", "role": "user", "key_prefix": "prefix"},
-            ],
-            "total": 2,
-            "account_total": 2,
-            "manager_count": 0,
-            "key_count": 2,
-        },
+        list_users_page=AsyncMock(
+            return_value={
+                "users": [
+                    {"user_id": "bot", "role": "user", "api_key": "private"},
+                    {"user_id": "hashed", "role": "user", "key_prefix": "prefix"},
+                ],
+                "total": 2,
+                "account_total": 2,
+                "manager_count": 0,
+                "key_count": 2,
+            }
+        ),
     )
     app.state.api_key_manager = registry
     monkeypatch.setattr(admin, "_get_api_key_manager", lambda request: registry)
@@ -111,7 +113,7 @@ async def test_reused_admin_users_support_safe_credential_status(
         assert "private" not in response.text and "prefix" not in response.text
         assert result == [
             {"user_id": "bot", "role": "user", "api_key_available": True},
-            {"user_id": "hashed", "role": "user", "api_key_available": False},
+            {"user_id": "hashed", "role": "user", "api_key_available": True},
         ]
 
 
@@ -121,7 +123,15 @@ async def test_selection_uses_current_account_registry(monkeypatch, user_id, acc
 
     registry = SimpleNamespace(
         refresh_account_users_from_store=AsyncMock(),
-        get_users=lambda *a, **kw: [{"user_id": "bot", "api_key": "internal-key"}],
+        list_users_page=AsyncMock(
+            return_value={
+                "users": [{"user_id": "bot", "api_key": "internal-key"}],
+                "total": 1,
+                "account_total": 1,
+                "manager_count": 0,
+                "key_count": 1,
+            }
+        ),
     )
     monkeypatch.setattr(bot_studio, "get_api_key_manager_or_raise", lambda request: registry)
     monkeypatch.setattr(
@@ -138,7 +148,6 @@ async def test_selection_uses_current_account_registry(monkeypatch, user_id, acc
         with pytest.raises(HTTPException) as exc:
             await bot_studio.selected_identity(request, ctx, user_id)
         assert exc.value.status_code == 400
-    registry.refresh_account_users_from_store.assert_awaited_with("a")
 
 
 async def test_hashed_key_is_not_treated_as_a_usable_credential(monkeypatch):

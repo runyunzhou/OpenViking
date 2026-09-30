@@ -451,11 +451,6 @@ class LDAPAuthPlugin(AuthPlugin):
             "LDAP auth plugin initialized with host=%s", self._config.host
         )
 
-    def requires_api_key_manager(self) -> bool:
-        """LDAP does not map external identities to admin roles, so no
-        APIKeyManager is needed. Admin API access is gated by role checks."""
-        return False
-
     def can_skip_api_key_for_bot_proxy(self) -> bool:
         """LDAP does not declare bot-proxy compatibility until VikingBot
         natively understands the ``ldap`` auth mode (mode inference, Basic

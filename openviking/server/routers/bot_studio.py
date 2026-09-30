@@ -120,8 +120,10 @@ async def connections(ctx: RequestContext = Depends(manager)):
 
 async def account_users(request, ctx):
     registry = get_api_key_manager_or_raise(request)
-    await registry.refresh_account_users_from_store(ctx.account_id)
-    return registry.get_users(ctx.account_id, limit=None, role_filter="user", expose_key=True)
+    page = await registry.list_users_page(
+        ctx.account_id, limit=None, role_filter="user", expose_key=True
+    )
+    return page["users"]
 
 
 async def selected_identity(request, ctx, user_id):

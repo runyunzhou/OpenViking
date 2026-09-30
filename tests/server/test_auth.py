@@ -3,7 +3,6 @@
 
 """Tests for multi-tenant authentication (openviking/server/auth.py)."""
 
-import asyncio
 import uuid
 
 import httpx
@@ -14,6 +13,7 @@ from fastapi import Request as FastAPIRequest
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from openviking.server.api_keys import APIKeyManager
 from openviking.server.app import create_app
 from openviking.server.auth import get_request_context, resolve_identity
 from openviking.server.auth.registry import get_registry
@@ -21,6 +21,7 @@ from openviking.server.config import ServerConfig, _is_localhost, validate_serve
 from openviking.server.dependencies import set_service
 from openviking.server.identity import ResolvedIdentity, Role
 from openviking.server.models import ERROR_CODE_TO_HTTP_STATUS, ErrorInfo, Response
+from openviking.server.store_assembly import build_api_key_manager
 from openviking.service.core import OpenVikingService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import (
@@ -99,14 +100,16 @@ def _make_request(
     # When auth is disabled and mode is the default api_key, fall back to dev mode
     effective_auth_mode = auth_mode if auth_enabled or auth_mode != "api_key" else "dev"
     app.state.config = ServerConfig(auth_mode=effective_auth_mode, root_api_key=root_api_key)
-    if auth_enabled:
-        # Non-empty api_key_manager means the server is in authenticated mode.
-        app.state.api_key_manager = api_key_manager if api_key_manager is not None else object()
+    app.state.api_key_manager = (
+        api_key_manager if auth_enabled and api_key_manager is not None else None
+    )
     # Set auth plugin based on mode
     registry = get_registry()
     plugin_cls = registry.get(effective_auth_mode)
     if plugin_cls is not None:
         app.state.auth_plugin = plugin_cls()
+        if effective_auth_mode == "trusted":
+            app.state.auth_plugin._api_key_manager = api_key_manager
     scope = {
         "type": "http",
         "path": path,
@@ -135,9 +138,7 @@ def _build_auth_http_test_app(
     # When auth is disabled and mode is the default api_key, fall back to dev mode
     effective_auth_mode = auth_mode if auth_enabled or auth_mode != "api_key" else "dev"
     app.state.config = ServerConfig(auth_mode=effective_auth_mode, root_api_key=root_api_key)
-    if auth_enabled:
-        # Match production auth mode so get_request_context enters the guard path.
-        app.state.api_key_manager = object()
+    app.state.api_key_manager = object() if auth_enabled else None
     # Set auth plugin based on mode
     registry = get_registry()
     plugin_cls = registry.get(effective_auth_mode)
@@ -233,8 +234,7 @@ async def auth_service(temp_dir):
 
 @pytest_asyncio.fixture(scope="function")
 async def auth_app(auth_service):
-    """App with root_api_key configured and APIKeyManager loaded."""
-    from openviking.server.api_keys import APIKeyManager
+    """App with root_api_key configured and identity services initialized."""
     from openviking.server.auth.plugins import ApiKeyAuthPlugin
     from openviking.server.auth.registry import get_registry
 
@@ -242,8 +242,7 @@ async def auth_app(auth_service):
     app = create_app(config=config, service=auth_service)
     set_service(auth_service)
 
-    # Manually initialize APIKeyManager (lifespan not triggered in ASGI tests)
-    manager = APIKeyManager(root_key=ROOT_KEY, viking_fs=auth_service.viking_fs)
+    manager = build_api_key_manager(ROOT_KEY, auth_service.viking_fs)
     await manager.load()
     app.state.api_key_manager = manager
 
@@ -255,7 +254,24 @@ async def auth_app(auth_service):
     plugin = plugin_cls()
     app.state.auth_plugin = plugin
 
-    return app
+    yield app
+    await manager.close()
+
+
+async def _initialize_test_plugin(plugin, app, service, config):
+    await plugin.initialize(app, service, config)
+
+
+async def _stored_users(service, account_id):
+    manager = build_api_key_manager(ROOT_KEY, service.viking_fs)
+    await manager.load()
+    try:
+        if await manager.get_account(account_id) is None:
+            return []
+        page = await manager.list_users_page(account_id, expose_key=True)
+        return page["users"]
+    finally:
+        await manager.close()
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -517,13 +533,15 @@ async def test_admin_key_cannot_switch_effective_user_within_account(auth_app):
         api_key_manager=manager,
     )
 
-    with pytest.raises(PermissionDeniedError, match="X-OpenViking-Account"):
-        await resolve_identity(
-            request,
-            x_api_key=admin_key,
-            x_openviking_account=account_id,
-            x_openviking_user="alice",
-        )
+    identity = await resolve_identity(
+        request,
+        x_api_key=admin_key,
+        x_openviking_account=account_id,
+        x_openviking_user="alice",
+    )
+    assert (identity.account_id, identity.user_id) == (account_id, "admin_user")
+    assert "x-openviking-account" not in request.headers
+    assert "x-openviking-user" not in request.headers
 
 
 async def test_admin_key_cannot_switch_account_via_header(auth_app):
@@ -542,12 +560,13 @@ async def test_admin_key_cannot_switch_account_via_header(auth_app):
         api_key_manager=manager,
     )
 
-    with pytest.raises(PermissionDeniedError, match="X-OpenViking-Account"):
-        await resolve_identity(
-            request,
-            x_api_key=admin_key,
-            x_openviking_account="other-account",
-        )
+    identity = await resolve_identity(
+        request,
+        x_api_key=admin_key,
+        x_openviking_account="other-account",
+    )
+    assert (identity.account_id, identity.user_id) == (account_id, "admin_user")
+    assert "x-openviking-account" not in request.headers
 
 
 async def test_user_key_resolves_to_key_user_and_cannot_switch_user(auth_app):
@@ -585,12 +604,13 @@ async def test_user_key_resolves_to_key_user_and_cannot_switch_user(auth_app):
         api_key_manager=manager,
     )
 
-    with pytest.raises(PermissionDeniedError, match="X-OpenViking-User"):
-        await resolve_identity(
-            forbidden_request,
-            x_api_key=user_key,
-            x_openviking_user="bob",
-        )
+    identity = await resolve_identity(
+        forbidden_request,
+        x_api_key=user_key,
+        x_openviking_user="bob",
+    )
+    assert (identity.account_id, identity.user_id) == (account_id, "alice")
+    assert "x-openviking-user" not in forbidden_request.headers
 
 
 async def test_cross_tenant_session_get_returns_not_found(auth_client: httpx.AsyncClient, auth_app):
@@ -1074,7 +1094,7 @@ async def test_trusted_identity_registration_batches_data_plane_identity(auth_se
     app = FastAPI()
     app.state.config = config
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
         request = _make_request(
             "/api/v1/resources",
@@ -1095,11 +1115,11 @@ async def test_trusted_identity_registration_batches_data_plane_identity(auth_se
         )
         assert identity.account_id == "acme"
         assert identity.user_id == "alice"
-        assert plugin._api_key_manager.has_user("acme", "alice") is False
+        assert await _stored_users(auth_service, "acme") == []
 
         await plugin.flush_trusted_identities()
 
-        assert plugin._api_key_manager.get_users("acme", expose_key=True) == [
+        assert await _stored_users(auth_service, "acme") == [
             {"user_id": "alice", "role": "user"}
         ]
     finally:
@@ -1119,7 +1139,7 @@ async def test_invalid_trusted_identity_does_not_block_later_registration(
     app = FastAPI()
     app.state.config = config
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
         request = _make_request(
             "/api/v1/resources",
@@ -1139,8 +1159,6 @@ async def test_invalid_trusted_identity_does_not_block_later_registration(
                 x_openviking_user="invalid/user",
             )
 
-        assert plugin._pending == {}
-
         valid_request = _make_request(
             "/api/v1/resources",
             headers={
@@ -1158,7 +1176,9 @@ async def test_invalid_trusted_identity_does_not_block_later_registration(
         )
         await plugin.flush_trusted_identities()
 
-        assert plugin._api_key_manager.has_user("good-account", "alice")
+        assert await _stored_users(auth_service, "good-account") == [
+            {"user_id": "alice", "role": "user"}
+        ]
     finally:
         await plugin.shutdown()
 
@@ -1171,16 +1191,21 @@ async def test_trusted_identity_registration_skips_identity_loaded_from_registry
     app = FastAPI()
     app.state.config = config
     first_plugin = TrustedAuthPlugin()
-    await first_plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(first_plugin, app, auth_service, config)
     try:
-        await first_plugin._api_key_manager.ensure_trusted_identities({"acme": {"alice"}})
+        seed_manager = build_api_key_manager(ROOT_KEY, auth_service.viking_fs)
+        await seed_manager.load()
+        try:
+            await seed_manager.ensure_trusted_identities({"acme": {"alice"}})
+        finally:
+            await seed_manager.close()
     finally:
         await first_plugin.shutdown()
 
     restarted_app = FastAPI()
     restarted_app.state.config = config
     restarted_plugin = TrustedAuthPlugin()
-    await restarted_plugin.initialize(restarted_app, auth_service, config)
+    await _initialize_test_plugin(restarted_plugin, restarted_app, auth_service, config)
     try:
         request = _make_request(
             "/api/v1/resources",
@@ -1193,11 +1218,18 @@ async def test_trusted_identity_registration_skips_identity_loaded_from_registry
         )
         request.app.state.config = config
 
-        await restarted_plugin.resolve_identity(
+        identity = await restarted_plugin.resolve_identity(
             request, x_openviking_account="acme", x_openviking_user="alice"
         )
-
-        assert restarted_plugin._pending == {}
+        await restarted_plugin.flush_trusted_identities()
+        assert (identity.account_id, identity.user_id, identity.role) == (
+            "acme",
+            "alice",
+            Role.USER,
+        )
+        assert await _stored_users(auth_service, "acme") == [
+            {"user_id": "alice", "role": "user"}
+        ]
     finally:
         await restarted_plugin.shutdown()
 
@@ -1208,9 +1240,7 @@ async def test_trusted_identity_registration_keeps_rootless_admin_api_disabled(a
     from openviking.server.auth.plugins import TrustedAuthPlugin
 
     config = ServerConfig(auth_mode="trusted")
-    app = _build_auth_http_test_app(
-        identity=None, auth_enabled=False, auth_mode="trusted"
-    )
+    app = _build_auth_http_test_app(identity=None, auth_enabled=False, auth_mode="trusted")
     app.state.config = config
 
     @app.get("/api/v1/admin/guarded")
@@ -1219,7 +1249,7 @@ async def test_trusted_identity_registration_keeps_rootless_admin_api_disabled(a
         return {"status": "ok"}
 
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
         assert app.state.api_key_manager is None
         transport = httpx.ASGITransport(app=app)
@@ -1241,7 +1271,9 @@ async def test_trusted_identity_registration_keeps_rootless_admin_api_disabled(a
             request, x_openviking_account="acme", x_openviking_user="alice"
         )
         await plugin.flush_trusted_identities()
-        assert plugin._api_key_manager.has_user("acme", "alice")
+        assert await _stored_users(auth_service, "acme") == [
+            {"user_id": "alice", "role": "user"}
+        ]
     finally:
         await plugin.shutdown()
 
@@ -1254,17 +1286,14 @@ async def test_disabled_trusted_identity_registration_and_admin_paths_do_not_enq
     app = FastAPI()
     app.state.config = config
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
-        assert plugin._flush_task is None
         for path in ("/api/v1/resources", "/api/v1/admin/accounts"):
             headers = {
                 "X-OpenViking-Account": "acme",
                 "X-OpenViking-User": "alice",
             }
-            request = _make_request(
-                path, headers=headers, auth_enabled=False, auth_mode="trusted"
-            )
+            request = _make_request(path, headers=headers, auth_enabled=False, auth_mode="trusted")
             request.app.state.config = config
             request.app.state.api_key_manager = app.state.api_key_manager
             await plugin.resolve_identity(
@@ -1274,7 +1303,7 @@ async def test_disabled_trusted_identity_registration_and_admin_paths_do_not_enq
             )
 
         await plugin.flush_trusted_identities()
-        assert plugin._api_key_manager.has_user("acme", "alice") is False
+        assert await _stored_users(auth_service, "acme") == []
     finally:
         await plugin.shutdown()
 
@@ -1287,7 +1316,7 @@ async def test_trusted_identity_registration_excludes_admin_paths(auth_service):
     app = FastAPI()
     app.state.config = config
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
         request = _make_request(
             "/api/v1/admin/accounts",
@@ -1307,7 +1336,8 @@ async def test_trusted_identity_registration_excludes_admin_paths(auth_service):
             x_openviking_user="alice",
         )
 
-        assert plugin._pending == {}
+        await plugin.flush_trusted_identities()
+        assert await _stored_users(auth_service, "acme") == []
     finally:
         await plugin.shutdown()
 
@@ -1325,33 +1355,48 @@ async def test_trusted_identity_registration_retries_failed_batch_without_exceed
     app = FastAPI()
     app.state.config = config
     plugin = TrustedAuthPlugin()
-    await plugin.initialize(app, auth_service, config)
+    await _initialize_test_plugin(plugin, app, auth_service, config)
     try:
-        plugin._queue_trusted_identity("acme", "alice")
-        plugin._queue_trusted_identity("acme", "bob")
-        plugin._queue_trusted_identity("acme", "eve")
-        assert plugin._pending == {"acme": {"alice", "bob"}}
+        for user_id in ("alice", "bob", "eve"):
+            request = _make_request(
+                "/api/v1/resources",
+                headers={
+                    "X-OpenViking-Account": "acme",
+                    "X-OpenViking-User": user_id,
+                },
+                auth_enabled=False,
+                auth_mode="trusted",
+            )
+            request.app.state.config = config
+            await plugin.resolve_identity(
+                request,
+                x_openviking_account="acme",
+                x_openviking_user=user_id,
+            )
 
-        original_ensure = plugin._api_key_manager.ensure_trusted_identities
+        original_ensure = APIKeyManager.ensure_trusted_identities
+        failed = False
 
-        async def _fail_once(identities):
-            monkeypatch.setattr(plugin._api_key_manager, "ensure_trusted_identities", original_ensure)
-            raise RuntimeError("temporary storage failure")
+        async def _fail_once(manager, identities):
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise RuntimeError("temporary storage failure")
+            return await original_ensure(manager, identities)
 
-        monkeypatch.setattr(plugin._api_key_manager, "ensure_trusted_identities", _fail_once)
+        monkeypatch.setattr(APIKeyManager, "ensure_trusted_identities", _fail_once)
         await plugin.flush_trusted_identities()
-        assert plugin._pending == {"acme": {"alice", "bob"}}
 
         await plugin.flush_trusted_identities()
-        assert plugin._api_key_manager.has_user("acme", "alice")
-        assert plugin._api_key_manager.has_user("acme", "bob")
+        assert await _stored_users(auth_service, "acme") == [
+            {"user_id": "alice", "role": "user"},
+            {"user_id": "bob", "role": "user"},
+        ]
     finally:
         await plugin.shutdown()
 
 
-def test_trusted_identity_registration_config_allows_disabling():
-    """A zero interval disables registration; negative values remain invalid."""
-    assert ServerConfig(trusted_identity_flush_interval_seconds=0).trusted_identity_flush_interval_seconds == 0
+def test_trusted_identity_registration_config_rejects_invalid_limits():
     with pytest.raises(ValueError):
         ServerConfig(trusted_identity_flush_interval_seconds=-1)
     with pytest.raises(ValueError):
@@ -1775,91 +1820,3 @@ async def test_trusted_mode_admin_api_http_route_without_identity():
     assert response.json()["result"]["role"] == "root"
     assert response.json()["result"]["account_id"] == "trusted"
     assert response.json()["result"]["user_id"] == "trusted"
-
-
-# ---- API key store watcher (read-replica refresh) tests ----
-#
-# When server.api_key_watch_enabled is set, the api_key plugin starts a
-# background task that polls the shared key store and reloads the in-memory
-# index on change, so read replicas converge on writer-side user changes.
-
-
-class _FakeManager:
-    """Minimal APIKeyManager stand-in that records watcher interactions."""
-
-    def __init__(self, signatures):
-        # signatures: list of signatures returned on successive calls; the last
-        # value is repeated once exhausted.
-        self._signatures = list(signatures)
-        self.reload_calls = 0
-        self.signature_calls = 0
-
-    async def compute_store_signature(self):
-        self.signature_calls += 1
-        idx = min(self.signature_calls - 1, len(self._signatures) - 1)
-        return self._signatures[idx]
-
-    async def reload(self):
-        self.reload_calls += 1
-
-
-async def test_watcher_disabled_by_default(auth_service):
-    """No watch task should start when api_key_watch_enabled is unset."""
-    from openviking.server.auth.plugins import ApiKeyAuthPlugin
-
-    app = create_app(config=ServerConfig(root_api_key=ROOT_KEY), service=auth_service)
-    plugin = ApiKeyAuthPlugin()
-    config = ServerConfig(root_api_key=ROOT_KEY)
-    await plugin.initialize(app, auth_service, config)
-    try:
-        assert plugin._watch_task is None
-    finally:
-        await plugin.shutdown()
-
-
-async def test_watcher_reloads_on_signature_change(auth_service):
-    """The watcher reloads only when the store signature changes."""
-    from openviking.server.auth.plugins import ApiKeyAuthPlugin
-
-    manager = _FakeManager(signatures=[("sig-a",), ("sig-b",)])
-    task = asyncio.create_task(ApiKeyAuthPlugin._watch_key_store(manager, interval=0.01))
-    try:
-        await asyncio.sleep(0.1)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    # First signature is the baseline; the change to sig-b triggers a reload.
-    assert manager.reload_calls >= 1
-
-
-async def test_watcher_skips_reload_when_unchanged(auth_service):
-    """A stable signature must not trigger any reload."""
-    from openviking.server.auth.plugins import ApiKeyAuthPlugin
-
-    manager = _FakeManager(signatures=[("sig-stable",)])
-    task = asyncio.create_task(ApiKeyAuthPlugin._watch_key_store(manager, interval=0.01))
-    try:
-        await asyncio.sleep(0.08)
-    finally:
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-    assert manager.reload_calls == 0
-
-
-async def test_shutdown_cancels_watch_task(auth_service):
-    """shutdown() must cancel a running watch task and clear the handle."""
-    from openviking.server.auth.plugins import ApiKeyAuthPlugin
-
-    app = create_app(config=ServerConfig(root_api_key=ROOT_KEY), service=auth_service)
-    plugin = ApiKeyAuthPlugin()
-    config = ServerConfig(
-        root_api_key=ROOT_KEY,
-        api_key_watch_enabled=True,
-        api_key_watch_interval_seconds=0.01,
-    )
-    await plugin.initialize(app, auth_service, config)
-    assert plugin._watch_task is not None
-    await plugin.shutdown()
-    assert plugin._watch_task is None

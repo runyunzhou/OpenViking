@@ -689,7 +689,6 @@ The server uses a plugin-based auth architecture. Each `auth_mode` maps to an `A
 | `validate_config(config)` | Validate `ServerConfig` at startup; should `sys.exit(1)` on fatal misconfiguration. |
 | `initialize(app, service, config)` | Initialize runtime state (e.g., `APIKeyManager`) on `app.state`. |
 | `get_request_context_checks(path, identity)` | Optional post-auth path/identity checks. |
-| `requires_api_key_manager()` | Whether Admin API routes need an `APIKeyManager`. |
 | `can_skip_api_key_for_bot_proxy()` | Whether the bot proxy may skip API key validation (e.g., `dev` mode). |
 
 ### Register a Custom Plugin

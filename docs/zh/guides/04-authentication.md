@@ -406,7 +406,6 @@ OIDC Claims: {
 | `validate_config(config)` | 在启动时校验 `ServerConfig`；遇到致命错误应调用 `sys.exit(1)` |
 | `initialize(app, service, config)` | 在 `app.state` 上初始化运行时状态（如 `APIKeyManager`） |
 | `get_request_context_checks(path, identity)` | 可选的认证后路径/身份检查 |
-| `requires_api_key_manager()` | Admin API 路由是否需要 `APIKeyManager` |
 | `can_skip_api_key_for_bot_proxy()` | Bot 代理是否可以跳过 API Key 校验（如 `dev` 模式） |
 
 ### 注册自定义插件示例
