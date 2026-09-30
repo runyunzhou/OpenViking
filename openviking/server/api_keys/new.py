@@ -5,7 +5,6 @@
 import base64
 import hmac
 import secrets
-from collections.abc import Awaitable, Callable
 from typing import Optional, Tuple
 
 from typing_extensions import deprecated
@@ -20,9 +19,6 @@ from openviking_cli.exceptions import (
     NotFoundError,
     UnauthenticatedError,
 )
-from openviking_cli.utils import get_logger
-
-logger = get_logger(__name__)
 
 
 def _encode_segment(data: str) -> str:
@@ -149,21 +145,14 @@ class APIKeyManager:
         account_id: str,
         admin_user_id: str,
         seed: Optional[str] = None,
-        *,
-        initialize: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
-        await self._store.create_account(account_id, admin_user_id)
-        try:
-            key = await self._issue_key(account_id, admin_user_id, seed=seed)
-            if initialize is not None:
-                await initialize()
-            return key
-        except BaseException:
-            try:
-                await self._store.delete_account(account_id)
-            except Exception:
-                logger.exception("Failed to roll back account identity: %s", account_id)
-            raise
+        key = generate_api_key(account_id, admin_user_id, seed)
+        await self._store.create_account_with_api_key(
+            account_id,
+            admin_user_id,
+            key,
+        )
+        return key
 
     async def delete_account(self, account_id: str) -> None:
         await self._store.delete_account(account_id)
@@ -174,25 +163,15 @@ class APIKeyManager:
         user_id: str,
         role: str = "user",
         seed: Optional[str] = None,
-        *,
-        initialize: Callable[[], Awaitable[None]] | None = None,
     ) -> str:
-        await self._store.create_user(account_id, user_id, role)
-        try:
-            key = await self._issue_key(account_id, user_id, seed=seed)
-            if initialize is not None:
-                await initialize()
-            return key
-        except BaseException:
-            try:
-                await self._store.delete_user(account_id, user_id)
-            except Exception:
-                logger.exception(
-                    "Failed to roll back user identity: %s/%s",
-                    account_id,
-                    user_id,
-                )
-            raise
+        key = generate_api_key(account_id, user_id, seed)
+        await self._store.create_user_with_api_key(
+            account_id,
+            user_id,
+            role,
+            key,
+        )
+        return key
 
     async def regenerate_key(self, account_id, user_id, seed=None):
         await self._require_manageable_user(account_id, user_id)

@@ -240,7 +240,7 @@ async def test_delete_account(manager: APIKeyManager):
         acct, None, task_id="delete-account-1", owner_account_id="_system", owner_user_id="root"
     )
     assert created
-    with pytest.raises(UnauthenticatedError):
+    with pytest.raises(UnauthenticatedError, match="Invalid API key"):
         await manager.resolve_identity(key)
     assert await manager.get_user_key_fingerprint(acct, "alice") is None
     with pytest.raises(AlreadyExistsError):
@@ -253,7 +253,7 @@ async def test_delete_account(manager: APIKeyManager):
     assert not await manager.has_user(acct, "trusted-user")
 
     assert await manager.get_deletion(acct) == deletion
-    with pytest.raises(UnauthenticatedError):
+    with pytest.raises(UnauthenticatedError, match="Invalid API key"):
         await manager.resolve_identity(key)
     assert await manager.finish_deletion(acct, None, "stale-task") is False
     replacement = await manager.replace_deletion_task(
@@ -344,7 +344,7 @@ async def test_user_deletion_fence_revokes_key_and_rejects_stale_finish(
     assert created is True
     assert deletion["task_id"] == "delete-1"
     assert await manager.get_deletion(acct, "bob") == deletion
-    with pytest.raises(UnauthenticatedError):
+    with pytest.raises(UnauthenticatedError, match="Invalid API key"):
         await manager.resolve_identity(bob_key)
     with pytest.raises(AlreadyExistsError):
         await manager.register_user(acct, "bob", "user")

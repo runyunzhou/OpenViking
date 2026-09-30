@@ -446,8 +446,13 @@ class FileStore(AccountStore):
         mod_time = info.get("modTime", info.get("mod_time", info.get("mtime")))
         return (path, size, mod_time)
 
-    async def _create_account_identity(self, account_id: str, admin_user_id: str) -> None:
-        """Create an account and admin without issuing an authentication credential."""
+    async def _create_account_with_api_key(
+        self,
+        account_id: str,
+        admin_user_id: str,
+        api_key: str,
+    ) -> None:
+        """Create an account, its first admin, and the admin credential."""
         if error := validate_account_id(account_id):
             raise InvalidArgumentError(error)
         if error := validate_user_id(admin_user_id):
@@ -456,7 +461,14 @@ class FileStore(AccountStore):
             raise AlreadyExistsError(account_id, "account")
 
         now = datetime.now(timezone.utc).isoformat()
-        user_info = {"role": "admin"}
+        stored_key = (
+            self._hash_api_key(api_key)
+            if self._api_key_hashing_enabled
+            else api_key
+        )
+        user_info = {"role": "admin", "key": stored_key}
+        if self._api_key_hashing_enabled:
+            user_info["key_prefix"] = self._get_key_prefix(api_key)
         self._accounts[account_id] = AccountInfo(
             created_at=now,
             users={admin_user_id: user_info},
@@ -489,46 +501,15 @@ class FileStore(AccountStore):
         await self._save_accounts_json(delete_account_ids={account_id})
         self._discard_account_state(account_id)
 
-    async def _delete_user_identity(self, account_id: str, user_id: str) -> None:
-        """Delete a user and its memberships from the legacy registry."""
-        account = self._require_account(account_id)
-        user_info = account.users.get(user_id)
-        if user_info is None:
-            raise NotFoundError(user_id, "user")
-        if user_info.get("role") == Role.ADMIN:
-            active_admins = sum(
-                info.get("role") == Role.ADMIN and not info.get("deletion")
-                for info in account.users.values()
-            )
-            if active_admins <= 1:
-                raise FailedPreconditionError("Cannot delete the last active account admin")
-
-        await self._load_account_groups_if_needed(account_id, account)
-        old_groups = copy.deepcopy(account.groups)
-        groups = copy.deepcopy(account.groups)
-        for group in groups.values():
-            group["members"] = [
-                member for member in group.get("members", []) if member != user_id
-            ]
-        self._remove_key_index_entry(account_id, user_id, user_info)
-        account.users.pop(user_id)
-        try:
-            await self._save_users_json(account_id, deleted_user_ids={user_id})
-            if groups != old_groups:
-                await self._write_groups_json(account_id, groups)
-        except Exception:
-            account.users[user_id] = user_info
-            account.groups = old_groups
-            self._rebuild_prefix_index()
-            self._rebuild_account_group_index(account_id)
-            raise
-        account.groups = groups
-        self._rebuild_account_group_index(account_id)
-
     async def _create_user_identity(
-        self, account_id: str, user_id: str, role: str = "user"
+        self,
+        account_id: str,
+        user_id: str,
+        role: str = "user",
+        *,
+        api_key: str | None = None,
     ) -> None:
-        """Create a user without issuing an authentication credential."""
+        """Create a user, optionally including its initial API key."""
         resolved_role = validate_account_user_role(role)
         if error := validate_user_id(user_id):
             raise InvalidArgumentError(error)
@@ -540,6 +521,15 @@ class FileStore(AccountStore):
             raise AlreadyExistsError(user_id, "user")
 
         user_info = {"role": resolved_role}
+        if api_key is not None:
+            stored_key = (
+                self._hash_api_key(api_key)
+                if self._api_key_hashing_enabled
+                else api_key
+            )
+            user_info["key"] = stored_key
+            if self._api_key_hashing_enabled:
+                user_info["key_prefix"] = self._get_key_prefix(api_key)
         account.users[user_id] = user_info
         try:
             await self._save_users_json(
@@ -1448,7 +1438,11 @@ class FileStore(AccountStore):
         if account is None:
             return None
         user = account.users.get(user_id)
-        return UserSummary(user_id=user_id, role=user["role"]) if user else None
+        return (
+            UserSummary(user_id=user_id, role=user.get("role", Role.USER))
+            if user
+            else None
+        )
 
     @deprecated(
         "get_user_for_management is a FileStore compatibility path and will be removed.",
@@ -1460,10 +1454,19 @@ class FileStore(AccountStore):
         await self._refresh_users_for_management_read(account_id)
         return await self.get_user(account_id, user_id)
 
-    async def create_account(self, account_id: str, admin_user_id: str) -> None:
+    async def create_account_with_api_key(
+        self,
+        account_id: str,
+        admin_user_id: str,
+        api_key: str,
+    ) -> None:
         async with self._mutation_lock:
             await self._refresh_accounts_for_management_read_unlocked()
-            await self._create_account_identity(account_id, admin_user_id)
+            await self._create_account_with_api_key(
+                account_id,
+                admin_user_id,
+                api_key,
+            )
 
     async def create_user(self, account_id: str, user_id: str, role: str) -> None:
         async with self._mutation_lock:
@@ -1471,16 +1474,27 @@ class FileStore(AccountStore):
             await self._refresh_users_for_management_read_unlocked(account_id)
             await self._create_user_identity(account_id, user_id, role)
 
+    async def create_user_with_api_key(
+        self,
+        account_id: str,
+        user_id: str,
+        role: str,
+        api_key: str,
+    ) -> None:
+        async with self._mutation_lock:
+            await self._refresh_accounts_for_management_read_unlocked()
+            await self._refresh_users_for_management_read_unlocked(account_id)
+            await self._create_user_identity(
+                account_id,
+                user_id,
+                role,
+                api_key=api_key,
+            )
+
     async def delete_account(self, account_id: str) -> None:
         async with self._mutation_lock:
             await self._refresh_accounts_for_management_read_unlocked()
             await self._delete_account_identity(account_id)
-
-    async def delete_user(self, account_id: str, user_id: str) -> None:
-        async with self._mutation_lock:
-            await self._refresh_accounts_for_management_read_unlocked()
-            await self._refresh_users_for_management_read_unlocked(account_id)
-            await self._delete_user_identity(account_id, user_id)
 
     async def list_accounts(
         self,

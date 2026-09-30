@@ -342,9 +342,9 @@ async def _rollback_account_creation(
 ) -> None:
     """Compensate resources created after the account registry entry.
 
-    ``APIKeyManager.create_account`` already rolls back its own registry writes.
-    This covers the later workspace, user-config and runtime-config steps when
-    one of them fails.
+    Account creation and its initial API key are committed atomically by the
+    AccountStore. This covers the later workspace, user-config and runtime-config
+    steps when one of them fails.
     """
     if deletion_service is not None and actor is not None:
         try:

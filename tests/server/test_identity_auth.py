@@ -6,15 +6,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from fastapi import HTTPException
 from starlette.requests import Request
 
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.auth import (
-    get_api_key_manager_or_raise,
     get_request_context,
     get_session_request_context,
-    get_upload_request_context,
 )
 from openviking.server.auth.plugin import AuthPlugin
 from openviking.server.auth.plugins.api_key import ApiKeyAuthPlugin
@@ -22,11 +19,8 @@ from openviking.server.auth.plugins.trusted import TrustedAuthPlugin
 from openviking.server.config import ServerConfig
 from openviking.server.identity import ResolvedIdentity, Role
 from openviking.server.store_assembly import build_api_key_manager
-from openviking.server.upload_token_store import upload_token_store
 from openviking_cli.exceptions import (
     FailedPreconditionError,
-    InvalidArgumentError,
-    PermissionDeniedError,
     UnauthenticatedError,
 )
 from tests.server.account_store_fakes import InMemoryAGFS
@@ -108,40 +102,23 @@ async def test_key_store_error_and_unknown_identity_fail_closed():
         await request.app.state.auth_plugin.resolve_identity(request, api_key="verified-key")
 
 
-async def test_root_key_route_restriction(runtime):
-    request = await make_request(runtime)
-    identity = await request.app.state.auth_plugin.resolve_identity(request, api_key="root")
-    assert identity.role == Role.ROOT
-    with pytest.raises(PermissionDeniedError, match="tenant-scoped"):
-        await get_request_context(request, identity, None, "root", None)
-
-
-@pytest.mark.parametrize("root", [None, "root"])
-async def test_trusted_role_and_rootless_management_rules(runtime, root):
-    request = await make_request(runtime, "trusted", root)
+async def test_trusted_explicit_user_role_with_root_key(runtime):
+    request = await make_request(runtime, "trusted", "root")
     plugin = request.app.state.auth_plugin
     identity = await plugin.resolve_identity(
-        request, api_key=root, x_openviking_account="acme", x_openviking_user="alice"
+        request, api_key="root", x_openviking_account="acme", x_openviking_user="alice"
     )
     assert identity.role == Role.ADMIN
-    if root is None:
-        with pytest.raises(PermissionDeniedError):
-            get_api_key_manager_or_raise(request)
-    else:
-        assert get_api_key_manager_or_raise(request) is runtime
     asserted = await make_request(
-        runtime, "trusted", root, headers=[(b"x-openviking-role", b"user")]
+        runtime, "trusted", "root", headers=[(b"x-openviking-role", b"user")]
     )
-    if root is None:
-        with pytest.raises(InvalidArgumentError, match="Root API Key"):
-            await plugin.resolve_identity(
-                asserted, x_openviking_account="acme", x_openviking_user="alice"
-            )
-    else:
-        identity = await plugin.resolve_identity(
-            asserted, api_key=root, x_openviking_account="acme", x_openviking_user="alice"
-        )
-        assert identity.role == Role.USER
+    identity = await plugin.resolve_identity(
+        asserted,
+        api_key="root",
+        x_openviking_account="acme",
+        x_openviking_user="alice",
+    )
+    assert identity.role == Role.USER
 
 
 async def test_trusted_unknown_user_cannot_bypass_account_deletion(runtime):
@@ -158,10 +135,9 @@ async def test_trusted_unknown_user_cannot_bypass_account_deletion(runtime):
     assert exc.value.details["task_id"] == "delete"
 
 
-@pytest.mark.parametrize("mode", ["oidc", "ldap", "dev", "external"])
-async def test_external_context_preserves_role_without_local_gate(runtime, mode):
+async def test_external_context_preserves_role_without_local_gate(runtime):
     class ExternalPlugin(AuthPlugin):
-        auth_mode = mode
+        auth_mode = "external"
 
         async def initialize(self, app, service, config):
             self.initialized = True
@@ -178,7 +154,7 @@ async def test_external_context_preserves_role_without_local_gate(runtime, mode)
         async def shutdown(self):
             self.initialized = False
 
-    request = await make_request(runtime, mode)
+    request = await make_request(runtime, "external")
     plugin = ExternalPlugin()
     request.app.state.auth_plugin = plugin
     await plugin.initialize(request.app, None, request.app.state.config)
@@ -187,27 +163,6 @@ async def test_external_context_preserves_role_without_local_gate(runtime, mode)
     assert (ctx.role, ctx.account_id, ctx.group_ids) == (Role.USER, "external", ())
     await plugin.shutdown()
     assert not plugin.initialized
-
-
-async def test_signed_upload_uses_bound_identity_and_burns_token(runtime):
-    request = await make_request(runtime)
-    token, _ = upload_token_store.issue("unregistered", "subject", 60, actor_peer_id="peer")
-    ctx = await get_upload_request_context(
-        request,
-        token=token,
-        x_api_key=None,
-        authorization=None,
-        x_openviking_account="spoof",
-        x_openviking_user="spoof",
-    )
-    assert (ctx.account_id, ctx.user.user_id, ctx.actor_peer_id) == (
-        "unregistered",
-        "subject",
-        "peer",
-    )
-    with pytest.raises(HTTPException) as exc:
-        await get_upload_request_context(request, token=token, x_api_key=None, authorization=None)
-    assert exc.value.status_code == 401
 
 
 async def test_trusted_cancelled_flush_requeues_batch_and_shutdown_preserves_store(

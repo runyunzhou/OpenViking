@@ -5,11 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from openviking.server.account_stores import (
-    list_account_store_providers,
-    new_account_store_registry,
-    register_account_store,
-)
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.config import AccountStoreConfig, ServerConfig
 from openviking.server.store_assembly import (
@@ -20,18 +15,16 @@ from openviking_cli.exceptions import InvalidArgumentError
 from tests.server.account_store_fakes import InMemoryAGFS
 
 
-def test_builtin_account_stores_are_registered():
-    assert set(list_account_store_providers()) == {"file"}
-
-
 def test_unknown_account_store_is_rejected():
     with pytest.raises(InvalidArgumentError, match="Unknown account store provider"):
-        new_account_store_registry().create("missing", params={})
-
-
-def test_duplicate_provider_registration_is_rejected():
-    with pytest.raises(ValueError, match="already registered"):
-        register_account_store("file")(lambda: None)
+        build_account_store(
+            viking_fs=SimpleNamespace(agfs=InMemoryAGFS()),
+            api_key_hashing_enabled=False,
+            account_store_provider="missing",
+            account_store_params=None,
+            account_store_watch_enabled=False,
+            account_store_watch_interval_seconds=30,
+        )
 
 
 def test_account_store_config_selects_provider_after_normalization():

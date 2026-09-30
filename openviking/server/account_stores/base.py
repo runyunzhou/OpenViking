@@ -1,11 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Asynchronous account and API key persistence contract.
-
-Every mutation is atomic within its account. Implementations must coordinate
-account state, credentials, users, the last active admin and memberships in the
-same commit. Reads return committed state; storage failures must propagate.
-"""
+"""Asynchronous account and API key persistence contract."""
 
 from abc import ABC, abstractmethod
 
@@ -34,7 +29,12 @@ class AccountStore(ABC):
     async def get_account(self, account_id: str) -> AccountSummary | None: ...
 
     @abstractmethod
-    async def create_account(self, account_id: str, admin_user_id: str) -> None: ...
+    async def create_account_with_api_key(
+        self,
+        account_id: str,
+        admin_user_id: str,
+        api_key: str,
+    ) -> None: ...
 
     @abstractmethod
     async def delete_account(self, account_id: str) -> None: ...
@@ -66,7 +66,13 @@ class AccountStore(ABC):
     async def create_user(self, account_id: str, user_id: str, role: str) -> None: ...
 
     @abstractmethod
-    async def delete_user(self, account_id: str, user_id: str) -> None: ...
+    async def create_user_with_api_key(
+        self,
+        account_id: str,
+        user_id: str,
+        role: str,
+        api_key: str,
+    ) -> None: ...
 
     @abstractmethod
     async def list_users_page(

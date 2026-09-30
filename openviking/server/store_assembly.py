@@ -7,9 +7,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 from openviking.server.account_stores.base import AccountStore
-from openviking.server.account_stores.registry import new_account_store_registry
 from openviking.server.api_keys.legacy import FileStore
 from openviking.storage.viking_fs import VikingFS
+from openviking_cli.exceptions import InvalidArgumentError
 
 if TYPE_CHECKING:
     from openviking.server.api_keys.new import APIKeyManager
@@ -57,17 +57,16 @@ def build_account_store(
         return account_store
 
     provider = account_store_provider.strip().lower()
-    registry = new_account_store_registry()
     if provider == "file":
         file_system = cast(VikingFS, viking_fs)
-        registry.bind(
-            "file",
-            lambda *, params: FileStore(
-                viking_fs=file_system,
-                params=params,
-                api_key_hashing_enabled=api_key_hashing_enabled,
-                watch_enabled=account_store_watch_enabled,
-                watch_interval_seconds=account_store_watch_interval_seconds,
-            ),
+        return FileStore(
+            viking_fs=file_system,
+            params=dict(account_store_params or {}),
+            api_key_hashing_enabled=api_key_hashing_enabled,
+            watch_enabled=account_store_watch_enabled,
+            watch_interval_seconds=account_store_watch_interval_seconds,
         )
-    return registry.create(provider, params=dict(account_store_params or {}))
+    raise InvalidArgumentError(
+        f"Unknown account store provider '{account_store_provider}'. "
+        "Available providers: file"
+    )
