@@ -99,12 +99,12 @@ gateway-fast = [
 ]
 mysql = [
   "aiomysql>=0.2.0,<1",
-  "SQLAlchemy[asyncio]>=2.0,<2.1",
+  "SQLAlchemy[asyncio]>=2.0.54,<2.1",
 ]
 redis-mysql = [
   "aiomysql>=0.2.0,<1",
   "redis>=5.0,<7",
-  "SQLAlchemy[asyncio]>=2.0,<2.1",
+  "SQLAlchemy[asyncio]>=2.0.54,<2.1",
 ]
 test = [
   "SQLAlchemy[asyncio]>=2.0,<2.1",
