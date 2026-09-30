@@ -5,6 +5,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from openviking.server.account_stores.mysql import MySQLAccountStore
+from openviking.server.account_stores.redis_mysql import RedisMySQLAccountStore
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.config import AccountStoreConfig, ServerConfig
 from openviking.server.store_assembly import (
@@ -38,6 +40,43 @@ def test_account_store_config_selects_provider_after_normalization():
         account_store_watch_interval_seconds=30,
     )
     assert isinstance(store, FileStore)
+
+
+def test_account_store_config_selects_mysql_provider(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    store = build_account_store(
+        viking_fs=None,
+        api_key_hashing_enabled=False,
+        account_store_provider="mysql",
+        account_store_params={
+            "user": "unused",
+            "password": "unused",
+            "database": "unused",
+        },
+        account_store_watch_enabled=False,
+        account_store_watch_interval_seconds=30,
+    )
+    assert isinstance(store, MySQLAccountStore)
+
+
+def test_account_store_config_selects_redis_mysql_provider(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    store = build_account_store(
+        viking_fs=None,
+        api_key_hashing_enabled=False,
+        account_store_provider="redis_mysql",
+        account_store_params={
+            "mysql": {
+                "user": "unused",
+                "password": "unused",
+                "database": "unused",
+            },
+            "redis": {"url": "redis://unused"},
+        },
+        account_store_watch_enabled=False,
+        account_store_watch_interval_seconds=30,
+    )
+    assert isinstance(store, RedisMySQLAccountStore)
 
 
 async def test_manager_accepts_an_injected_account_store():

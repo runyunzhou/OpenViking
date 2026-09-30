@@ -66,7 +66,25 @@ def build_account_store(
             watch_enabled=account_store_watch_enabled,
             watch_interval_seconds=account_store_watch_interval_seconds,
         )
+    if provider == "mysql":
+        try:
+            from openviking.server.account_stores.mysql import MySQLAccountStore
+        except ImportError:
+            raise RuntimeError(
+                "MySQL account storage requires openviking[mysql]"
+            ) from None
+        return MySQLAccountStore(params=account_store_params)
+    if provider == "redis_mysql":
+        try:
+            from openviking.server.account_stores.redis_mysql import (
+                RedisMySQLAccountStore,
+            )
+        except ImportError:
+            raise RuntimeError(
+                "Redis MySQL account storage requires openviking[redis-mysql]"
+            ) from None
+        return RedisMySQLAccountStore(params=account_store_params)
     raise InvalidArgumentError(
         f"Unknown account store provider '{account_store_provider}'. "
-        "Available providers: file"
+        "Available providers: file, mysql, redis_mysql"
     )

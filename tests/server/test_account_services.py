@@ -2,19 +2,28 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
+import base64
 import json
+import os
 import threading
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
+from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from openviking.server.account_stores import mysql as mysql_store_module
+from openviking.server.account_stores.mysql import MySQLAccountStore
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.identity import Role
 from openviking.server.store_assembly import build_api_key_manager
 from openviking_cli.exceptions import (
     FailedPreconditionError,
+    InvalidArgumentError,
     NotFoundError,
+    UnauthenticatedError,
 )
 from tests.server.account_store_fakes import InMemoryAGFS
 
@@ -190,6 +199,53 @@ async def test_file_user_deletion_fence_survives_concurrent_role_update():
     assert (await store.get_deletion("acme", "bob"))["task_id"] == "delete"
 
 
+def test_mysql_requires_resource_id(monkeypatch):
+    monkeypatch.delenv("OV_RESOURCE_ID", raising=False)
+    with pytest.raises(InvalidArgumentError, match="OV_RESOURCE_ID is required"):
+        MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+
+
+async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+
+    class FakeEngine:
+        disposed = False
+
+        async def dispose(self):
+            self.disposed = True
+
+    engine = FakeEngine()
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def execute(self, statement):
+            table = statement.get_final_froms()[0].name
+            if table == store._tables["groups"]:
+                raise OperationalError(
+                    str(statement),
+                    {},
+                    Exception(1146, f"Table '{table}' doesn't exist"),
+                )
+
+    monkeypatch.setattr(mysql_store_module, "create_async_engine", lambda *args, **kwargs: engine)
+    monkeypatch.setattr(
+        mysql_store_module,
+        "async_sessionmaker",
+        lambda *args, **kwargs: FakeSession,
+    )
+
+    with pytest.raises(RuntimeError, match="schema is missing or incompatible"):
+        await store.load()
+
+    assert engine.disposed
+
+
 async def test_file_store_rejects_deleting_nonempty_group():
     store = _file_store()
     await store.load()
@@ -200,3 +256,85 @@ async def test_file_store_rejects_deleting_nonempty_group():
     with pytest.raises(FailedPreconditionError, match="Group must be empty"):
         await store.delete_group("acme", "engineering")
     assert await store.get_group_members("acme", "engineering") == ["alice"]
+
+
+async def test_mysql_managers_share_authoritative_state(monkeypatch):
+    raw = os.environ.get("OV_TEST_MYSQL")
+    if not raw:
+        pytest.skip("Set OV_TEST_MYSQL to connection JSON for the MySQL test")
+    monkeypatch.setenv("OV_RESOURCE_ID", f"test-{uuid4().hex}")
+    encryption_key = base64.urlsafe_b64encode(b"k" * 32).decode()
+    params = {
+        **json.loads(raw),
+        "table": f"ov_test_{uuid4().hex}",
+        "credential_encryption_key": encryption_key,
+    }
+    first = build_api_key_manager(
+        "root",
+        None,
+        account_store_provider="mysql",
+        account_store_params={**params, "credential_storage": "encrypted"},
+    )
+    second = build_api_key_manager(
+        "root",
+        None,
+        account_store_provider="mysql",
+        account_store_params={**params, "credential_storage": "hash"},
+    )
+    setup_engine = create_async_engine(first._store._url, **first._store._engine_options)
+    async with setup_engine.begin() as connection:
+        await connection.run_sync(first._store._models.Base.metadata.create_all)
+    await setup_engine.dispose()
+    await first.load()
+    await second.load()
+    try:
+        trusted_results = await asyncio.gather(
+            first.ensure_trusted_identities({"trusted": {"alice", "bob"}}),
+            second.ensure_trusted_identities({"trusted": {"bob", "carol"}}),
+        )
+        assert sum(result["created_accounts"] for result in trusted_results) == 1
+        assert sum(result["created_users"] for result in trusted_results) == 3
+        assert await first.get_registered_user_role("trusted", "alice") == Role.USER
+        assert await second.get_registered_user_role("trusted", "bob") == Role.USER
+        assert await first.get_registered_user_role("trusted", "carol") == Role.USER
+        assert (await first.get_account("trusted"))["user_count"] == 3
+        repeat = await second.ensure_trusted_identities({"trusted": {"alice", "bob", "carol"}})
+        assert repeat == {"created_accounts": 0, "created_users": 0}
+
+        deletion, created = await first.begin_deletion(
+            "trusted",
+            "carol",
+            task_id="delete-carol",
+            owner_account_id="system",
+            owner_user_id="system",
+        )
+        assert created
+        assert await second.get_deletion("trusted", "carol") == deletion
+        account_deletion, account_created = await first.begin_deletion(
+            "trusted",
+            None,
+            task_id="delete-trusted",
+            owner_account_id="system",
+            owner_user_id="system",
+        )
+        assert account_created
+        assert await second.get_deletion("trusted", "carol") == account_deletion
+
+        key = await first.create_account("acme", "alice")
+        assert (await second.resolve_identity(key)).role == Role.ADMIN
+        user_key = await first.register_user("acme", "dave")
+        assert (await second.resolve_identity(user_key)).role == Role.USER
+        hashed_key = await second.create_account("hashed", "bob")
+        assert (await first.resolve_identity(hashed_key)).role == Role.ADMIN
+        rotated = await first.regenerate_key("acme", "alice")
+        assert (await second.resolve_identity(rotated)).role == Role.ADMIN
+        with pytest.raises(UnauthenticatedError):
+            await second.resolve_identity(key)
+        await first.create_group("acme", "engineering")
+        await first.add_group_member("acme", "engineering", "alice")
+        assert await second.get_user_group_ids("acme", "alice") == ("engineering",)
+    finally:
+        async with first._store._engine.begin() as connection:
+            await connection.run_sync(first._store._models.Base.metadata.drop_all)
+        await second.close()
+        await first.close()
