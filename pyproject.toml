@@ -97,7 +97,17 @@ gateway-fast = [
     "uvloop>=0.21; sys_platform != 'win32'",
     "httptools>=0.6",
 ]
+mysql = [
+  "aiomysql>=0.2.0,<1",
+  "SQLAlchemy[asyncio]>=2.0,<2.1",
+]
+redis-mysql = [
+  "aiomysql>=0.2.0,<1",
+  "redis>=5.0,<7",
+  "SQLAlchemy[asyncio]>=2.0,<2.1",
+]
 test = [
+  "SQLAlchemy[asyncio]>=2.0,<2.1",
   "pytest>=7.0.0",
   "pytest-asyncio>=0.21.0",
   "pytest-xdist>=3.5.0",
