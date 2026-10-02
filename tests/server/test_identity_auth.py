@@ -135,6 +135,29 @@ async def test_trusted_unknown_user_cannot_bypass_account_deletion(runtime):
     assert exc.value.details["task_id"] == "delete"
 
 
+async def test_root_context_remains_available_while_default_account_is_deleting(runtime):
+    if await runtime.get_registered_user_role("default", "default") is None:
+        await runtime.register_user("default", "default", Role.ADMIN)
+    await runtime.begin_deletion(
+        "default",
+        None,
+        task_id="delete-default",
+        owner_account_id="system",
+        owner_user_id="system",
+    )
+    request = await make_request(runtime, path="/api/v1/admin/accounts")
+    identity = await request.app.state.auth_plugin.resolve_identity(request, api_key="root")
+
+    ctx = await get_request_context(request, identity, None, "root", None)
+
+    assert (ctx.role, ctx.account_id, ctx.user.user_id, ctx.group_ids) == (
+        Role.ROOT,
+        "default",
+        "default",
+        (),
+    )
+
+
 async def test_external_context_preserves_role_without_local_gate(runtime):
     class ExternalPlugin(AuthPlugin):
         auth_mode = "external"

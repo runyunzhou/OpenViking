@@ -121,7 +121,7 @@ async def _build_request_context(
         role=identity.role,
         group_ids=(
             await resolve_group_ids(request, account_id, user_id)
-            if _uses_local_account_store(plugin)
+            if identity.role != Role.ROOT and _uses_local_account_store(plugin)
             else ()
         ),
         actor_peer_id=actor_peer_id,
@@ -229,14 +229,16 @@ async def get_upload_request_context(
         request.state.signed_upload = consumed
         if _auth_mode(request) == AuthMode.API_KEY:
             manager = get_api_key_manager_or_raise(request)
-            if not manager.has_user(consumed.account_id, consumed.user_id):
+            current_role = await manager.get_registered_user_role(
+                consumed.account_id, consumed.user_id
+            )
+            if current_role is None:
                 raise UnauthenticatedError("Upload token's user no longer exists")
-            current_role = Role(manager.get_user_role(consumed.account_id, consumed.user_id))
             if Role(consumed.role).rank > current_role.rank:
                 raise UnauthenticatedError(
                     "Upload token's role exceeds the user's current role; request a new upload"
                 )
-            return _build_request_context(
+            return await _build_request_context(
                 request,
                 ResolvedIdentity(
                     role=consumed.role,
