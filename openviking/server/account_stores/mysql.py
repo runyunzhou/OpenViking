@@ -677,10 +677,12 @@ class MySQLAccountStore(AccountStore):
                 continue
             async with self._transaction() as session:
                 account = await session.scalar(
-                    select(Account).where(
+                    select(Account)
+                    .where(
                         Account.resource_id == self._resource_id,
                         Account.account_id == account_id,
                     )
+                    .with_for_update()
                 )
                 if account is None:
                     try:
@@ -694,8 +696,6 @@ class MySQLAccountStore(AccountStore):
                         created_accounts += 1
                     except IntegrityError:
                         account = await self._lock_account(session, account_id)
-                else:
-                    account = await self._lock_account(session, account_id)
                 if account.deletion_task_id:
                     continue
                 existing = set(

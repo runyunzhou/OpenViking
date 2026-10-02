@@ -541,6 +541,9 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
         )
         assert account_created
         assert await second.get_deletion("trusted", "carol") == account_deletion
+        blocked = await second.ensure_trusted_identities({"trusted": {"late-user"}})
+        assert blocked == {"created_accounts": 0, "created_users": 0}
+        assert await first.get_registered_user_role("trusted", "late-user") is None
 
         key = await first.create_account("acme", "alice")
         assert (await second.resolve_identity(key)).role == Role.ADMIN
