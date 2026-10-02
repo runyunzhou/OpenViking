@@ -9,7 +9,7 @@ import pytest
 from openviking.server.account_stores.redis_mysql import RedisMySQLAccountStore
 from openviking.server.api_keys.new import APIKeyManager
 from openviking.server.identity import Role
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, UnauthenticatedError
 
 
 class FakeRedis:
@@ -49,6 +49,8 @@ class FakeRedis:
         for member, score in tuple(members.items()):
             if score <= self.now_ms:
                 del members[member]
+        if not members:
+            self.zsets.pop(key, None)
 
     async def eval(self, script: str, numkeys: int, *args):
         keys = args[:numkeys]
@@ -77,6 +79,8 @@ class FakeRedis:
             members = self.zsets.get(keys[0], {})
             for key in keys[1:]:
                 members.pop(key, None)
+            if not members:
+                self.zsets.pop(keys[0], None)
             return len(keys) - 1
         if "-- prune-cache-index" in script:
             self._prune_zset(keys[0])
@@ -210,7 +214,9 @@ class FakeMySQLAuthority:
         return self.user_deletion, True
 
 
-def _store(api_key: str) -> tuple[RedisMySQLAccountStore, FakeMySQLAuthority]:
+def _store(
+    api_key: str, *, redis_client=None, lock_wait_seconds: int = 30
+) -> tuple[RedisMySQLAccountStore, FakeMySQLAuthority]:
     mysql = FakeMySQLAuthority(api_key)
     store = RedisMySQLAccountStore(
         params={
@@ -218,10 +224,11 @@ def _store(api_key: str) -> tuple[RedisMySQLAccountStore, FakeMySQLAuthority]:
                 "url": "redis://unused",
                 "ttl_seconds": 60,
                 "lock_ttl_seconds": 60,
+                "lock_wait_seconds": lock_wait_seconds,
             }
         },
         mysql_store=mysql,
-        redis_client=FakeRedis(),
+        redis_client=redis_client if redis_client is not None else FakeRedis(),
     )
     return store, mysql
 
@@ -594,3 +601,131 @@ async def test_user_group_and_deletion_reads_are_cached_and_invalidated():
         "account_deletion": 1,
         "user_deletion": 2,
     }
+
+
+async def test_deleting_recreated_account_rejects_key_after_delayed_cleanup():
+    api_key = _api_key()
+    redis = FakeRedis()
+    store, _ = _store(api_key, redis_client=redis, lock_wait_seconds=1)
+    await store.load()
+    original_zrange = redis.zrange
+    saw_empty = asyncio.Event()
+    resume_clear = asyncio.Event()
+    paused = False
+
+    async def delayed_empty_reply(*args):
+        nonlocal paused
+        result = await original_zrange(*args)
+        if not result and not paused:
+            paused = True
+            saw_empty.set()
+            await resume_clear.wait()
+        return result
+
+    redis.zrange = delayed_empty_reply
+    old_clear = asyncio.create_task(store.delete_account("acme"))
+    try:
+        await asyncio.wait_for(saw_empty.wait(), 2)
+        await asyncio.wait_for(store.create_account_with_api_key("acme", "alice", api_key), 5)
+        manager = APIKeyManager("root", store)
+        assert (await manager.resolve_identity(api_key)).role == Role.ADMIN
+
+        resume_clear.set()
+        await asyncio.wait_for(old_clear, 2)
+
+        await store.delete_account("acme")
+        with pytest.raises(UnauthenticatedError, match="Invalid API key"):
+            await manager.resolve_identity(api_key)
+    finally:
+        resume_clear.set()
+        await asyncio.gather(old_clear, return_exceptions=True)
+        await store.close()
+
+
+@pytest.mark.parametrize("operation", ["create_account", "create_user", "replace_key"])
+@pytest.mark.parametrize("user_hint", [None, "alice"])
+async def test_provisioned_key_is_immediately_usable(operation, user_hint):
+    new_key = _api_key("new")
+    store, mysql = _store(_api_key("old"))
+    if operation == "create_account":
+        mysql.account_exists = False
+        mysql.user_exists = False
+    elif operation == "create_user":
+        mysql.user_exists = False
+    await store.load()
+    try:
+        assert (
+            await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint=user_hint)
+            is None
+        )
+        if operation == "create_account":
+            await store.create_account_with_api_key("acme", "alice", new_key)
+        elif operation == "create_user":
+            await store.create_user_with_api_key("acme", "alice", Role.USER, new_key)
+        else:
+            await store.replace_active_user_api_key("acme", "alice", new_key)
+        assert await store.verify_api_key(
+            new_key, account_id_hint="acme", user_id_hint=user_hint
+        ) == ("acme", "alice")
+    finally:
+        await store.close()
+
+
+async def test_key_rotation_rejects_old_key_after_inflight_verification():
+    old_key, new_key = _api_key("old"), _api_key("new")
+    store, mysql = _store(old_key, lock_wait_seconds=1)
+    await store.load()
+    read_started = asyncio.Event()
+    resume_read = asyncio.Event()
+    original_verify = mysql.verify_api_key
+
+    async def delayed_verification(api_key, **hints):
+        result = await original_verify(api_key, **hints)
+        if api_key == old_key and not read_started.is_set():
+            read_started.set()
+            await resume_read.wait()
+        return result
+
+    mysql.verify_api_key = delayed_verification
+    reader = asyncio.create_task(
+        store.verify_api_key(old_key, account_id_hint="acme", user_id_hint="alice")
+    )
+    try:
+        await asyncio.wait_for(read_started.wait(), 2)
+        await asyncio.wait_for(store.replace_active_user_api_key("acme", "alice", new_key), 5)
+        assert await store.verify_api_key(
+            new_key, account_id_hint="acme", user_id_hint="alice"
+        ) == ("acme", "alice")
+        resume_read.set()
+        # After the earlier request finishes, only the new key remains valid.
+        await asyncio.wait_for(reader, 2)
+        assert (
+            await store.verify_api_key(old_key, account_id_hint="acme", user_id_hint="alice")
+            is None
+        )
+        assert await store.verify_api_key(
+            new_key, account_id_hint="acme", user_id_hint="alice"
+        ) == ("acme", "alice")
+    finally:
+        resume_read.set()
+        await asyncio.gather(reader, return_exceptions=True)
+        await store.close()
+
+
+async def test_redis_timeouts_allow_mysql_reads_and_writes():
+    redis = FakeRedis()
+    store, _ = _store(_api_key(), redis_client=redis)
+    await store.load()
+
+    async def timeout(*_args, **_kwargs):
+        raise TimeoutError("Redis did not respond")
+
+    redis.get = timeout
+    redis.set = timeout
+    redis.delete = timeout
+    redis.eval = timeout
+    try:
+        await store.set_role("acme", "alice", Role.USER)
+        assert await store.get_user("acme", "alice") == {"user_id": "alice", "role": Role.USER}
+    finally:
+        await store.close()

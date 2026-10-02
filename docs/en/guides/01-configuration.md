@@ -1969,6 +1969,13 @@ index members, allowing account deletion or recreation to clear only that
 account's current cached users, groups, deletion records, and credential data.
 API-key bindings are checked against account and user credential fences, so
 normal key replacement, revocation, and user deletion invalidate old bindings.
+Redis automatically removes the index when its last sorted-set member is removed.
+Cleanup does not issue a separate index deletion, which could remove a newer
+fill's index after lease loss. Provisioning
+and key replacement clear negative lookups both with and without a user hint.
+Redis socket connect and read timeouts default to 5 seconds each; override them
+with `socket_connect_timeout` and `socket_timeout` query parameters in `redis.url`.
+These are socket timeouts, not an overall request deadline.
 
 ```json
 {

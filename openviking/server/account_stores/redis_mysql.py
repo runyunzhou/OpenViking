@@ -88,6 +88,7 @@ return redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 """
 
 _ACCOUNT_CACHE_CLEAR_BATCH_SIZE = 500
+_REDIS_SOCKET_TIMEOUT_SECONDS = 5
 
 
 class _CacheLockUnavailable(Exception):
@@ -181,7 +182,12 @@ class RedisMySQLAccountStore(AccountStore):
                     raise RuntimeError(
                         "Redis MySQL account storage requires openviking[redis-mysql]"
                     ) from None
-                self._redis = Redis.from_url(self._redis_url, decode_responses=True)
+                self._redis = Redis.from_url(
+                    self._redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+                    socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+                )
             await self._redis.ping()
         except BaseException:
             await self.close()
@@ -235,12 +241,11 @@ class RedisMySQLAccountStore(AccountStore):
         digest_input = self._resource_id + "\0" + api_key + "\0" + (user_id_hint or "")
         return self._key(account_id, f"binding-miss:{_digest(digest_input)}")
 
-    def _binding_cache_keys(
-        self, account_id: str, api_key: str, user_id: str
-    ) -> tuple[str, str]:
+    def _binding_cache_keys(self, account_id: str, api_key: str, user_id: str) -> tuple[str, ...]:
         return (
             self._binding_key(account_id, api_key),
             self._negative_binding_key(account_id, api_key, user_id),
+            self._negative_binding_key(account_id, api_key, None),
         )
 
     async def _delete(self, *keys: str) -> None:
@@ -415,7 +420,8 @@ class RedisMySQLAccountStore(AccountStore):
                 if not keys:
                     break
                 await self._delete_and_unindex(account_id, *keys)
-            await self._delete(index_key)
+            # ZREM removes an emptied sorted set automatically. A separate DEL
+            # could remove a newer fill's index after this lease is lost.
         except Exception:
             logger.exception("Failed to clear Redis account cache for %s", account_id)
 

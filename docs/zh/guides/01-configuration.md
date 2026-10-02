@@ -1945,6 +1945,11 @@ schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`�
 级、按过期时间排序的 key 索引；每次写入已索引缓存时会清理过期成员，因此删除或重建
 Account 时只会清理该 Account 当前的 User、Group、删除记录和凭据缓存。API Key 绑定会
 校验 Account 和 User 的凭据 fence，所以正常的换 Key、吊销和删 User 会使旧绑定失效。
+索引的最后一个有序集合成员被移除后，Redis 会自动删除空索引；清理结束时不再单独删除
+索引，避免失去租约的旧请求误删新回填的索引。创建身份或换 Key 会同时清除携带和未携带
+User 提示的负缓存。
+Redis socket 连接和读取超时默认分别为 5 秒，可通过 `redis.url` 中的
+`socket_connect_timeout`、`socket_timeout` 查询参数覆盖；这不是整个请求的总超时。
 
 ```json
 {
