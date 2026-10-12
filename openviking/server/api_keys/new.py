@@ -48,13 +48,9 @@ def parse_api_key(api_key: str) -> Tuple[str, str, str]:
     )
 
 
-def generate_api_key(
-    account_id: str, user_id: str, seed: Optional[str] = None
-) -> str:
+def generate_api_key(account_id: str, user_id: str, seed: Optional[str] = None) -> str:
     secret = (
-        derive_seeded_api_key_secret(user_id, seed)
-        if seed is not None
-        else secrets.token_hex(32)
+        derive_seeded_api_key_secret(user_id, seed) if seed is not None else secrets.token_hex(32)
     )
     return ".".join(map(_encode_segment, (account_id, user_id, secret)))
 
@@ -123,11 +119,6 @@ class APIKeyManager:
             user_id=user_id,
         )
 
-    async def _issue_key(self, account_id, user_id, *, seed=None):
-        key = generate_api_key(account_id, user_id, seed)
-        await self._store.replace_active_user_api_key(account_id, user_id, key)
-        return key
-
     async def _verify_key(self, key: str):
         account_id = None
         user_id = None
@@ -179,11 +170,11 @@ class APIKeyManager:
         if not self._issue_user_keys:
             raise FailedPreconditionError("Personal API keys are disabled in trusted mode")
         await self._require_manageable_user(account_id, user_id)
-        return await self._issue_key(account_id, user_id, seed=seed)
+        key = generate_api_key(account_id, user_id, seed)
+        await self._store.replace_active_user_api_key(account_id, user_id, key)
+        return key
 
-    async def get_registered_user_role(
-        self, account_id: str, user_id: str
-    ) -> Role | None:
+    async def get_registered_user_role(self, account_id: str, user_id: str) -> Role | None:
         user = await self.get_user(account_id, user_id)
         return Role(user["role"]) if user else None
 
@@ -207,19 +198,13 @@ class APIKeyManager:
         return await self._store.ensure_trusted_identities(identities)
 
     async def begin_deletion(self, account_id, user_id, **owner):
-        return await self._store.begin_deletion(
-            account_id, user_id, **owner
-        )
+        return await self._store.begin_deletion(account_id, user_id, **owner)
 
     async def replace_deletion_task(self, account_id, user_id, **owner):
-        return await self._store.replace_deletion_task(
-            account_id, user_id, **owner
-        )
+        return await self._store.replace_deletion_task(account_id, user_id, **owner)
 
     async def finish_deletion(self, account_id, user_id, task_id):
-        return await self._store.finish_deletion(
-            account_id, user_id, task_id
-        )
+        return await self._store.finish_deletion(account_id, user_id, task_id)
 
     async def get_deletion(self, account_id, user_id=None):
         return await self._store.get_deletion(account_id, user_id)
@@ -286,14 +271,10 @@ class APIKeyManager:
         return await self._store.get_group_members(account_id, group_id)
 
     async def add_group_member(self, account_id, group_id, user_id):
-        return await self._store.add_group_member(
-            account_id, group_id, user_id
-        )
+        return await self._store.add_group_member(account_id, group_id, user_id)
 
     async def remove_group_member(self, account_id, group_id, user_id):
-        return await self._store.remove_group_member(
-            account_id, group_id, user_id
-        )
+        return await self._store.remove_group_member(account_id, group_id, user_id)
 
     async def delete_group(self, account_id, group_id):
         await self._store.delete_group(account_id, group_id)

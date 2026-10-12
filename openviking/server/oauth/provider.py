@@ -302,11 +302,7 @@ class OpenVikingOAuthProvider(
                     error="invalid_grant",
                     error_description="Unable to validate current identity; re-authorize the client",
                 ) from exc
-            if (
-                token_role is not None
-                and current_role is not None
-                and token_role.rank > current_role.rank
-            ):
+            if token_role.rank > current_role.rank:
                 raise TokenError(
                     error="invalid_grant",
                     error_description=(

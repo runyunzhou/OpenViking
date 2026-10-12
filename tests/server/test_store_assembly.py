@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from openviking.server.api_keys.legacy import FileStore
-from openviking.server.config import AccountStoreConfig, ServerConfig
+from openviking.server.config import AccountStoreConfig
 from openviking.server.store_assembly import (
     build_account_store,
     build_api_key_manager,
@@ -27,26 +27,19 @@ def test_unknown_account_store_is_rejected():
         )
 
 
-def test_account_store_config_selects_provider_after_normalization():
-    config = ServerConfig(account_store=AccountStoreConfig(provider=" FILE "))
-    store = build_account_store(
-        viking_fs=SimpleNamespace(agfs=InMemoryAGFS()),
-        api_key_hashing_enabled=False,
-        account_store_provider=config.account_store.provider,
-        account_store_params=None,
-        account_store_watch_enabled=False,
-        account_store_watch_interval_seconds=30,
-    )
-    assert isinstance(store, FileStore)
+def test_unknown_account_store_is_rejected_during_config_validation():
+    with pytest.raises(ValueError, match="account_store.provider must be one of"):
+        AccountStoreConfig(provider="missing")
 
 
-async def test_manager_accepts_an_injected_account_store():
+@pytest.mark.parametrize("injected", [False, True])
+async def test_assembled_manager_supports_account_authentication(injected):
     account_store = FileStore(SimpleNamespace(agfs=InMemoryAGFS()))
     manager = build_api_key_manager(
         "root",
-        None,
-        account_store_provider="file",
-        account_store=account_store,
+        None if injected else SimpleNamespace(agfs=InMemoryAGFS()),
+        account_store_provider=AccountStoreConfig(provider=" FILE ").provider,
+        account_store=account_store if injected else None,
     )
     await manager.load()
     try:

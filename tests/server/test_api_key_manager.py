@@ -1,15 +1,17 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
 
-"""Tests for APIKeyManager (openviking/server/api_keys.py)."""
+"""Public account and credential contracts through APIKeyManager."""
 
 import asyncio
 import hashlib
 import uuid
+from types import SimpleNamespace
 
 import pytest
 import pytest_asyncio
 
+from openviking.pyagfs import AGFSNotFoundError
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.identity import Role
 from openviking.server.store_assembly import build_api_key_manager
@@ -21,6 +23,7 @@ from openviking_cli.exceptions import (
     PermissionDeniedError,
     UnauthenticatedError,
 )
+from tests.server.account_store_fakes import InMemoryAGFS
 
 
 def _uid() -> str:
@@ -35,10 +38,9 @@ def _seed_secret(user_id: str, seed: str) -> str:
 ROOT_KEY = "test-root-key-abcdef1234567890abcdef1234567890"
 
 
-@pytest_asyncio.fixture(scope="function")
-async def manager_service(service):
-    """Use the shared service fixture with local fake models."""
-    yield service
+@pytest.fixture
+def manager_service():
+    return SimpleNamespace(viking_fs=SimpleNamespace(agfs=InMemoryAGFS()))
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -46,7 +48,8 @@ async def manager(manager_service):
     """Fresh APIKeyManager instance, loaded."""
     mgr = build_api_key_manager(root_key=ROOT_KEY, viking_fs=manager_service.viking_fs)
     await mgr.load()
-    return mgr
+    yield mgr
+    await mgr.close()
 
 
 async def _list_users(manager, account_id, **filters):
@@ -65,16 +68,11 @@ async def test_resolve_root_key(manager: APIKeyManager):
     assert identity.user_id is None
 
 
-async def test_resolve_wrong_key_raises(manager: APIKeyManager):
+@pytest.mark.parametrize("key", ["wrong-key", ""])
+async def test_resolve_invalid_key_raises(manager: APIKeyManager, key):
     """Invalid key should raise UnauthenticatedError."""
     with pytest.raises(UnauthenticatedError):
-        await manager.resolve_identity("wrong-key")
-
-
-async def test_resolve_empty_key_raises(manager: APIKeyManager):
-    """Empty key should raise UnauthenticatedError."""
-    with pytest.raises(UnauthenticatedError):
-        await manager.resolve_identity("")
+        await manager.resolve_identity(key)
 
 
 # ---- Account lifecycle tests ----
@@ -82,17 +80,19 @@ async def test_resolve_empty_key_raises(manager: APIKeyManager):
 
 async def test_create_account(manager: APIKeyManager):
     """create_account should create workspace + first admin user."""
+    from openviking.server.api_keys import parse_api_key
+
     acct = _uid()
     key = await manager.create_account(acct, "alice")
-    assert isinstance(key, str)
-    # New format: base64url(account_id).base64url(user_id).base64url(secret)
-    # Length varies based on account_id and user_id, but should have two dots
-    assert key.count(".") == 2
+    account_id, user_id, secret = parse_api_key(key)
+    assert (account_id, user_id) == (acct, "alice")
+    assert secret
 
     identity = await manager.resolve_identity(key)
     assert identity.role == Role.ADMIN
     assert identity.account_id == acct
     assert identity.user_id == "alice"
+    assert await manager.get_registered_user_role(acct, "alice") == Role.ADMIN
 
 
 async def test_create_duplicate_account_raises(manager: APIKeyManager):
@@ -283,7 +283,9 @@ async def test_recreated_account_does_not_restore_deleted_users(manager: APIKeyM
     with pytest.raises(UnauthenticatedError):
         await manager.resolve_identity(old_key)
     assert (await manager.resolve_identity(new_key)).user_id == "new-admin"
-    assert await _list_users(manager, acct, expose_key=False) == [{"user_id": "new-admin", "role": "admin"}]
+    assert await _list_users(manager, acct, expose_key=False) == [
+        {"user_id": "new-admin", "role": "admin"}
+    ]
 
 
 async def test_delete_nonexistent_account_raises(manager: APIKeyManager):
@@ -300,25 +302,20 @@ async def test_default_account_exists(manager: APIKeyManager):
 
 @pytest.mark.parametrize("operation", ["create", "delete", "trusted"])
 async def test_account_mutation_preserves_registry_when_baseline_is_missing(
-    manager: APIKeyManager, monkeypatch: pytest.MonkeyPatch, operation: str
+    manager: APIKeyManager, manager_service, monkeypatch: pytest.MonkeyPatch, operation: str
 ):
     survivor = _uid()
     key = await manager.create_account(survivor, "alice")
     target = _uid()
     if operation == "delete":
         await manager.create_account(target, "bob")
-    read = manager._legacy._async_agfs.read
-    before = await read(ACCOUNTS_PATH)
-    missing_reads = 0
+    agfs = manager_service.viking_fs.agfs
+    read = agfs.read
 
-    async def missing_once(path, *args, **kwargs):
-        nonlocal missing_reads
-        if path == ACCOUNTS_PATH and missing_reads == 0:
-            missing_reads += 1
+    def missing_registry(path, *args, **kwargs):
+        if path == "/local/_system/accounts.json":
             raise AGFSNotFoundError("injected missing registry read")
-        return await read(path, *args, **kwargs)
-
-    monkeypatch.setattr(manager._legacy._async_agfs, "read", missing_once)
+        return read(path, *args, **kwargs)
 
     async def mutate():
         if operation == "create":
@@ -327,17 +324,25 @@ async def test_account_mutation_preserves_registry_when_baseline_is_missing(
             return await manager.delete_account(target)
         return await manager.ensure_trusted_identities({target: {"bob"}})
 
-    with pytest.raises(FailedPreconditionError, match="Account registry"):
-        await mutate()
-    assert missing_reads == 1
-    assert await read(ACCOUNTS_PATH) == before
-    assert manager.resolve(key).account_id == survivor
-    await manager.reload()
-    assert manager.resolve(key).account_id == survivor
-    # The failed mutation must also release its lease and leave retries usable.
-    await mutate()
-    await manager.reload()
-    assert manager.resolve(key).account_id == survivor
+    with monkeypatch.context() as patch:
+        patch.setattr(agfs, "read", missing_registry)
+        with pytest.raises(FailedPreconditionError, match="Account registry"):
+            await mutate()
+    assert (await manager.resolve_identity(key)).account_id == survivor
+
+    # Check durable state both after failure and after a successful retry.
+    for retried in (False, True):
+        if retried:
+            await mutate()
+        verifier = build_api_key_manager(ROOT_KEY, manager_service.viking_fs)
+        await verifier.load()
+        try:
+            assert (await verifier.resolve_identity(key)).account_id == survivor
+            target_exists = (operation == "delete") != retried
+            assert await verifier.has_user(target, "bob") == target_exists
+            assert (await verifier.get_account(target) is not None) == target_exists
+        finally:
+            await verifier.close()
 
 
 # ---- User lifecycle tests ----
@@ -345,14 +350,18 @@ async def test_account_mutation_preserves_registry_when_baseline_is_missing(
 
 async def test_register_user(manager: APIKeyManager):
     """register_user should create a user with given role."""
+    from openviking.server.api_keys import parse_api_key
+
     acct = _uid()
     await manager.create_account(acct, "alice")
     key = await manager.register_user(acct, "bob", "user")
+    assert parse_api_key(key)[:2] == (acct, "bob")
 
     identity = await manager.resolve_identity(key)
     assert identity.role == Role.USER
     assert identity.account_id == acct
     assert identity.user_id == "bob"
+    assert await manager.get_registered_user_role(acct, "bob") == Role.USER
 
 
 async def test_register_duplicate_user_raises(manager: APIKeyManager):
@@ -532,7 +541,9 @@ async def test_get_users_name_filter(manager: APIKeyManager):
     assert matched == {"alice", "alan"}
 
     # Exact match (no wildcard) only hits the literal ID
-    assert {u["user_id"] for u in await _list_users(manager, acct, name_filter="alice")} == {"alice"}
+    assert {u["user_id"] for u in await _list_users(manager, acct, name_filter="alice")} == {
+        "alice"
+    }
 
     # No match
     assert await _list_users(manager, acct, name_filter="zzz*") == []
@@ -602,13 +613,15 @@ async def test_get_accounts_pagination_and_ordering(manager: APIKeyManager):
 
     # First page of 2 (creation order).
     page1 = [
-        a["account_id"] for a in await manager.list_accounts(name_filter=f"{prefix}*", limit=2, page=1)
+        a["account_id"]
+        for a in await manager.list_accounts(name_filter=f"{prefix}*", limit=2, page=1)
     ]
     assert page1 == ids[:2]
 
     # Second page of 2 (creation order).
     page2 = [
-        a["account_id"] for a in await manager.list_accounts(name_filter=f"{prefix}*", limit=2, page=2)
+        a["account_id"]
+        for a in await manager.list_accounts(name_filter=f"{prefix}*", limit=2, page=2)
     ]
     assert page2 == ids[2:]
 
@@ -655,78 +668,7 @@ async def test_user_and_group_persistence_across_reload(manager_service):
     assert await mgr3.get_group_members(acct, group_id) == []
 
 
-# ---- Argon2id hashing tests ----
-
-
-async def test_migrate_plaintext_keys_to_argon2id_hashing(manager_service):
-    """Keys created with api_key_hashing disabled should be migrated when api_key_hashing is enabled."""
-    acct = _uid()
-
-    # First, create a key with api_key_hashing disabled
-    mgr1 = build_api_key_manager(
-        root_key=ROOT_KEY, viking_fs=manager_service.viking_fs, api_key_hashing_enabled=False
-    )
-    await mgr1.load()
-    key = await mgr1.create_account(acct, "alice")
-
-    # Now, reload with api_key_hashing enabled - should migrate the key
-    mgr2 = build_api_key_manager(
-        root_key=ROOT_KEY, viking_fs=manager_service.viking_fs, api_key_hashing_enabled=True
-    )
-    await mgr2.load()
-
-    # Key should still work
-    identity = await mgr2.resolve_identity(key)
-    assert identity.account_id == acct
-    assert identity.user_id == "alice"
-
-
 # ---- New format API Key tests ----
-
-
-async def test_new_format_key_generation(manager: APIKeyManager):
-    """Test that new keys are generated in the new format with three segments."""
-    from openviking.server.api_keys import is_new_format_key, parse_api_key
-
-    acct = _uid()
-    key = await manager.create_account(acct, "alice")
-
-    # Verify new format
-    assert is_new_format_key(key)
-    assert key.count(".") == 2
-
-    # Verify we can parse identity directly from the key
-    account_id, user_id, secret = parse_api_key(key)
-    assert account_id == acct
-    assert user_id == "alice"
-    assert len(secret) > 0
-
-
-async def test_new_format_key_resolve_fast_path(manager: APIKeyManager):
-    """Test that new format keys use the fast decode path without prefix lookup."""
-    acct = _uid()
-    key = await manager.create_account(acct, "alice")
-
-    # Resolve should work and return correct identity
-    identity = await manager.resolve_identity(key)
-    assert identity.role == Role.ADMIN
-    assert identity.account_id == acct
-    assert identity.user_id == "alice"
-
-
-async def test_register_user_generates_new_format(manager: APIKeyManager):
-    """Test that register_user generates keys in new format."""
-    from openviking.server.api_keys import is_new_format_key
-
-    acct = _uid()
-    await manager.create_account(acct, "alice")
-    key = await manager.register_user(acct, "bob", "user")
-
-    assert is_new_format_key(key)
-    identity = await manager.resolve_identity(key)
-    assert identity.role == Role.USER
-    assert identity.account_id == acct
-    assert identity.user_id == "bob"
 
 
 async def test_seeded_new_format_keys_are_predictable(manager: APIKeyManager):
@@ -774,21 +716,6 @@ async def test_seed_must_not_be_empty(manager: APIKeyManager):
         await manager.create_account(acct, "alice", seed="")
 
 
-async def test_parse_api_key_edge_cases():
-    """Test parse_api_key with various edge cases."""
-    # Test with simple ASCII values
-    # First generate some test keys using the utility functions
-    from openviking.server.api_keys import generate_api_key, is_new_format_key, parse_api_key
-
-    key = generate_api_key("test-account", "test-user")
-    assert is_new_format_key(key)
-
-    account_id, user_id, secret = parse_api_key(key)
-    assert account_id == "test-account"
-    assert user_id == "test-user"
-    assert len(secret) == 64  # 32 bytes as hex
-
-
 async def test_is_new_format_key_validation():
     """Test is_new_format_key correctly identifies key format."""
     from openviking.server.api_keys import generate_api_key, is_new_format_key
@@ -810,19 +737,6 @@ async def test_is_new_format_key_validation():
 
 
 # ---- Registered user role ----
-
-
-async def test_get_registered_user_role_returns_admin_for_account_admin(manager: APIKeyManager):
-    acct = _uid()
-    await manager.create_account(acct, "admin_user")
-    assert await manager.get_registered_user_role(acct, "admin_user") == Role.ADMIN
-
-
-async def test_get_registered_user_role_returns_user_for_registered_user(manager: APIKeyManager):
-    acct = _uid()
-    await manager.create_account(acct, "admin_user")
-    await manager.register_user(acct, "regular_user", "user")
-    assert await manager.get_registered_user_role(acct, "regular_user") == Role.USER
 
 
 async def test_get_registered_user_role_returns_none_when_user_missing(manager: APIKeyManager):

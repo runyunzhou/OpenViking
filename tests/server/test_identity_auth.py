@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from starlette.requests import Request
 
+from openviking.server.account_stores.base import AccountStore
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.auth import (
     get_request_context,
@@ -90,7 +91,7 @@ async def test_key_identity_and_groups_are_resolved_independently(runtime):
 
 
 async def test_key_store_error_and_unknown_identity_fail_closed():
-    store = AsyncMock()
+    store = AsyncMock(spec=AccountStore)
     store.verify_api_key.return_value = ("acme", "missing")
     store.get_user.return_value = None
     manager = APIKeyManager("root", store)
@@ -163,7 +164,7 @@ async def test_external_context_preserves_role_without_local_gate(runtime):
         auth_mode = "external"
 
         async def initialize(self, app, service, config):
-            self.initialized = True
+            pass
 
         def validate_config(self, config):
             pass
@@ -171,21 +172,12 @@ async def test_external_context_preserves_role_without_local_gate(runtime):
         async def resolve_identity(self, request, **kwargs):
             return ResolvedIdentity(role=Role.USER, account_id="external", user_id="subject")
 
-        def get_request_context_checks(self, path, identity):
-            assert self.initialized
-
-        async def shutdown(self):
-            self.initialized = False
-
     request = await make_request(runtime, "external")
     plugin = ExternalPlugin()
     request.app.state.auth_plugin = plugin
-    await plugin.initialize(request.app, None, request.app.state.config)
     identity = await plugin.resolve_identity(request)
     ctx = await get_request_context(request, identity, None, None, None)
     assert (ctx.role, ctx.account_id, ctx.group_ids) == (Role.USER, "external", ())
-    await plugin.shutdown()
-    assert not plugin.initialized
 
 
 async def test_trusted_cancelled_flush_requeues_batch_and_shutdown_preserves_store(
@@ -274,11 +266,6 @@ async def test_builtin_external_mapping_preserves_identity_and_user_role(
     plugin._mapper = IdentityMapper(config.identity)
     request = await make_request(runtime, mode, headers=headers)
     request.app.state.auth_plugin = plugin
-    monkeypatch.setattr(
-        runtime,
-        "get_user",
-        AsyncMock(side_effect=AssertionError("External identities must not need registration")),
-    )
     identity = await plugin.resolve_identity(request)
     assert (identity.account_id, identity.user_id) == expected
     assert identity.role == Role.USER

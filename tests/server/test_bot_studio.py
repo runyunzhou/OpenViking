@@ -74,7 +74,6 @@ async def test_reused_admin_users_support_safe_credential_status(
         role=Role.ROOT,
     )
     registry = SimpleNamespace(
-        refresh_account_users_from_store=AsyncMock(),
         list_users_page=AsyncMock(
             return_value={
                 "users": [
@@ -123,14 +122,9 @@ async def test_selection_uses_current_account_registry(monkeypatch, user_id, acc
     from fastapi import HTTPException
 
     registry = SimpleNamespace(
-        refresh_account_users_from_store=AsyncMock(),
         list_users_page=AsyncMock(
             return_value={
                 "users": [{"user_id": "bot", "api_key": "internal-key"}],
-                "total": 1,
-                "account_total": 1,
-                "manager_count": 0,
-                "key_count": 1,
             }
         ),
     )

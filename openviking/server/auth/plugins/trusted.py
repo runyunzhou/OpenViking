@@ -163,15 +163,14 @@ class TrustedAuthPlugin(AuthPlugin):
         _validate_trusted_identity(effective_account_id, effective_user_id)
 
         local_role = None
-        if self._api_key_manager and effective_account_id and effective_user_id:
-            local_role = await self._api_key_manager.get_registered_user_role(
-                effective_account_id, effective_user_id
-            )
-        trusted_role = Role.USER
         if asserted_role is not None:
             trusted_role = asserted_role
-        elif local_role is not None:
-            trusted_role = local_role
+        else:
+            if self._api_key_manager and effective_account_id and effective_user_id:
+                local_role = await self._api_key_manager.get_registered_user_role(
+                    effective_account_id, effective_user_id
+                )
+            trusted_role = local_role or Role.USER
 
         identity = ResolvedIdentity(
             role=trusted_role,
@@ -259,8 +258,6 @@ class TrustedAuthPlugin(AuthPlugin):
                 pending_after_failure.setdefault(account_id, set()).update(user_ids)
             self._pending = pending_after_failure
             self._pending_count += self._in_flight_count
-            self._in_flight = {}
-            self._in_flight_count = 0
             if not isinstance(exc, Exception):
                 raise
             logger.warning("Trusted identity batch registration failed; will retry", exc_info=True)

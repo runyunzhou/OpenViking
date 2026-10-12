@@ -391,9 +391,3 @@ def should_expose_user_key(request: Request) -> bool:
     if not isinstance(config, ServerConfig):
         return True
     return config.get_effective_auth_mode() != "trusted"
-
-
-def registry_watcher_running(request: Request) -> bool:
-    plugin = getattr(request.app.state, "auth_plugin", None)
-    watch_task = getattr(plugin, "_watch_task", None)
-    return watch_task is not None and not watch_task.done()
