@@ -336,6 +336,73 @@ def test_mysql_requires_resource_id(monkeypatch):
         MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
 
 
+def test_mysql_resource_id_must_fit_schema(monkeypatch):
+    params = {"user": "unused", "password": "unused", "database": "unused"}
+    monkeypatch.setenv("OV_RESOURCE_ID", "r" * 255)
+    MySQLAccountStore(params=params)
+
+    monkeypatch.setenv("OV_RESOURCE_ID", "r" * 256)
+    with pytest.raises(InvalidArgumentError, match="OV_RESOURCE_ID must not exceed 255"):
+        MySQLAccountStore(params=params)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        pytest.param(
+            lambda store, value: store.create_account_with_api_key(value, "admin", "key"),
+            id="account",
+        ),
+        pytest.param(
+            lambda store, value: store.create_account_with_api_key("account", value, "key"),
+            id="account-admin",
+        ),
+        pytest.param(
+            lambda store, value: store.create_user("account", value, "user"),
+            id="user",
+        ),
+        pytest.param(
+            lambda store, value: store.ensure_trusted_identities({value: {"user"}}),
+            id="trusted-account",
+        ),
+        pytest.param(
+            lambda store, value: store.ensure_trusted_identities({"account": {value}}),
+            id="trusted-user",
+        ),
+        pytest.param(
+            lambda store, value: store.create_group("account", value),
+            id="group",
+        ),
+        pytest.param(
+            lambda store, value: store.begin_deletion(
+                "account",
+                None,
+                task_id="task",
+                owner_account_id=value,
+                owner_user_id="owner",
+            ),
+            id="deletion-owner-account",
+        ),
+        pytest.param(
+            lambda store, value: store.begin_deletion(
+                "account",
+                None,
+                task_id="task",
+                owner_account_id="owner",
+                owner_user_id=value,
+            ),
+            id="deletion-owner-user",
+        ),
+    ],
+)
+async def test_mysql_identifiers_must_fit_schema(monkeypatch, operation):
+    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+
+    with pytest.raises(InvalidArgumentError, match="must not exceed 255 characters"):
+        await operation(store, "a" * 256)
+
+
 def test_mysql_rejects_removed_table_parameter(monkeypatch):
     monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
     with pytest.raises(InvalidArgumentError, match="Unknown MySQL account store parameters: table"):

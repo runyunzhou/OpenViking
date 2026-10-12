@@ -56,10 +56,20 @@ from openviking_cli.session.user_id import (
     validate_user_id,
 )
 
+_MYSQL_IDENTIFIER_MAX_LENGTH = 255
 
-def _validate(value: str, validator) -> None:
+
+def _validate_length(value: str, name: str) -> None:
+    if len(value) > _MYSQL_IDENTIFIER_MAX_LENGTH:
+        raise InvalidArgumentError(
+            f"{name} must not exceed {_MYSQL_IDENTIFIER_MAX_LENGTH} characters."
+        )
+
+
+def _validate(value: str, validator, name: str) -> None:
     if error := validator(value):
         raise InvalidArgumentError(error)
+    _validate_length(value, name)
 
 
 def _validate_role(role: str) -> Role:
@@ -118,6 +128,7 @@ class MySQLAccountStore(AccountStore):
         self._resource_id = os.environ.get("OV_RESOURCE_ID", "").strip()
         if not self._resource_id:
             raise InvalidArgumentError("OV_RESOURCE_ID is required for MySQL account storage")
+        _validate_length(self._resource_id, "OV_RESOURCE_ID")
 
         credential_storage = values.pop("credential_storage", "hash")
         encryption_key = values.pop("credential_encryption_key", None)
@@ -431,8 +442,8 @@ class MySQLAccountStore(AccountStore):
         admin_user_id: str,
         api_key: str,
     ) -> None:
-        _validate(account_id, validate_account_id)
-        _validate(admin_user_id, validate_user_id)
+        _validate(account_id, validate_account_id, "account_id")
+        _validate(admin_user_id, validate_user_id, "admin_user_id")
         try:
             async with self._transaction() as session:
                 account = Account(resource_id=self._resource_id, account_id=account_id)
@@ -459,7 +470,7 @@ class MySQLAccountStore(AccountStore):
             raise AlreadyExistsError(account_id, "account") from exc
 
     async def create_user(self, account_id: str, user_id: str, role: str) -> None:
-        _validate(user_id, validate_user_id)
+        _validate(user_id, validate_user_id, "user_id")
         role = _validate_role(role)
         try:
             async with self._transaction() as session:
@@ -484,7 +495,7 @@ class MySQLAccountStore(AccountStore):
         role: str,
         api_key: str,
     ) -> None:
-        _validate(user_id, validate_user_id)
+        _validate(user_id, validate_user_id, "user_id")
         role = _validate_role(role)
         try:
             async with self._transaction() as session:
@@ -652,9 +663,9 @@ class MySQLAccountStore(AccountStore):
 
     async def ensure_trusted_identities(self, identities: dict[str, set[str]]) -> dict[str, int]:
         for account_id, user_ids in identities.items():
-            _validate(account_id, validate_account_id)
+            _validate(account_id, validate_account_id, "account_id")
             for user_id in user_ids:
-                _validate(user_id, validate_user_id)
+                _validate(user_id, validate_user_id, "user_id")
         created_accounts = 0
         created_users = 0
         for account_id, user_ids in identities.items():
@@ -715,6 +726,8 @@ class MySQLAccountStore(AccountStore):
         owner_account_id: str,
         owner_user_id: str,
     ) -> tuple[DeletionRecord, bool]:
+        _validate_length(owner_account_id, "owner_account_id")
+        _validate_length(owner_user_id, "owner_user_id")
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             record = account
@@ -743,6 +756,8 @@ class MySQLAccountStore(AccountStore):
         owner_account_id: str,
         owner_user_id: str,
     ) -> DeletionRecord:
+        _validate_length(owner_account_id, "owner_account_id")
+        _validate_length(owner_user_id, "owner_user_id")
         async with self._transaction() as session:
             account = await self._lock_account(session, account_id)
             record = account
@@ -851,7 +866,11 @@ class MySQLAccountStore(AccountStore):
         ]
 
     async def create_group(self, account_id: str, group_id: str) -> GroupSummary:
-        _validate(group_id, lambda value: validate_identifier_part(value, "group_id"))
+        _validate(
+            group_id,
+            lambda value: validate_identifier_part(value, "group_id"),
+            "group_id",
+        )
         try:
             async with self._transaction() as session:
                 account = await self._lock_account(session, account_id)
