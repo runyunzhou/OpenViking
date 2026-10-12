@@ -12,7 +12,6 @@ import os
 import secrets
 import ssl as ssl_module
 from contextlib import asynccontextmanager
-from datetime import datetime
 from typing import AsyncGenerator
 from uuid import uuid4
 
@@ -90,10 +89,6 @@ def _substring_pattern(value: str) -> str:
         "=" + character if character in {"%", "_", "="} else character for character in value
     )
     return f"%{escaped}%"
-
-
-def _timestamp(value: datetime) -> str:
-    return value.isoformat()
 
 
 def _credential_digest(api_key: str) -> str:
@@ -187,11 +182,6 @@ class MySQLAccountStore(AccountStore):
             ).decode()
         except (InvalidTag, ValueError, UnicodeError):
             return None
-
-    def _display_credential(self, account_id: str, user_id: str, material: str) -> str | None:
-        if material.startswith(_DIGEST_CREDENTIAL_PREFIX):
-            return None
-        return self._decrypt_credential(account_id, user_id, material)
 
     def _matches_credential(
         self, account_id: str, user_id: str, material: str, api_key: str
@@ -389,7 +379,7 @@ class MySQLAccountStore(AccountStore):
     def _account_summary(account, user_count: int) -> AccountSummary:
         return {
             "account_id": account.account_id,
-            "created_at": _timestamp(account.created_at),
+            "created_at": account.created_at.isoformat(),
             "user_count": user_count,
             "status": "deleting" if account.deletion_task_id else "active",
             **({"task_id": account.deletion_task_id} if account.deletion_task_id else {}),
@@ -572,14 +562,7 @@ class MySQLAccountStore(AccountStore):
         async with self._session_factory() as session:
             # One HTTP response must derive its rows and summary from one MVCC snapshot.
             await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
-            account = await session.scalar(
-                select(Account).where(
-                    Account.resource_id == self._resource_id,
-                    Account.account_id == account_id,
-                )
-            )
-            if account is None:
-                raise NotFoundError(account_id, "account")
+            account = await self._account_for_read(session, account_id)
             base = [
                 User.resource_id == self._resource_id,
                 User.account_pk == account.account_pk,
@@ -640,7 +623,7 @@ class MySQLAccountStore(AccountStore):
         for user in users:
             row: UserSummary = {"user_id": user.user_id, "role": user.role}
             if credential := credentials.get(user.user_pk):
-                api_key = self._display_credential(account_id, user.user_id, credential.material)
+                api_key = self._decrypt_credential(account_id, user.user_id, credential.material)
                 if api_key is None:
                     row["key_prefix"] = credential.prefix
                 else:

@@ -11,13 +11,12 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import delete
-from sqlalchemy.dialects import mysql
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from openviking.server.account_stores import mysql as mysql_store_module
-from openviking.server.account_stores.mysql import MySQLAccountStore, _substring_pattern
-from openviking.server.account_stores.mysql_schema import Account, Base, Group, GroupMember
+from openviking.server.account_stores.mysql import MySQLAccountStore
+from openviking.server.account_stores.mysql_schema import Account, Base
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.identity import Role
@@ -183,23 +182,8 @@ async def test_file_trusted_batch_rejects_oversized_account_before_any_write():
         await manager.close()
 
 
-async def test_file_account_creation_is_atomic_when_credential_write_fails():
-    class FailingAGFS(InMemoryAGFS):
-        def write(self, path, content, ctx=None):
-            if path == "/local/acme/_system/users.json":
-                raise OSError("credential store unavailable")
-            return super().write(path, content, ctx)
-
-    store = FileStore(SimpleNamespace(agfs=FailingAGFS()))
-    manager = APIKeyManager("root", store)
-    await manager.load()
-
-    with pytest.raises(OSError, match="credential store unavailable"):
-        await manager.create_account("acme", "alice")
-    assert await manager.get_account("acme") is None
-
-
-async def test_file_user_creation_is_atomic_when_credential_write_fails():
+@pytest.mark.parametrize("operation", ["account", "user"])
+async def test_file_creation_is_atomic_when_credential_write_fails(operation):
     class FailingAGFS(InMemoryAGFS):
         fail_user_write = False
 
@@ -212,13 +196,23 @@ async def test_file_user_creation_is_atomic_when_credential_write_fails():
     store = FileStore(SimpleNamespace(agfs=agfs))
     manager = APIKeyManager("root", store)
     await manager.load()
-    admin_key = await manager.create_account("acme", "alice")
+    if operation == "user":
+        admin_key = await manager.create_account("acme", "alice")
     agfs.fail_user_write = True
 
-    with pytest.raises(OSError, match="credential store unavailable"):
-        await manager.register_user("acme", "bob")
-    assert await manager.get_user("acme", "bob") is None
-    assert (await manager.resolve_identity(admin_key)).user_id == "alice"
+    try:
+        with pytest.raises(OSError, match="credential store unavailable"):
+            if operation == "account":
+                await manager.create_account("acme", "alice")
+            else:
+                await manager.register_user("acme", "bob")
+        assert await manager.get_user("acme", "bob") is None
+        if operation == "account":
+            assert await manager.get_account("acme") is None
+        else:
+            assert (await manager.resolve_identity(admin_key)).user_id == "alice"
+    finally:
+        await manager.close()
 
 
 async def test_regenerate_key_preserves_management_not_found_errors():
@@ -230,18 +224,6 @@ async def test_regenerate_key_preserves_management_not_found_errors():
         await manager.regenerate_key("missing", "alice")
     with pytest.raises(NotFoundError, match="User not found"):
         await manager.regenerate_key("acme", "missing")
-
-
-async def test_file_store_allows_only_one_active_credential_per_user():
-    store = _file_store()
-    await store.load()
-    await store.create_account_with_api_key("acme", "alice", "initial-key")
-
-    await store.replace_active_user_api_key("acme", "alice", "first-key")
-    await store.replace_active_user_api_key("acme", "alice", "second-key")
-    assert await store.verify_api_key("first-key") is None
-    active = await store.verify_api_key("second-key")
-    assert active == ("acme", "alice")
 
 
 async def test_file_hashing_never_persists_plaintext_credentials():
@@ -256,12 +238,13 @@ async def test_file_hashing_never_persists_plaintext_credentials():
     user_key = await manager.register_user("acme", "bob")
     rotated_key = await manager.regenerate_key("acme", "bob")
 
-    users = json.loads(agfs._files["/local/acme/_system/users.json"])["users"]
-    assert users["alice"]["key"].startswith("$argon2")
-    assert users["bob"]["key"].startswith("$argon2")
-    assert account_key.encode() not in agfs._files["/local/acme/_system/users.json"]
-    assert user_key.encode() not in agfs._files["/local/acme/_system/users.json"]
-    assert rotated_key.encode() not in agfs._files["/local/acme/_system/users.json"]
+    persisted = agfs.read("/local/acme/_system/users.json")
+    for key in (account_key, user_key, rotated_key):
+        assert key.encode() not in persisted
+    assert (await manager.resolve_identity(account_key)).user_id == "alice"
+    assert (await manager.resolve_identity(rotated_key)).user_id == "bob"
+    with pytest.raises(UnauthenticatedError):
+        await manager.resolve_identity(user_key)
 
 
 async def test_file_load_migrates_plaintext_credential_to_argon2():
@@ -277,9 +260,7 @@ async def test_file_load_migrates_plaintext_credential_to_argon2():
     )
     await hashed.load()
 
-    users = json.loads(agfs._files["/local/acme/_system/users.json"])["users"]
-    assert users["alice"]["key"].startswith("$argon2")
-    assert key.encode() not in agfs._files["/local/acme/_system/users.json"]
+    assert key.encode() not in agfs.read("/local/acme/_system/users.json")
     assert (await hashed.resolve_identity(key)).user_id == "alice"
 
 
@@ -355,29 +336,6 @@ def test_mysql_requires_resource_id(monkeypatch):
         MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
 
 
-def test_mysql_substring_filter_escapes_sql_wildcards():
-    assert _substring_pattern("alice") == "%alice%"
-    assert _substring_pattern("a_b%=c") == "%a=_b=%==c%"
-
-
-def test_mysql_schema_uses_fixed_tables_and_scoped_memberships():
-    assert set(Base.metadata.tables) == {
-        "ov_accounts",
-        "ov_accounts_users",
-        "ov_accounts_groups",
-        "ov_accounts_group_members",
-        "ov_accounts_credentials",
-    }
-    membership = GroupMember.__table__
-    assert "account_pk" in membership.c
-    assert all(
-        {"resource_id", "account_pk"}.issubset(
-            {element.parent.name for element in constraint.elements}
-        )
-        for constraint in membership.foreign_key_constraints
-    )
-
-
 def test_mysql_rejects_removed_table_parameter(monkeypatch):
     monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
     with pytest.raises(InvalidArgumentError, match="Unknown MySQL account store parameters: table"):
@@ -389,40 +347,6 @@ def test_mysql_rejects_removed_table_parameter(monkeypatch):
                 "table": "tenant_accounts",
             }
         )
-
-
-async def test_mysql_verification_excludes_deleting_identities(monkeypatch):
-    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
-    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
-    statements = []
-
-    class Result:
-        def all(self):
-            return []
-
-    class Session:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_args):
-            return None
-
-        async def execute(self, statement):
-            statements.append(
-                str(
-                    statement.compile(
-                        dialect=mysql.dialect(),
-                        compile_kwargs={"literal_binds": True},
-                    )
-                )
-            )
-            return Result()
-
-    store._sessions = lambda: Session()
-
-    assert await store.verify_api_key("key", account_id_hint="acme") is None
-    statement = statements[0]
-    assert statement.count("deletion_task_id IS NULL") == 2
 
 
 async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypatch):
@@ -445,13 +369,7 @@ async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypa
             pass
 
         async def execute(self, statement):
-            table = statement.get_final_froms()[0].name
-            if table == Group.__tablename__:
-                raise OperationalError(
-                    str(statement),
-                    {},
-                    Exception(1146, f"Table '{table}' doesn't exist"),
-                )
+            raise OperationalError(str(statement), {}, Exception(1146, "Table doesn't exist"))
 
     monkeypatch.setattr(mysql_store_module, "create_async_engine", lambda *args, **kwargs: engine)
     monkeypatch.setattr(

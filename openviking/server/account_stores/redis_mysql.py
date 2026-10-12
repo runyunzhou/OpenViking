@@ -481,17 +481,13 @@ class RedisMySQLAccountStore(AccountStore):
             )
         return result
 
-    def _user_cache_keys(
-        self, account_id: str, user_id: str, *, credentials: bool = False
-    ) -> tuple[str, ...]:
-        keys = (
+    def _user_cache_keys(self, account_id: str, user_id: str) -> tuple[str, ...]:
+        return (
             self._user_key(account_id, user_id),
             self._group_ids_key(account_id, user_id),
             self._user_deletion_key(account_id, user_id),
+            self._user_credential_fence_key(account_id, user_id),
         )
-        if credentials:
-            return keys + (self._user_credential_fence_key(account_id, user_id),)
-        return keys
 
     async def _cached_binding(
         self,
@@ -531,9 +527,7 @@ class RedisMySQLAccountStore(AccountStore):
                     ):
                         return True, (binding_account_id, user_id)
         negative = _decode(
-            await self._redis.get(
-                self._negative_binding_key(account_id, api_key, user_id_hint)
-            )
+            await self._redis.get(self._negative_binding_key(account_id, api_key, user_id_hint))
         )
         negative_hit, negative_value = self._read_nullable(negative)
         return (True, None) if negative_hit and negative_value is None else (False, None)
@@ -721,7 +715,7 @@ class RedisMySQLAccountStore(AccountStore):
         await self._mutate_account(
             account_id,
             lambda: self._mysql.create_user(account_id, user_id, role),
-            lambda: self._user_cache_keys(account_id, user_id, credentials=True),
+            lambda: self._user_cache_keys(account_id, user_id),
         )
 
     async def create_user_with_api_key(
@@ -739,12 +733,10 @@ class RedisMySQLAccountStore(AccountStore):
                 role,
                 api_key,
             ),
-            lambda: self._user_cache_keys(
-                account_id,
-                user_id,
-                credentials=True,
-            )
-            + self._binding_cache_keys(account_id, api_key, user_id),
+            lambda: (
+                self._user_cache_keys(account_id, user_id)
+                + self._binding_cache_keys(account_id, api_key, user_id)
+            ),
         )
 
     async def list_users_page(self, account_id: str, **kwargs) -> UsersPage:
@@ -791,9 +783,7 @@ class RedisMySQLAccountStore(AccountStore):
             lambda: (),
         )
 
-    async def ensure_trusted_identities(
-        self, identities: dict[str, set[str]]
-    ) -> dict[str, int]:
+    async def ensure_trusted_identities(self, identities: dict[str, set[str]]) -> dict[str, int]:
         result = {"created_accounts": 0, "created_users": 0}
         for account_id, user_ids in identities.items():
             created = await self._mutate_account(
@@ -838,9 +828,7 @@ class RedisMySQLAccountStore(AccountStore):
         return await self._mutate_account(
             account_id,
             lambda: self._mysql.finish_deletion(account_id, user_id, task_id),
-            lambda: ()
-            if user_id is None
-            else self._user_cache_keys(account_id, user_id, credentials=True),
+            lambda: () if user_id is None else self._user_cache_keys(account_id, user_id),
             account_wide=user_id is None,
         )
 
@@ -851,20 +839,20 @@ class RedisMySQLAccountStore(AccountStore):
             account_id,
             lambda: self._mysql.replace_active_user_api_key(account_id, user_id, api_key),
             lambda: (
-                self._user_credential_fence_key(account_id, user_id),
-            )
-            + self._binding_cache_keys(account_id, api_key, user_id),
+                (self._user_credential_fence_key(account_id, user_id),)
+                + self._binding_cache_keys(account_id, api_key, user_id)
+            ),
         )
 
-    async def revoke_active_api_keys(
-        self, account_id: str, user_id: str | None = None
-    ) -> None:
+    async def revoke_active_api_keys(self, account_id: str, user_id: str | None = None) -> None:
         await self._mutate_account(
             account_id,
             lambda: self._mysql.revoke_active_api_keys(account_id, user_id),
-            lambda: (self._account_credential_fence_key(account_id),)
-            if user_id is None
-            else (self._user_credential_fence_key(account_id, user_id),),
+            lambda: (
+                (self._account_credential_fence_key(account_id),)
+                if user_id is None
+                else (self._user_credential_fence_key(account_id, user_id),)
+            ),
         )
 
     async def get_user_key_fingerprint(self, account_id: str, user_id: str) -> str | None:

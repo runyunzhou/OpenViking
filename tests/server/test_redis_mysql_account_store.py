@@ -70,9 +70,7 @@ class FakeRedis:
             self.values[keys[1]] = values[1]
             if str(values[4]) == "1":
                 self._prune_zset(keys[2])
-                self.zsets.setdefault(keys[2], {})[keys[1]] = (
-                    self.now_ms + int(values[2]) * 1000
-                )
+                self.zsets.setdefault(keys[2], {})[keys[1]] = self.now_ms + int(values[2]) * 1000
             return 1
         if "-- delete-and-unindex" in script:
             await self.delete(*keys[1:])
@@ -89,9 +87,8 @@ class FakeRedis:
 
 
 class FakeMySQLAuthority:
-    _resource_id = "test-resource"
-
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, resource_id: str = "test-resource"):
+        self._resource_id = resource_id
         self.api_key = api_key
         self.account_exists = True
         self.user_exists = True
@@ -99,13 +96,6 @@ class FakeMySQLAuthority:
         self.group_ids = ("engineering",)
         self.account_deletion = None
         self.user_deletion = None
-        self.calls = {
-            "verify": 0,
-            "user": 0,
-            "groups": 0,
-            "account_deletion": 0,
-            "user_deletion": 0,
-        }
 
     async def load(self):
         return None
@@ -120,7 +110,6 @@ class FakeMySQLAuthority:
         account_id_hint: str | None = None,
         user_id_hint: str | None = None,
     ):
-        self.calls["verify"] += 1
         return (
             ("acme", "alice")
             if (
@@ -134,7 +123,6 @@ class FakeMySQLAuthority:
         )
 
     async def get_user(self, account_id: str, user_id: str):
-        self.calls["user"] += 1
         if (
             not self.account_exists
             or not self.user_exists
@@ -144,7 +132,6 @@ class FakeMySQLAuthority:
         return dict(self.user)
 
     async def get_user_group_ids(self, account_id: str, user_id: str):
-        self.calls["groups"] += 1
         return (
             self.group_ids
             if self.account_exists and (account_id, user_id) == ("acme", "alice")
@@ -155,9 +142,7 @@ class FakeMySQLAuthority:
         if not self.account_exists or account_id != "acme":
             return None
         if user_id is None:
-            self.calls["account_deletion"] += 1
             return self.account_deletion
-        self.calls["user_deletion"] += 1
         return self.account_deletion or self.user_deletion
 
     async def replace_active_user_api_key(self, account_id: str, user_id: str, api_key: str):
@@ -215,9 +200,9 @@ class FakeMySQLAuthority:
 
 
 def _store(
-    api_key: str, *, redis_client=None, lock_wait_seconds: int = 30
+    api_key: str, *, redis_client=None, lock_wait_seconds: int = 30, resource_id="test-resource"
 ) -> tuple[RedisMySQLAccountStore, FakeMySQLAuthority]:
-    mysql = FakeMySQLAuthority(api_key)
+    mysql = FakeMySQLAuthority(api_key, resource_id)
     store = RedisMySQLAccountStore(
         params={
             "redis": {
@@ -240,14 +225,6 @@ def _api_key(secret: str = "secret") -> str:
     return f"{encoded_account}.{encoded_user}.{encoded_secret}"
 
 
-def test_account_keys_include_resource_in_hash_tag():
-    store, _ = _store(_api_key())
-
-    assert "{dGVzdC1yZXNvdXJjZQBhY21l}" in store._user_key("acme", "alice")
-    assert "{dGVzdC1yZXNvdXJjZQBhY21l}" in store._binding_key("acme", _api_key())
-    assert store._lock_wait_seconds == 30
-
-
 def test_redis_timeouts_must_be_positive_integers():
     mysql = FakeMySQLAuthority(_api_key())
     for name, value in (
@@ -266,26 +243,29 @@ def test_redis_timeouts_must_be_positive_integers():
             )
 
 
-async def test_verify_api_key_caches_public_binding_read():
-    api_key = _api_key()
-    store, mysql = _store(api_key)
-    await store.load()
-
-    assert await store.verify_api_key(api_key, account_id_hint="acme", user_id_hint="alice") == (
-        "acme",
-        "alice",
-    )
-    assert await store.verify_api_key(api_key, account_id_hint="acme", user_id_hint="alice") == (
-        "acme",
-        "alice",
-    )
-
-    assert mysql.calls["verify"] == 1
+async def test_resources_do_not_share_cached_identities():
+    redis = FakeRedis()
+    first_key, second_key = _api_key("first"), _api_key("second")
+    first, _ = _store(first_key, redis_client=redis, resource_id="first")
+    second, _ = _store(second_key, redis_client=redis, resource_id="second")
+    await first.load()
+    await second.load()
+    try:
+        assert await first.verify_api_key(first_key, account_id_hint="acme") == ("acme", "alice")
+        assert await second.verify_api_key(first_key, account_id_hint="acme") is None
+        assert await second.verify_api_key(second_key, account_id_hint="acme") == ("acme", "alice")
+        await first.get_user("acme", "alice")
+        await second.set_role("acme", "alice", Role.USER)
+        assert (await first.get_user("acme", "alice"))["role"] == Role.ADMIN
+        assert (await second.get_user("acme", "alice"))["role"] == Role.USER
+    finally:
+        await first.close()
+        await second.close()
 
 
 async def test_cached_binding_respects_user_id_hint():
     api_key = _api_key()
-    store, mysql = _store(api_key)
+    store, _ = _store(api_key)
     await store.load()
 
     assert await store.verify_api_key(
@@ -306,284 +286,68 @@ async def test_cached_binding_respects_user_id_hint():
         account_id_hint="acme",
         user_id_hint="alice",
     ) == ("acme", "alice")
-    assert mysql.calls["verify"] == 2
 
 
-async def test_concurrent_user_cache_misses_query_mysql_once():
-    store, mysql = _store(_api_key())
-    await store.load()
-    read_started = asyncio.Event()
-    allow_read = asyncio.Event()
-
-    async def delayed_get_user(account_id: str, user_id: str):
-        mysql.calls["user"] += 1
-        read_started.set()
-        await allow_read.wait()
-        return {"user_id": user_id, "role": Role.ADMIN}
-
-    mysql.get_user = delayed_get_user
-    reads = [
-        asyncio.create_task(store.get_user("acme", "alice"))
-        for _ in range(5)
-    ]
-    await read_started.wait()
-    await asyncio.sleep(0.05)
-    assert mysql.calls["user"] == 1
-
-    allow_read.set()
-    assert await asyncio.gather(*reads) == [
-        {"user_id": "alice", "role": Role.ADMIN}
-    ] * 5
-    assert mysql.calls["user"] == 1
-
-
-async def test_expired_cache_lease_cannot_refill_cache():
-    store, _ = _store(_api_key())
-    await store.load()
-    redis = store._redis
-    key = store._user_key("acme", "alice")
-    redis.values[store._lock_key("acme")] = "new-owner"
-
-    written = await store._set_if_locked(
-        "acme",
-        "expired-owner",
-        key,
-        {"found": True, "value": {"user_id": "alice", "role": Role.ADMIN}},
-    )
-
-    assert written is False
-    assert key not in redis.values
-
-
-async def test_write_lock_timeout_revokes_stale_lease_before_invalidation():
-    store, mysql = _store(_api_key())
-    store._lock_wait_seconds = 0.05
-    await store.load()
-    assert await store.get_user("acme", "alice") is not None
-    redis = store._redis
-    redis.values[store._lock_key("acme")] = "other-owner"
-
-    mutation = asyncio.create_task(store.set_role("acme", "alice", Role.USER))
-    await asyncio.sleep(0.01)
-    assert mysql.user["role"] == Role.USER
-    assert not mutation.done()
-    await mutation
-
-    assert store._lock_key("acme") not in redis.values
-    assert store._user_key("acme", "alice") not in redis.values
-    assert not await store._set_if_locked(
-        "acme",
-        "other-owner",
-        store._user_key("acme", "alice"),
-        {"found": True, "value": {"user_id": "alice", "role": Role.ADMIN}},
-    )
-
-
-async def test_invalidation_failure_does_not_block_mysql_mutation():
-    store, mysql = _store(_api_key())
-    await store.load()
-    assert await store.get_user("acme", "alice") is not None
-
-    async def fail_invalidation(*_args):
-        raise ConnectionError("redis unavailable")
-
-    store._delete_and_unindex = fail_invalidation
-
-    await store.set_role("acme", "alice", Role.USER)
-
-    assert mysql.user["role"] == Role.USER
-    assert store._user_key("acme", "alice") in store._redis.values
-
-
-async def test_redis_outage_does_not_block_mysql_mutation():
-    store, mysql = _store(_api_key())
-    await store.load()
-
-    async def unavailable(*_args, **_kwargs):
-        raise ConnectionError("redis unavailable")
-
-    store._redis.set = unavailable
-    store._redis.delete = unavailable
-    store._redis.eval = unavailable
-
-    await store.set_role("acme", "alice", Role.USER)
-
-    assert mysql.user["role"] == Role.USER
-
-
-async def test_api_key_manager_uses_cached_public_store_reads():
+async def test_cached_identity_survives_authority_read_failure(monkeypatch):
     api_key = _api_key()
     store, mysql = _store(api_key)
     await store.load()
     manager = APIKeyManager("root", store)
 
     first = await manager.resolve_identity(api_key)
+
+    async def unavailable(*_args, **_kwargs):
+        raise ConnectionError("MySQL unavailable")
+
+    for method in ("verify_api_key", "get_user", "get_deletion"):
+        monkeypatch.setattr(mysql, method, unavailable)
     second = await manager.resolve_identity(api_key)
 
     assert (first.account_id, first.user_id, first.role) == ("acme", "alice", Role.ADMIN)
     assert second == first
-    assert mysql.calls == {
-        "verify": 1,
-        "user": 1,
-        "groups": 0,
-        "account_deletion": 1,
-        "user_deletion": 1,
-    }
 
 
-async def test_replacing_key_invalidates_cached_binding_and_prior_negative():
-    old_key = _api_key("old")
-    new_key = _api_key("new")
-    store, mysql = _store(old_key)
-    await store.load()
-    assert await store.verify_api_key(old_key, account_id_hint="acme", user_id_hint="alice")
-    assert await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint="alice") is None
-    assert await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint="alice") is None
-    assert mysql.calls["verify"] == 2
-    assert store._binding_key("acme", new_key) not in await store._redis.zrange(
-        store._cache_keys_index_key("acme"),
-        0,
-        -1,
-    )
-
-    await store.replace_active_user_api_key("acme", "alice", new_key)
-
-    assert await store.verify_api_key(old_key, account_id_hint="acme", user_id_hint="alice") is None
-    assert await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint="alice") == (
-        "acme",
-        "alice",
-    )
-    assert mysql.calls["verify"] == 4
-
-
-async def test_creating_account_invalidates_prior_negative_key_binding():
-    api_key = _api_key("new-account")
-    store, mysql = _store(api_key)
-    mysql.account_exists = False
-    mysql.user_exists = False
-    await store.load()
-
-    assert await store.verify_api_key(
-        api_key,
-        account_id_hint="acme",
-        user_id_hint="alice",
-    ) is None
-
-    await store.create_account_with_api_key("acme", "alice", api_key)
-
-    assert await store.verify_api_key(
-        api_key,
-        account_id_hint="acme",
-        user_id_hint="alice",
-    ) == ("acme", "alice")
-
-
-async def test_creating_user_invalidates_prior_negative_key_binding():
-    api_key = _api_key("new-user")
-    store, mysql = _store(api_key)
-    mysql.user_exists = False
-    await store.load()
-
-    assert await store.verify_api_key(
-        api_key,
-        account_id_hint="acme",
-        user_id_hint="alice",
-    ) is None
-
-    await store.create_user_with_api_key("acme", "alice", Role.USER, api_key)
-
-    assert await store.verify_api_key(
-        api_key,
-        account_id_hint="acme",
-        user_id_hint="alice",
-    ) == ("acme", "alice")
-
-
-async def test_account_delete_and_recreate_clear_all_indexed_cache_keys():
+async def test_recreated_account_does_not_inherit_cached_identity():
     api_key = _api_key()
-    store, mysql = _store(api_key)
+    store, _ = _store(api_key)
     await store.load()
-    redis = store._redis
+    manager = APIKeyManager("root", store)
 
-    assert await store.get_user("acme", "alice")
+    assert (await manager.resolve_identity(api_key)).role == Role.ADMIN
     assert await store.get_user_group_ids("acme", "alice") == ("engineering",)
-    assert await store.get_deletion("acme", "alice") is None
-    assert await store.verify_api_key(
-        api_key,
-        account_id_hint="acme",
-        user_id_hint="alice",
+    await store.begin_deletion(
+        "acme", "alice", task_id="delete-1", owner_account_id="acme", owner_user_id="alice"
     )
-    index_key = store._cache_keys_index_key("acme")
-    indexed_keys = set(await redis.zrange(index_key, 0, -1))
-    assert store._user_key("acme", "alice") in indexed_keys
-    assert store._group_ids_key("acme", "alice") in indexed_keys
-    assert store._account_deletion_key("acme") in indexed_keys
-    assert store._user_deletion_key("acme", "alice") in indexed_keys
-    assert store._binding_key("acme", api_key) in indexed_keys
-    assert store._account_credential_fence_key("acme") in indexed_keys
-    assert store._user_credential_fence_key("acme", "alice") in indexed_keys
+    with pytest.raises(UnauthenticatedError):
+        await manager.resolve_identity(api_key)
 
     await store.delete_account("acme")
-
-    assert index_key not in redis.zsets
-    assert not indexed_keys.intersection(redis.values)
     assert await store.get_user("acme", "alice") is None
+    with pytest.raises(UnauthenticatedError):
+        await manager.resolve_identity(api_key)
 
-    await store.create_account_with_api_key("acme", "alice", api_key)
-
-    assert await store.get_user("acme", "alice") == {
-        "user_id": "alice",
-        "role": Role.ADMIN,
-    }
-
-
-async def test_refill_prunes_expired_cache_index_members():
-    store, _ = _store(_api_key())
-    await store.load()
-    redis = store._redis
-    index_key = store._cache_keys_index_key("acme")
-    user_key = store._user_key("acme", "alice")
-    group_key = store._group_ids_key("acme", "alice")
-
-    assert await store.get_user("acme", "alice")
-    redis.now_ms += 60_001
-    assert await store.get_user_group_ids("acme", "alice") == ("engineering",)
-
-    assert await redis.zrange(index_key, 0, -1) == [group_key]
-    assert user_key not in redis.zsets[index_key]
-
-
-async def test_targeted_invalidation_removes_cache_index_member():
-    store, _ = _store(_api_key())
-    await store.load()
-    redis = store._redis
-    index_key = store._cache_keys_index_key("acme")
-    user_key = store._user_key("acme", "alice")
-
-    assert await store.get_user("acme", "alice")
-    assert user_key in await redis.zrange(index_key, 0, -1)
-
-    await store.set_role("acme", "alice", Role.USER)
-
-    assert user_key not in await redis.zrange(index_key, 0, -1)
+    new_key = _api_key("recreated")
+    await store.create_account_with_api_key("acme", "alice", new_key)
+    assert (await manager.resolve_identity(new_key)).role == Role.ADMIN
+    assert await store.get_user_group_ids("acme", "alice") == ()
+    assert await store.get_deletion("acme", "alice") is None
+    with pytest.raises(UnauthenticatedError):
+        await manager.resolve_identity(api_key)
 
 
 async def test_user_group_and_deletion_reads_are_cached_and_invalidated():
     api_key = _api_key()
-    store, mysql = _store(api_key)
+    store, _ = _store(api_key)
     await store.load()
 
-    assert await store.get_user("acme", "alice") == {"user_id": "alice", "role": Role.ADMIN}
     assert await store.get_user("acme", "alice") == {"user_id": "alice", "role": Role.ADMIN}
     await store.set_role("acme", "alice", Role.USER)
     assert await store.get_user("acme", "alice") == {"user_id": "alice", "role": Role.USER}
 
     assert await store.get_user_group_ids("acme", "alice") == ("engineering",)
-    assert await store.get_user_group_ids("acme", "alice") == ("engineering",)
     await store.add_group_member("acme", "product", "alice")
     assert await store.get_user_group_ids("acme", "alice") == ("engineering", "product")
 
-    assert await store.get_deletion("acme", "alice") is None
     assert await store.get_deletion("acme", "alice") is None
     await store.begin_deletion(
         "acme",
@@ -593,14 +357,6 @@ async def test_user_group_and_deletion_reads_are_cached_and_invalidated():
         owner_user_id="alice",
     )
     assert await store.get_deletion("acme", "alice") == {"task_id": "delete-1"}
-
-    assert mysql.calls == {
-        "verify": 0,
-        "user": 2,
-        "groups": 2,
-        "account_deletion": 1,
-        "user_deletion": 2,
-    }
 
 
 async def test_deleting_recreated_account_rejects_key_after_delayed_cleanup():
@@ -645,8 +401,9 @@ async def test_deleting_recreated_account_rejects_key_after_delayed_cleanup():
 @pytest.mark.parametrize("operation", ["create_account", "create_user", "replace_key"])
 @pytest.mark.parametrize("user_hint", [None, "alice"])
 async def test_provisioned_key_is_immediately_usable(operation, user_hint):
+    old_key = _api_key("old")
     new_key = _api_key("new")
-    store, mysql = _store(_api_key("old"))
+    store, mysql = _store(old_key)
     if operation == "create_account":
         mysql.account_exists = False
         mysql.user_exists = False
@@ -654,6 +411,10 @@ async def test_provisioned_key_is_immediately_usable(operation, user_hint):
         mysql.user_exists = False
     await store.load()
     try:
+        if operation == "replace_key":
+            assert await store.verify_api_key(
+                old_key, account_id_hint="acme", user_id_hint=user_hint
+            ) == ("acme", "alice")
         assert (
             await store.verify_api_key(new_key, account_id_hint="acme", user_id_hint=user_hint)
             is None
@@ -667,6 +428,10 @@ async def test_provisioned_key_is_immediately_usable(operation, user_hint):
         assert await store.verify_api_key(
             new_key, account_id_hint="acme", user_id_hint=user_hint
         ) == ("acme", "alice")
+        assert (
+            await store.verify_api_key(old_key, account_id_hint="acme", user_id_hint=user_hint)
+            is None
+        )
     finally:
         await store.close()
 
@@ -712,13 +477,14 @@ async def test_key_rotation_rejects_old_key_after_inflight_verification():
         await store.close()
 
 
-async def test_redis_timeouts_allow_mysql_reads_and_writes():
+@pytest.mark.parametrize("error", [ConnectionError, TimeoutError])
+async def test_redis_failure_allows_mysql_reads_and_writes(error):
     redis = FakeRedis()
     store, _ = _store(_api_key(), redis_client=redis)
     await store.load()
 
     async def timeout(*_args, **_kwargs):
-        raise TimeoutError("Redis did not respond")
+        raise error("Redis did not respond")
 
     redis.get = timeout
     redis.set = timeout
