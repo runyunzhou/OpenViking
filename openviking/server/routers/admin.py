@@ -1003,9 +1003,9 @@ async def list_users(
             {
                 "user_id": user["user_id"],
                 "role": user["role"],
-                "api_key_available": bool(
-                    user.get("api_key") or user.get("key_prefix")
-                ),
+                # A key prefix identifies a hash-only credential, which cannot
+                # be supplied to server-side Gateway or Bot Studio bindings.
+                "api_key_available": bool(user.get("api_key")),
             }
             for user in users["users"]
         ]

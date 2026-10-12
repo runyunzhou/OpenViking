@@ -112,7 +112,7 @@ async def test_reused_admin_users_support_safe_credential_status(
         assert "private" not in response.text and "prefix" not in response.text
         assert result == [
             {"user_id": "bot", "role": "user", "api_key_available": True},
-            {"user_id": "hashed", "role": "user", "api_key_available": True},
+            {"user_id": "hashed", "role": "user", "api_key_available": False},
         ]
 
 

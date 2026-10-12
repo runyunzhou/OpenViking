@@ -182,9 +182,8 @@ class TrustedAuthPlugin(AuthPlugin):
             and not is_admin_path
             and effective_account_id
             and effective_user_id
-            and local_role is None
         ):
-            self._queue_trusted_identity(effective_account_id, effective_user_id)
+            await self._queue_trusted_identity(effective_account_id, effective_user_id)
         return identity
 
     def validate_config(self, config) -> None:
@@ -223,7 +222,13 @@ class TrustedAuthPlugin(AuthPlugin):
         """Return whether this trusted request's identity should be batch registered."""
         return self._flush_interval_seconds > 0
 
-    def _queue_trusted_identity(self, account_id: str, user_id: str) -> None:
+    async def _queue_trusted_identity(self, account_id: str, user_id: str) -> None:
+        manager = self._api_key_manager
+        if manager is not None:
+            if await manager.get_deletion(account_id, user_id) is not None:
+                return
+            if await manager.get_user(account_id, user_id) is not None:
+                return
         if user_id in self._in_flight.get(account_id, set()):
             return
         if user_id in self._pending.get(account_id, set()):

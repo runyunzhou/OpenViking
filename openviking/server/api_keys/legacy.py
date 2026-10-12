@@ -1478,8 +1478,6 @@ class FileStore(AccountStore):
 
     async def create_user(self, account_id: str, user_id: str, role: str) -> None:
         async with self._mutation_lock:
-            await self._refresh_accounts_for_management_read_unlocked()
-            await self._refresh_users_for_management_read_unlocked(account_id)
             await self._create_user_identity(account_id, user_id, role)
 
     async def create_user_with_api_key(
@@ -1490,8 +1488,6 @@ class FileStore(AccountStore):
         api_key: str,
     ) -> None:
         async with self._mutation_lock:
-            await self._refresh_accounts_for_management_read_unlocked()
-            await self._refresh_users_for_management_read_unlocked(account_id)
             await self._create_user_identity(
                 account_id,
                 user_id,
