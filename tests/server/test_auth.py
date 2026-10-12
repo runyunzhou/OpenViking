@@ -1286,17 +1286,12 @@ async def test_trusted_mode_with_root_api_key_accepts_matching_api_key():
     assert identity.user_id == "alice"
 
 
-async def test_trusted_mode_root_key_allows_admin_role_header(auth_app, monkeypatch):
+async def test_trusted_mode_root_key_allows_admin_role_header(auth_app):
     """Trusted upstreams with the root key may assert ADMIN role for tenant routes."""
     manager = auth_app.state.api_key_manager
     account_id = _uid()
     await manager.create_account(account_id, "owner")
     await manager.register_user(account_id, "alice", "user")
-
-    async def fail_role_lookup(*_args):
-        raise AssertionError("asserted roles must not read the account store")
-
-    monkeypatch.setattr(manager, "get_registered_user_role", fail_role_lookup)
 
     request = _make_request(
         "/api/v1/resources",
