@@ -27,6 +27,11 @@ def test_unknown_account_store_is_rejected():
         )
 
 
+def test_unknown_account_store_is_rejected_during_config_validation():
+    with pytest.raises(ValueError, match="account_store.provider must be one of"):
+        AccountStoreConfig(provider="missing")
+
+
 @pytest.mark.parametrize("injected", [False, True])
 async def test_assembled_manager_supports_account_authentication(injected):
     account_store = FileStore(SimpleNamespace(agfs=InMemoryAGFS()))
