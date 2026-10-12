@@ -109,6 +109,8 @@ class TrustedAuthPlugin(AuthPlugin):
         x_openviking_account: Optional[str] = None,
         x_openviking_user: Optional[str] = None,
     ) -> ResolvedIdentity:
+        if api_key is None:
+            api_key = request.headers.get("X-API-Key")
         configured_root_api_key = request.app.state.config.root_api_key
         if not api_key:
             raise UnauthenticatedError(

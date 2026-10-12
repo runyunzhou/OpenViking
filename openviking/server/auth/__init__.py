@@ -158,6 +158,10 @@ async def resolve_identity(
     x_openviking_user: Optional[str] = Header(None, alias="X-OpenViking-User"),
 ) -> ResolvedIdentity:
     """Resolve API key to identity via the active auth plugin."""
+    if x_api_key is None:
+        x_api_key = request.headers.get("X-API-Key")
+    if authorization is None:
+        authorization = request.headers.get("Authorization")
     x_openviking_account = _normalize_header_value(x_openviking_account)
     x_openviking_user = _normalize_header_value(x_openviking_user)
     api_key = _extract_api_key(x_api_key, authorization)
