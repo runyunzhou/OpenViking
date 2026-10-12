@@ -253,6 +253,7 @@ class APIKeyManager:
                 "role_filter",
                 "page",
                 "query_filter",
+                "fresh",
             )
             if name in filters
         }

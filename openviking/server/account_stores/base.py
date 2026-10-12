@@ -83,6 +83,7 @@ class AccountStore(ABC):
         role_filter: str | None = None,
         page: int = 1,
         query_filter: str | None = None,
+        fresh: bool = False,
     ) -> UsersPage: ...
 
     @abstractmethod

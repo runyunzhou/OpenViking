@@ -1527,8 +1527,14 @@ class FileStore(AccountStore):
         role_filter: str | None = None,
         page: int = 1,
         query_filter: str | None = None,
+        fresh: bool = False,
     ) -> UsersPage:
-        await self._refresh_users_for_management_read(account_id)
+        if fresh:
+            async with self._mutation_lock:
+                async with self._reload_lock:
+                    await self._refresh_account_users_from_store_unlocked(account_id)
+        else:
+            await self._refresh_users_for_management_read(account_id)
         return self._get_users_page(
             account_id,
             limit=limit,

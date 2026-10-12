@@ -1,7 +1,7 @@
 """The browser cannot elevate or cross accounts through Studio management."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -173,8 +173,11 @@ async def test_hashed_key_is_not_treated_as_a_usable_credential(monkeypatch):
 
 async def test_trusted_selection_uses_keyless_root_identity(monkeypatch):
     registry = SimpleNamespace(
-        refresh_account_users_from_store=AsyncMock(),
-        get_users=Mock(return_value=[{"user_id": "bot", "key_prefix": "prefix"}]),
+        list_users_page=AsyncMock(
+            return_value={
+                "users": [{"user_id": "bot", "key_prefix": "prefix"}],
+            }
+        ),
     )
     monkeypatch.setattr(bot_studio, "get_api_key_manager_or_raise", lambda request: registry)
     monkeypatch.setattr(
@@ -186,8 +189,12 @@ async def test_trusted_selection_uses_keyless_root_identity(monkeypatch):
 
     identity = await bot_studio.selected_identity(request, ctx, "bot")
 
-    registry.get_users.assert_called_once_with(
-        "a", limit=None, role_filter="user", expose_key=False
+    registry.list_users_page.assert_awaited_once_with(
+        "a",
+        limit=None,
+        role_filter="user",
+        expose_key=False,
+        fresh=True,
     )
     assert identity == {
         "account_id": "a",

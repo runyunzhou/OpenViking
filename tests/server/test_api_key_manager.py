@@ -835,6 +835,29 @@ async def test_get_registered_user_role_returns_none_when_user_missing(manager: 
 # ---- Read-replica refresh contract ----
 
 
+async def test_explicit_fresh_list_bypasses_watcher_interval(manager_service):
+    writer = build_api_key_manager(root_key=ROOT_KEY, viking_fs=manager_service.viking_fs)
+    reader = build_api_key_manager(
+        root_key=ROOT_KEY,
+        viking_fs=manager_service.viking_fs,
+        account_store_watch_enabled=True,
+        account_store_watch_interval_seconds=300,
+    )
+    await writer.load()
+    await reader.load()
+    acct = _uid()
+    try:
+        await writer.create_account(acct, "alice")
+        await writer.register_user(acct, "bob")
+
+        page = await reader.list_users_page(acct, limit=None, fresh=True)
+
+        assert {user["user_id"] for user in page["users"]} == {"alice", "bob"}
+    finally:
+        await reader.close()
+        await writer.close()
+
+
 async def test_watched_reader_accepts_user_registered_by_writer(manager_service):
     writer = build_api_key_manager(root_key=ROOT_KEY, viking_fs=manager_service.viking_fs)
     await writer.load()
