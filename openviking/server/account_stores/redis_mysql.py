@@ -683,6 +683,18 @@ class RedisMySQLAccountStore(AccountStore):
     async def get_account(self, account_id: str) -> AccountSummary | None:
         return await self._mysql.get_account(account_id)
 
+    async def create_account(
+        self,
+        account_id: str,
+        admin_user_id: str,
+    ) -> None:
+        await self._mutate_account(
+            account_id,
+            lambda: self._mysql.create_account(account_id, admin_user_id),
+            lambda: self._user_cache_keys(account_id, admin_user_id),
+            account_wide=True,
+        )
+
     async def create_account_with_api_key(
         self,
         account_id: str,

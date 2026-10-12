@@ -436,6 +436,30 @@ class MySQLAccountStore(AccountStore):
             )
         return UserSummary(user_id=user.user_id, role=user.role) if user else None
 
+    async def create_account(
+        self,
+        account_id: str,
+        admin_user_id: str,
+    ) -> None:
+        _validate(account_id, validate_account_id, "account_id")
+        _validate(admin_user_id, validate_user_id, "admin_user_id")
+        try:
+            async with self._transaction() as session:
+                account = Account(resource_id=self._resource_id, account_id=account_id)
+                session.add(account)
+                await session.flush()
+                session.add(
+                    User(
+                        resource_id=self._resource_id,
+                        account_pk=account.account_pk,
+                        user_id=admin_user_id,
+                        role=Role.ADMIN,
+                    )
+                )
+                await session.flush()
+        except IntegrityError as exc:
+            raise AlreadyExistsError(account_id, "account") from exc
+
     async def create_account_with_api_key(
         self,
         account_id: str,
