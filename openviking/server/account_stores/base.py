@@ -29,6 +29,13 @@ class AccountStore(ABC):
     async def get_account(self, account_id: str) -> AccountSummary | None: ...
 
     @abstractmethod
+    async def create_account(
+        self,
+        account_id: str,
+        admin_user_id: str,
+    ) -> None: ...
+
+    @abstractmethod
     async def create_account_with_api_key(
         self,
         account_id: str,

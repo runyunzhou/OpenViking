@@ -383,7 +383,7 @@ async def test_studio_full_configuration_preview_and_save_are_root_only(
     path = tmp_path / "startup.conf"
     server = {"port": 1933}
     if cli_host:
-        server.update(host="0.0.0.0", auth_mode="trusted")
+        server.update(host="0.0.0.0", auth_mode="trusted", root_api_key=ROOT_KEY)
         lightweight_admin_app.state.server_config_overrides = {"host": cli_host}
     path.write_text(json.dumps({"server": server, "storage": {"workspace": "/tmp/old"}}))
     monkeypatch.setattr(OpenVikingConfigSingleton, "_config_file", path)
@@ -1955,6 +1955,7 @@ async def test_user_memory_policy_can_be_initialized_and_hot_updated(
     assert get_settings.json()["result"]["memory_policy"] == {
         "self": {"enabled": True},
         "peer": {"enabled": True},
+        "working_memory": {"enabled": False},
         "memory_types": ["profile"],
     }
 
@@ -2006,6 +2007,7 @@ async def test_user_memory_policy_can_be_initialized_and_hot_updated(
     assert reset_settings.json()["result"]["memory_policy"] == {
         "self": {"enabled": True},
         "peer": {"enabled": True},
+        "working_memory": {"enabled": False},
         "memory_types": ["events"],
     }
 
@@ -2042,6 +2044,7 @@ async def test_user_memory_policy_uses_server_default_without_user_override(
     assert get_settings.json()["result"]["memory_policy"] == {
         "self": {"enabled": True},
         "peer": {"enabled": True},
+        "working_memory": {"enabled": False},
         "memory_types": ["profile"],
     }
 
@@ -3026,21 +3029,24 @@ async def trusted_admin_app(admin_service):
     from openviking.server.auth.plugins import TrustedAuthPlugin
     from openviking.server.auth.registry import get_registry
 
-    config = ServerConfig(auth_mode="trusted", root_api_key=ROOT_KEY)
+    config = ServerConfig(
+        auth_mode="trusted",
+        root_api_key=ROOT_KEY,
+        trusted_identity_flush_interval_seconds=0,
+    )
     app = create_app(config=config, service=admin_service)
     set_service(admin_service)
-    manager = build_api_key_manager(root_key=ROOT_KEY, viking_fs=admin_service.viking_fs)
-    await manager.load()
-    # Create test users for trusted mode tests if they don't exist
-    if await manager.get_account("platform") is None:
-        await manager.create_account("platform", "gateway-admin")
-    app.state.api_key_manager = manager
 
-    # Set auth plugin (lifespan not triggered in ASGI tests)
+    # Initialize the plugin directly because the ASGI transport does not run lifespan.
     registry = get_registry()
     if registry.get("trusted") is None:
         registry.register(TrustedAuthPlugin)
     app.state.auth_plugin = registry.get("trusted")()
+    await app.state.auth_plugin.initialize(app, admin_service, config)
+
+    manager = app.state.api_key_manager
+    if await manager.get_account("platform") is None:
+        await manager.create_account("platform", "gateway-admin")
 
     return app
 
@@ -3116,6 +3122,24 @@ async def test_trusted_mode_admin_can_register_user_in_own_account(
     assert resp.json()["result"]["account_id"] == acct
     assert resp.json()["result"]["user_id"] == "bob"
     assert "user_key" not in resp.json()["result"]
+
+    users = await trusted_admin_client.get(
+        f"/api/v1/admin/accounts/{acct}/users",
+        params={"include_credentials": "false"},
+        headers=trusted_headers(account=acct, user="alice", include_api_key=True),
+    )
+    assert users.status_code == 200
+    assert all(
+        user["api_key_available"] is False
+        for user in users.json()["result"]
+    )
+
+    rotated = await trusted_admin_client.post(
+        f"/api/v1/admin/accounts/{acct}/users/bob/key",
+        headers=root_headers(),
+    )
+    assert rotated.status_code == 412
+    assert rotated.json()["error"]["code"] == "FAILED_PRECONDITION"
 
 
 async def test_trusted_mode_admin_can_list_users_with_account_only_in_url(

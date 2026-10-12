@@ -446,13 +446,13 @@ class FileStore(AccountStore):
         mod_time = info.get("modTime", info.get("mod_time", info.get("mtime")))
         return (path, size, mod_time)
 
-    async def _create_account_with_api_key(
+    async def _create_account_identity(
         self,
         account_id: str,
         admin_user_id: str,
-        api_key: str,
+        api_key: str | None = None,
     ) -> None:
-        """Create an account, its first admin, and the admin credential."""
+        """Create an account and its first admin, optionally with a credential."""
         if error := validate_account_id(account_id):
             raise InvalidArgumentError(error)
         if error := validate_user_id(admin_user_id):
@@ -461,14 +461,15 @@ class FileStore(AccountStore):
             raise AlreadyExistsError(account_id, "account")
 
         now = datetime.now(timezone.utc).isoformat()
-        stored_key = (
-            self._hash_api_key(api_key)
-            if self._api_key_hashing_enabled
-            else api_key
-        )
-        user_info = {"role": "admin", "key": stored_key}
-        if self._api_key_hashing_enabled:
-            user_info["key_prefix"] = self._get_key_prefix(api_key)
+        user_info = {"role": "admin"}
+        if api_key is not None:
+            user_info["key"] = (
+                self._hash_api_key(api_key)
+                if self._api_key_hashing_enabled
+                else api_key
+            )
+            if self._api_key_hashing_enabled:
+                user_info["key_prefix"] = self._get_key_prefix(api_key)
         self._accounts[account_id] = AccountInfo(
             created_at=now,
             users={admin_user_id: user_info},
@@ -1470,11 +1471,20 @@ class FileStore(AccountStore):
     ) -> None:
         async with self._mutation_lock:
             await self._refresh_accounts_for_management_read_unlocked()
-            await self._create_account_with_api_key(
+            await self._create_account_identity(
                 account_id,
                 admin_user_id,
                 api_key,
             )
+
+    async def create_account(
+        self,
+        account_id: str,
+        admin_user_id: str,
+    ) -> None:
+        async with self._mutation_lock:
+            await self._refresh_accounts_for_management_read_unlocked()
+            await self._create_account_identity(account_id, admin_user_id)
 
     async def create_user(self, account_id: str, user_id: str, role: str) -> None:
         async with self._mutation_lock:
