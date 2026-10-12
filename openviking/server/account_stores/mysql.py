@@ -558,7 +558,9 @@ class MySQLAccountStore(AccountStore):
         role_filter: str | None = None,
         page: int = 1,
         query_filter: str | None = None,
+        fresh: bool = False,
     ) -> UsersPage:
+        del fresh
         async with self._session_factory() as session:
             # One HTTP response must derive its rows and summary from one MVCC snapshot.
             await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
