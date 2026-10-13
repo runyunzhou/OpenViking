@@ -25,6 +25,7 @@ from openviking.server.account_stores.models import (
 from openviking.server.account_stores.mysql import MySQLAccountStore
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils import get_logger
+from openviking_cli.utils.config.config_utils import normalize_service_name
 
 logger = get_logger(__name__)
 T = TypeVar("T")
@@ -124,10 +125,15 @@ class RedisMySQLAccountStore(AccountStore):
     def __init__(
         self,
         *,
+        service_name: str,
         params: dict[str, object] | None = None,
         mysql_store: MySQLAccountStore | None = None,
         redis_client: Any | None = None,
     ) -> None:
+        try:
+            normalized_service_name = normalize_service_name(service_name)
+        except ValueError as exc:
+            raise InvalidArgumentError(str(exc)) from None
         values = dict(params or {})
         mysql_params = values.pop("mysql", None)
         redis_params = values.pop("redis", None)
@@ -137,7 +143,14 @@ class RedisMySQLAccountStore(AccountStore):
         if mysql_store is None:
             if not isinstance(mysql_params, dict):
                 raise InvalidArgumentError("redis_mysql account storage requires mysql parameters")
-            mysql_store = MySQLAccountStore(params=mysql_params)
+            mysql_store = MySQLAccountStore(
+                service_name=normalized_service_name,
+                params=mysql_params,
+            )
+        elif mysql_store._service_name != normalized_service_name:
+            raise InvalidArgumentError(
+                "Redis and MySQL account stores must use the same service_name"
+            )
         if not isinstance(redis_params, dict):
             raise InvalidArgumentError("redis_mysql account storage requires redis parameters")
 
@@ -167,7 +180,7 @@ class RedisMySQLAccountStore(AccountStore):
 
         self._mysql = mysql_store
         self._index_ttl_seconds = self._ttl_seconds + self._lock_ttl_seconds
-        self._resource_id = mysql_store._resource_id
+        self._service_name = normalized_service_name
         self._redis = redis_client
         self._redis_url = url
         self._owns_redis = redis_client is None
@@ -204,7 +217,7 @@ class RedisMySQLAccountStore(AccountStore):
             await self._mysql.close()
 
     def _account_tag(self, account_id: str) -> str:
-        return _key_part(f"{self._resource_id}\0{account_id}")
+        return _key_part(f"{self._service_name}\0{account_id}")
 
     def _key(self, account_id: str, suffix: str) -> str:
         return f"{self._key_prefix}:v1:{{{self._account_tag(account_id)}}}:{suffix}"
@@ -234,11 +247,11 @@ class RedisMySQLAccountStore(AccountStore):
         return self._key(account_id, f"credential-fence:user:{_key_part(user_id)}")
 
     def _binding_key(self, account_id: str, api_key: str) -> str:
-        digest_input = self._resource_id + "\0" + api_key
+        digest_input = self._service_name + "\0" + api_key
         return self._key(account_id, f"binding:{_digest(digest_input)}")
 
     def _negative_binding_key(self, account_id: str, api_key: str, user_id_hint: str | None) -> str:
-        digest_input = self._resource_id + "\0" + api_key + "\0" + (user_id_hint or "")
+        digest_input = self._service_name + "\0" + api_key + "\0" + (user_id_hint or "")
         return self._key(account_id, f"binding-miss:{_digest(digest_input)}")
 
     def _binding_cache_keys(self, account_id: str, api_key: str, user_id: str) -> tuple[str, ...]:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 """Fixed SQLAlchemy schema for the MySQL account-store provider.
 
-``resource_id`` is the tenant boundary. It is deliberately present in every
+``service_name`` is the tenant boundary. It is deliberately present in every
 primary lookup, unique key, and foreign-key relationship so one database can
 hold many OpenViking deployments safely.
 """
@@ -34,25 +34,25 @@ class Account(Base):
     __tablename__ = "ov_accounts"
     __table_args__ = (
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_id",
             name="uq_ov_accounts_account_identity",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_pk",
-            name="uq_ov_accounts_account_resource_pk",
+            name="uq_ov_accounts_account_service_pk",
         ),
         Index(
             "ix_ov_accounts_account_deletion",
-            "resource_id",
+            "service_name",
             "deletion_task_id",
         ),
         {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},
     )
 
     account_pk: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    resource_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+    service_name: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     account_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     created_at: Mapped[object] = mapped_column(
         DATETIME(fsp=6), server_default=text("CURRENT_TIMESTAMP(6)")
@@ -70,44 +70,44 @@ class User(Base):
     __tablename__ = "ov_accounts_users"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["resource_id", "account_pk"],
-            ["ov_accounts.resource_id", "ov_accounts.account_pk"],
+            ["service_name", "account_pk"],
+            ["ov_accounts.service_name", "ov_accounts.account_pk"],
             ondelete="CASCADE",
             name="fk_ov_accounts_user_account",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_pk",
             "user_id",
             name="uq_ov_accounts_user_identity",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "user_pk",
-            name="uq_ov_accounts_user_resource_pk",
+            name="uq_ov_accounts_user_service_pk",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_pk",
             "user_pk",
             name="uq_ov_accounts_user_account_pk",
         ),
         Index(
             "ix_ov_accounts_user_admin",
-            "resource_id",
+            "service_name",
             "account_pk",
             "role",
         ),
         Index(
             "ix_ov_accounts_user_deletion",
-            "resource_id",
+            "service_name",
             "deletion_task_id",
         ),
         {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},
     )
 
     user_pk: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    resource_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+    service_name: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     account_pk: Mapped[int] = mapped_column(BigInteger)
     user_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     role: Mapped[str] = mapped_column(String(16))
@@ -127,24 +127,24 @@ class Group(Base):
     __tablename__ = "ov_accounts_groups"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["resource_id", "account_pk"],
-            ["ov_accounts.resource_id", "ov_accounts.account_pk"],
+            ["service_name", "account_pk"],
+            ["ov_accounts.service_name", "ov_accounts.account_pk"],
             ondelete="CASCADE",
             name="fk_ov_accounts_group_account",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_pk",
             "group_id",
             name="uq_ov_accounts_group_identity",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "group_pk",
-            name="uq_ov_accounts_group_resource_pk",
+            name="uq_ov_accounts_group_service_pk",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "account_pk",
             "group_pk",
             name="uq_ov_accounts_group_account_pk",
@@ -153,7 +153,7 @@ class Group(Base):
     )
 
     group_pk: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    resource_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+    service_name: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     account_pk: Mapped[int] = mapped_column(BigInteger)
     group_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     created_at: Mapped[object] = mapped_column(
@@ -164,11 +164,11 @@ class Group(Base):
 class GroupMember(Base):
     __tablename__ = "ov_accounts_group_members"
     __table_args__ = (
-        PrimaryKeyConstraint("resource_id", "account_pk", "group_pk", "user_pk"),
+        PrimaryKeyConstraint("service_name", "account_pk", "group_pk", "user_pk"),
         ForeignKeyConstraint(
-            ["resource_id", "account_pk", "group_pk"],
+            ["service_name", "account_pk", "group_pk"],
             [
-                "ov_accounts_groups.resource_id",
+                "ov_accounts_groups.service_name",
                 "ov_accounts_groups.account_pk",
                 "ov_accounts_groups.group_pk",
             ],
@@ -176,9 +176,9 @@ class GroupMember(Base):
             name="fk_ov_accounts_member_group",
         ),
         ForeignKeyConstraint(
-            ["resource_id", "account_pk", "user_pk"],
+            ["service_name", "account_pk", "user_pk"],
             [
-                "ov_accounts_users.resource_id",
+                "ov_accounts_users.service_name",
                 "ov_accounts_users.account_pk",
                 "ov_accounts_users.user_pk",
             ],
@@ -187,14 +187,14 @@ class GroupMember(Base):
         ),
         Index(
             "ix_ov_accounts_member_user",
-            "resource_id",
+            "service_name",
             "account_pk",
             "user_pk",
         ),
         {"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},
     )
 
-    resource_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+    service_name: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     account_pk: Mapped[int] = mapped_column(BigInteger)
     group_pk: Mapped[int] = mapped_column(BigInteger)
     user_pk: Mapped[int] = mapped_column(BigInteger)
@@ -204,26 +204,26 @@ class Credential(Base):
     __tablename__ = "ov_accounts_credentials"
     __table_args__ = (
         ForeignKeyConstraint(
-            ["resource_id", "user_pk"],
-            ["ov_accounts_users.resource_id", "ov_accounts_users.user_pk"],
+            ["service_name", "user_pk"],
+            ["ov_accounts_users.service_name", "ov_accounts_users.user_pk"],
             ondelete="CASCADE",
             name="fk_ov_accounts_credential_user",
         ),
         UniqueConstraint(
-            "resource_id",
+            "service_name",
             "active_user_pk",
             name="uq_ov_accounts_active_credential",
         ),
         Index(
             "ix_ov_accounts_credential_lookup",
-            "resource_id",
+            "service_name",
             "lookup_digest",
             "revoked",
             "user_pk",
         ),
         Index(
             "ix_ov_accounts_credential_history",
-            "resource_id",
+            "service_name",
             "user_pk",
             "revoked",
             "sequence",
@@ -232,7 +232,7 @@ class Credential(Base):
     )
 
     credential_id: Mapped[str] = mapped_column(String(32, collation="ascii_bin"), primary_key=True)
-    resource_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+    service_name: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
     user_pk: Mapped[int] = mapped_column(BigInteger)
     material: Mapped[str] = mapped_column(Text(collation="ascii_bin"))
     lookup_digest: Mapped[str] = mapped_column(String(64, collation="ascii_bin"))

@@ -330,20 +330,21 @@ async def test_file_user_deletion_fence_survives_concurrent_role_update():
     assert (await store.get_deletion("acme", "bob"))["task_id"] == "delete"
 
 
-def test_mysql_requires_resource_id(monkeypatch):
-    monkeypatch.delenv("OV_RESOURCE_ID", raising=False)
-    with pytest.raises(InvalidArgumentError, match="OV_RESOURCE_ID is required"):
-        MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+def test_mysql_uses_service_name_instead_of_resource_id_env(monkeypatch):
+    monkeypatch.setenv("OV_RESOURCE_ID", "ignored-resource")
+    store = MySQLAccountStore(
+        service_name="account-cluster",
+        params={"user": "unused", "password": "unused", "database": "unused"},
+    )
+    assert store._service_name == "account-cluster"
 
 
-def test_mysql_resource_id_must_fit_schema(monkeypatch):
+def test_mysql_service_name_must_fit_schema():
     params = {"user": "unused", "password": "unused", "database": "unused"}
-    monkeypatch.setenv("OV_RESOURCE_ID", "r" * 255)
-    MySQLAccountStore(params=params)
+    MySQLAccountStore(service_name="r" * 255, params=params)
 
-    monkeypatch.setenv("OV_RESOURCE_ID", "r" * 256)
-    with pytest.raises(InvalidArgumentError, match="OV_RESOURCE_ID must not exceed 255"):
-        MySQLAccountStore(params=params)
+    with pytest.raises(InvalidArgumentError, match="service_name must not exceed 255"):
+        MySQLAccountStore(service_name="r" * 256, params=params)
 
 
 @pytest.mark.parametrize(
@@ -395,30 +396,34 @@ def test_mysql_resource_id_must_fit_schema(monkeypatch):
         ),
     ],
 )
-async def test_mysql_identifiers_must_fit_schema(monkeypatch, operation):
-    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
-    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+async def test_mysql_identifiers_must_fit_schema(operation):
+    store = MySQLAccountStore(
+        service_name="test-service",
+        params={"user": "unused", "password": "unused", "database": "unused"},
+    )
 
     with pytest.raises(InvalidArgumentError, match="must not exceed 255 characters"):
         await operation(store, "a" * 256)
 
 
-def test_mysql_rejects_removed_table_parameter(monkeypatch):
-    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
+def test_mysql_rejects_removed_table_parameter():
     with pytest.raises(InvalidArgumentError, match="Unknown MySQL account store parameters: table"):
         MySQLAccountStore(
+            service_name="test-service",
             params={
                 "user": "unused",
                 "password": "unused",
                 "database": "unused",
                 "table": "tenant_accounts",
-            }
+            },
         )
 
 
 async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypatch):
-    monkeypatch.setenv("OV_RESOURCE_ID", "test-resource")
-    store = MySQLAccountStore(params={"user": "unused", "password": "unused", "database": "unused"})
+    store = MySQLAccountStore(
+        service_name="test-service",
+        params={"user": "unused", "password": "unused", "database": "unused"},
+    )
 
     class FakeEngine:
         disposed = False
@@ -463,11 +468,11 @@ async def test_file_store_rejects_deleting_nonempty_group():
     assert await store.get_group_members("acme", "engineering") == ["alice"]
 
 
-async def test_mysql_managers_share_authoritative_state(monkeypatch):
+async def test_mysql_managers_share_authoritative_state():
     raw = os.environ.get("OV_TEST_MYSQL")
     if not raw:
         pytest.skip("Set OV_TEST_MYSQL to connection JSON for the MySQL test")
-    monkeypatch.setenv("OV_RESOURCE_ID", f"test-{uuid4().hex}")
+    service_name = f"test-{uuid4().hex}"
     encryption_key = base64.urlsafe_b64encode(b"k" * 32).decode()
     params = {
         **json.loads(raw),
@@ -476,12 +481,22 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
     first = build_api_key_manager(
         "root",
         None,
+        service_name=service_name,
         account_store_provider="mysql",
         account_store_params={**params, "credential_storage": "encrypted"},
     )
     second = build_api_key_manager(
         "root",
         None,
+        service_name=service_name,
+        account_store_provider="mysql",
+        account_store_params={**params, "credential_storage": "hash"},
+    )
+    isolated_service_name = f"test-{uuid4().hex}"
+    isolated = build_api_key_manager(
+        "root",
+        None,
+        service_name=isolated_service_name,
         account_store_provider="mysql",
         account_store_params={**params, "credential_storage": "hash"},
     )
@@ -489,11 +504,12 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
     async with setup_engine.begin() as connection:
         await connection.run_sync(Base.metadata.create_all)
         await connection.execute(
-            delete(Account).where(Account.resource_id == first._store._resource_id)
+            delete(Account).where(Account.service_name.in_([service_name, isolated_service_name]))
         )
     await setup_engine.dispose()
     await first.load()
     await second.load()
+    await isolated.load()
     try:
         trusted_results = await asyncio.gather(
             first.ensure_trusted_identities({"trusted": {"alice", "bob"}}),
@@ -543,10 +559,25 @@ async def test_mysql_managers_share_authoritative_state(monkeypatch):
         await first.create_group("acme", "engineering")
         await first.add_group_member("acme", "engineering", "alice")
         assert await second.get_user_group_ids("acme", "alice") == ("engineering",)
+
+        assert await isolated.get_account("acme") is None
+        isolated_key = await isolated.create_account("acme", "alice")
+        assert (await isolated.resolve_identity(isolated_key)).role == Role.ADMIN
+        with pytest.raises(UnauthenticatedError):
+            await isolated.resolve_identity(rotated)
+        with pytest.raises(UnauthenticatedError):
+            await first.resolve_identity(isolated_key)
+        await isolated.register_user("acme", "dave")
+        await isolated.set_role("acme", "dave", Role.ADMIN)
+        assert await isolated.get_registered_user_role("acme", "dave") == Role.ADMIN
+        assert await first.get_registered_user_role("acme", "dave") == Role.USER
     finally:
         async with first._store._engine.begin() as connection:
             await connection.execute(
-                delete(Account).where(Account.resource_id == first._store._resource_id)
+                delete(Account).where(
+                    Account.service_name.in_([service_name, isolated_service_name])
+                )
             )
+        await isolated.close()
         await second.close()
         await first.close()

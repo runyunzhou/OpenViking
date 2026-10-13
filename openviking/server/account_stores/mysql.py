@@ -8,7 +8,6 @@ import base64
 import binascii
 import hashlib
 import hmac
-import os
 import secrets
 import ssl as ssl_module
 from contextlib import asynccontextmanager
@@ -55,6 +54,7 @@ from openviking_cli.session.user_id import (
     validate_identifier_part,
     validate_user_id,
 )
+from openviking_cli.utils.config.config_utils import normalize_service_name
 
 _MYSQL_IDENTIFIER_MAX_LENGTH = 255
 
@@ -121,14 +121,20 @@ def _deletion(record) -> DeletionRecord | None:
 
 
 class MySQLAccountStore(AccountStore):
-    """A manually provisioned relational account store scoped by ``resource_id``."""
+    """A manually provisioned relational account store scoped by service name."""
 
-    def __init__(self, *, params: dict[str, object] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        service_name: str,
+        params: dict[str, object] | None = None,
+    ) -> None:
         values = dict(params or {})
-        self._resource_id = os.environ.get("OV_RESOURCE_ID", "").strip()
-        if not self._resource_id:
-            raise InvalidArgumentError("OV_RESOURCE_ID is required for MySQL account storage")
-        _validate_length(self._resource_id, "OV_RESOURCE_ID")
+        try:
+            self._service_name = normalize_service_name(service_name)
+        except ValueError as exc:
+            raise InvalidArgumentError(str(exc)) from None
+        _validate_length(self._service_name, "service_name")
 
         credential_storage = values.pop("credential_storage", "hash")
         encryption_key = values.pop("credential_encryption_key", None)
@@ -214,7 +220,7 @@ class MySQLAccountStore(AccountStore):
     ):
         return Credential(
             credential_id=uuid4().hex,
-            resource_id=self._resource_id,
+            service_name=self._service_name,
             user_pk=user_pk,
             active_user_pk=user_pk,
             material=self._encode_credential(account_id, user_id, api_key),
@@ -339,7 +345,7 @@ class MySQLAccountStore(AccountStore):
         account = await session.scalar(
             select(Account)
             .where(
-                Account.resource_id == self._resource_id,
+                Account.service_name == self._service_name,
                 Account.account_id == account_id,
             )
             .with_for_update()
@@ -352,7 +358,7 @@ class MySQLAccountStore(AccountStore):
         user = await session.scalar(
             select(User)
             .where(
-                User.resource_id == self._resource_id,
+                User.service_name == self._service_name,
                 User.account_pk == account.account_pk,
                 User.user_id == user_id,
             )
@@ -377,7 +383,7 @@ class MySQLAccountStore(AccountStore):
             select(func.count())
             .select_from(User)
             .where(
-                User.resource_id == self._resource_id,
+                User.service_name == self._service_name,
                 User.account_pk == account.account_pk,
                 User.role == Role.ADMIN,
                 User.deletion_task_id.is_(None),
@@ -404,12 +410,12 @@ class MySQLAccountStore(AccountStore):
                     .outerjoin(
                         User,
                         and_(
-                            User.resource_id == Account.resource_id,
+                            User.service_name == Account.service_name,
                             User.account_pk == Account.account_pk,
                         ),
                     )
                     .where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.account_id == account_id,
                     )
                     .group_by(Account.account_pk)
@@ -424,12 +430,12 @@ class MySQLAccountStore(AccountStore):
                 .join(
                     Account,
                     and_(
-                        Account.resource_id == User.resource_id,
+                        Account.service_name == User.service_name,
                         Account.account_pk == User.account_pk,
                     ),
                 )
                 .where(
-                    User.resource_id == self._resource_id,
+                    User.service_name == self._service_name,
                     Account.account_id == account_id,
                     User.user_id == user_id,
                 )
@@ -445,12 +451,12 @@ class MySQLAccountStore(AccountStore):
         _validate(admin_user_id, validate_user_id, "admin_user_id")
         try:
             async with self._transaction() as session:
-                account = Account(resource_id=self._resource_id, account_id=account_id)
+                account = Account(service_name=self._service_name, account_id=account_id)
                 session.add(account)
                 await session.flush()
                 session.add(
                     User(
-                        resource_id=self._resource_id,
+                        service_name=self._service_name,
                         account_pk=account.account_pk,
                         user_id=admin_user_id,
                         role=Role.ADMIN,
@@ -470,11 +476,11 @@ class MySQLAccountStore(AccountStore):
         _validate(admin_user_id, validate_user_id, "admin_user_id")
         try:
             async with self._transaction() as session:
-                account = Account(resource_id=self._resource_id, account_id=account_id)
+                account = Account(service_name=self._service_name, account_id=account_id)
                 session.add(account)
                 await session.flush()
                 user = User(
-                    resource_id=self._resource_id,
+                    service_name=self._service_name,
                     account_pk=account.account_pk,
                     user_id=admin_user_id,
                     role=Role.ADMIN,
@@ -502,7 +508,7 @@ class MySQLAccountStore(AccountStore):
                 self._require_active(account)
                 session.add(
                     User(
-                        resource_id=self._resource_id,
+                        service_name=self._service_name,
                         account_pk=account.account_pk,
                         user_id=user_id,
                         role=role,
@@ -526,7 +532,7 @@ class MySQLAccountStore(AccountStore):
                 account = await self._lock_account(session, account_id)
                 self._require_active(account)
                 user = User(
-                    resource_id=self._resource_id,
+                    service_name=self._service_name,
                     account_pk=account.account_pk,
                     user_id=user_id,
                     role=role,
@@ -556,7 +562,7 @@ class MySQLAccountStore(AccountStore):
         page: int = 1,
         query_filter: str | None = None,
     ) -> list[AccountSummary]:
-        predicates = [Account.resource_id == self._resource_id]
+        predicates = [Account.service_name == self._service_name]
         if name_filter:
             predicates.append(Account.account_id.like(_like_pattern(name_filter), escape="="))
         if query := (query_filter or "").strip():
@@ -571,7 +577,7 @@ class MySQLAccountStore(AccountStore):
             .outerjoin(
                 User,
                 and_(
-                    User.resource_id == Account.resource_id,
+                    User.service_name == Account.service_name,
                     User.account_pk == Account.account_pk,
                 ),
             )
@@ -601,7 +607,7 @@ class MySQLAccountStore(AccountStore):
             await session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
             account = await self._account_for_read(session, account_id)
             base = [
-                User.resource_id == self._resource_id,
+                User.service_name == self._service_name,
                 User.account_pk == account.account_pk,
                 User.deletion_task_id.is_(None),
             ]
@@ -619,7 +625,7 @@ class MySQLAccountStore(AccountStore):
                 .join(
                     User,
                     and_(
-                        User.resource_id == Credential.resource_id,
+                        User.service_name == Credential.service_name,
                         User.user_pk == Credential.user_pk,
                     ),
                 )
@@ -649,7 +655,7 @@ class MySQLAccountStore(AccountStore):
                     for credential in (
                         await session.scalars(
                             select(Credential).where(
-                                Credential.resource_id == self._resource_id,
+                                Credential.service_name == self._service_name,
                                 Credential.user_pk.in_([user.user_pk for user in users]),
                                 Credential.revoked.is_(False),
                             )
@@ -699,7 +705,7 @@ class MySQLAccountStore(AccountStore):
                 account = await session.scalar(
                     select(Account)
                     .where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.account_id == account_id,
                     )
                     .with_for_update()
@@ -708,7 +714,7 @@ class MySQLAccountStore(AccountStore):
                     try:
                         async with session.begin_nested():
                             account = Account(
-                                resource_id=self._resource_id,
+                                service_name=self._service_name,
                                 account_id=account_id,
                             )
                             session.add(account)
@@ -722,7 +728,7 @@ class MySQLAccountStore(AccountStore):
                     (
                         await session.scalars(
                             select(User.user_id).where(
-                                User.resource_id == self._resource_id,
+                                User.service_name == self._service_name,
                                 User.account_pk == account.account_pk,
                                 User.user_id.in_(user_ids),
                             )
@@ -732,7 +738,7 @@ class MySQLAccountStore(AccountStore):
                 for user_id in sorted(user_ids - existing):
                     session.add(
                         User(
-                            resource_id=self._resource_id,
+                            service_name=self._service_name,
                             account_pk=account.account_pk,
                             user_id=user_id,
                             role=Role.USER,
@@ -829,7 +835,7 @@ class MySQLAccountStore(AccountStore):
             async with self._session_factory() as session:
                 account = await session.scalar(
                     select(Account).where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.account_id == account_id,
                     )
                 )
@@ -842,13 +848,13 @@ class MySQLAccountStore(AccountStore):
                     .outerjoin(
                         User,
                         and_(
-                            User.resource_id == Account.resource_id,
+                            User.service_name == Account.service_name,
                             User.account_pk == Account.account_pk,
                             User.user_id == user_id,
                         ),
                     )
                     .where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.account_id == account_id,
                     )
                 )
@@ -863,7 +869,7 @@ class MySQLAccountStore(AccountStore):
             accounts = (
                 await session.scalars(
                     select(Account).where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.deletion_task_id.is_not(None),
                     )
                 )
@@ -874,12 +880,12 @@ class MySQLAccountStore(AccountStore):
                     .join(
                         User,
                         and_(
-                            User.resource_id == Account.resource_id,
+                            User.service_name == Account.service_name,
                             User.account_pk == Account.account_pk,
                         ),
                     )
                     .where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.deletion_task_id.is_(None),
                         User.deletion_task_id.is_not(None),
                     )
@@ -901,7 +907,7 @@ class MySQLAccountStore(AccountStore):
                 self._require_active(account)
                 session.add(
                     Group(
-                        resource_id=self._resource_id,
+                        service_name=self._service_name,
                         account_pk=account.account_pk,
                         group_id=group_id,
                     )
@@ -914,7 +920,7 @@ class MySQLAccountStore(AccountStore):
     async def _account_for_read(self, session: AsyncSession, account_id: str):
         account = await session.scalar(
             select(Account).where(
-                Account.resource_id == self._resource_id,
+                Account.service_name == self._service_name,
                 Account.account_id == account_id,
             )
         )
@@ -931,13 +937,13 @@ class MySQLAccountStore(AccountStore):
                     .outerjoin(
                         GroupMember,
                         and_(
-                            GroupMember.resource_id == Group.resource_id,
+                            GroupMember.service_name == Group.service_name,
                             GroupMember.account_pk == Group.account_pk,
                             GroupMember.group_pk == Group.group_pk,
                         ),
                     )
                     .where(
-                        Group.resource_id == self._resource_id,
+                        Group.service_name == self._service_name,
                         Group.account_pk == account.account_pk,
                     )
                     .group_by(Group.group_pk)
@@ -951,7 +957,7 @@ class MySQLAccountStore(AccountStore):
             account = await self._account_for_read(session, account_id)
             group = await session.scalar(
                 select(Group).where(
-                    Group.resource_id == self._resource_id,
+                    Group.service_name == self._service_name,
                     Group.account_pk == account.account_pk,
                     Group.group_id == group_id,
                 )
@@ -965,13 +971,13 @@ class MySQLAccountStore(AccountStore):
                         .join(
                             GroupMember,
                             and_(
-                                GroupMember.resource_id == User.resource_id,
+                                GroupMember.service_name == User.service_name,
                                 GroupMember.account_pk == User.account_pk,
                                 GroupMember.user_pk == User.user_pk,
                             ),
                         )
                         .where(
-                            GroupMember.resource_id == self._resource_id,
+                            GroupMember.service_name == self._service_name,
                             GroupMember.account_pk == account.account_pk,
                             GroupMember.group_pk == group.group_pk,
                         )
@@ -989,14 +995,14 @@ class MySQLAccountStore(AccountStore):
                     .join(
                         User,
                         and_(
-                            User.resource_id == Account.resource_id,
+                            User.service_name == Account.service_name,
                             User.account_pk == Account.account_pk,
                         ),
                     )
                     .outerjoin(
                         GroupMember,
                         and_(
-                            GroupMember.resource_id == User.resource_id,
+                            GroupMember.service_name == User.service_name,
                             GroupMember.account_pk == User.account_pk,
                             GroupMember.user_pk == User.user_pk,
                         ),
@@ -1004,13 +1010,13 @@ class MySQLAccountStore(AccountStore):
                     .outerjoin(
                         Group,
                         and_(
-                            Group.resource_id == GroupMember.resource_id,
+                            Group.service_name == GroupMember.service_name,
                             Group.account_pk == GroupMember.account_pk,
                             Group.group_pk == GroupMember.group_pk,
                         ),
                     )
                     .where(
-                        Account.resource_id == self._resource_id,
+                        Account.service_name == self._service_name,
                         Account.account_id == account_id,
                         User.user_id == user_id,
                     )
@@ -1026,7 +1032,7 @@ class MySQLAccountStore(AccountStore):
             group = await session.scalar(
                 select(Group)
                 .where(
-                    Group.resource_id == self._resource_id,
+                    Group.service_name == self._service_name,
                     Group.account_pk == account.account_pk,
                     Group.group_id == group_id,
                 )
@@ -1039,7 +1045,7 @@ class MySQLAccountStore(AccountStore):
             if (
                 await session.scalar(
                     select(GroupMember.group_pk).where(
-                        GroupMember.resource_id == self._resource_id,
+                        GroupMember.service_name == self._service_name,
                         GroupMember.account_pk == account.account_pk,
                         GroupMember.group_pk == group.group_pk,
                         GroupMember.user_pk == user.user_pk,
@@ -1049,7 +1055,7 @@ class MySQLAccountStore(AccountStore):
             ):
                 session.add(
                     GroupMember(
-                        resource_id=self._resource_id,
+                        service_name=self._service_name,
                         account_pk=account.account_pk,
                         group_pk=group.group_pk,
                         user_pk=user.user_pk,
@@ -1064,7 +1070,7 @@ class MySQLAccountStore(AccountStore):
             group = await session.scalar(
                 select(Group)
                 .where(
-                    Group.resource_id == self._resource_id,
+                    Group.service_name == self._service_name,
                     Group.account_pk == account.account_pk,
                     Group.group_id == group_id,
                 )
@@ -1077,13 +1083,13 @@ class MySQLAccountStore(AccountStore):
                 .join(
                     User,
                     and_(
-                        User.resource_id == GroupMember.resource_id,
+                        User.service_name == GroupMember.service_name,
                         User.account_pk == GroupMember.account_pk,
                         User.user_pk == GroupMember.user_pk,
                     ),
                 )
                 .where(
-                    GroupMember.resource_id == self._resource_id,
+                    GroupMember.service_name == self._service_name,
                     GroupMember.account_pk == account.account_pk,
                     GroupMember.group_pk == group.group_pk,
                     User.account_pk == account.account_pk,
@@ -1102,7 +1108,7 @@ class MySQLAccountStore(AccountStore):
             group = await session.scalar(
                 select(Group)
                 .where(
-                    Group.resource_id == self._resource_id,
+                    Group.service_name == self._service_name,
                     Group.account_pk == account.account_pk,
                     Group.group_id == group_id,
                 )
@@ -1114,7 +1120,7 @@ class MySQLAccountStore(AccountStore):
                 select(func.count())
                 .select_from(GroupMember)
                 .where(
-                    GroupMember.resource_id == self._resource_id,
+                    GroupMember.service_name == self._service_name,
                     GroupMember.account_pk == account.account_pk,
                     GroupMember.group_pk == group.group_pk,
                 )
@@ -1132,14 +1138,14 @@ class MySQLAccountStore(AccountStore):
             self._require_active(user)
             sequence = await session.scalar(
                 select(func.coalesce(func.max(Credential.sequence), 0)).where(
-                    Credential.resource_id == self._resource_id,
+                    Credential.service_name == self._service_name,
                     Credential.user_pk == user.user_pk,
                 )
             )
             await session.execute(
                 update(Credential)
                 .where(
-                    Credential.resource_id == self._resource_id,
+                    Credential.service_name == self._service_name,
                     Credential.user_pk == user.user_pk,
                     Credential.revoked.is_(False),
                 )
@@ -1168,7 +1174,7 @@ class MySQLAccountStore(AccountStore):
         user_id_hint: str | None = None,
     ) -> tuple[str, str] | None:
         predicates = [
-            Credential.resource_id == self._resource_id,
+            Credential.service_name == self._service_name,
             Credential.lookup_digest == _credential_digest(api_key),
             Credential.revoked.is_(False),
             Account.deletion_task_id.is_(None),
@@ -1185,14 +1191,14 @@ class MySQLAccountStore(AccountStore):
                     .join(
                         User,
                         and_(
-                            User.resource_id == Credential.resource_id,
+                            User.service_name == Credential.service_name,
                             User.user_pk == Credential.user_pk,
                         ),
                     )
                     .join(
                         Account,
                         and_(
-                            Account.resource_id == User.resource_id,
+                            Account.service_name == User.service_name,
                             Account.account_pk == User.account_pk,
                         ),
                     )
@@ -1209,7 +1215,7 @@ class MySQLAccountStore(AccountStore):
             account = await session.scalar(
                 select(Account)
                 .where(
-                    Account.resource_id == self._resource_id,
+                    Account.service_name == self._service_name,
                     Account.account_id == account_id,
                 )
                 .with_for_update()
@@ -1217,14 +1223,14 @@ class MySQLAccountStore(AccountStore):
             if account is None:
                 return
             user_ids = select(User.user_pk).where(
-                User.resource_id == self._resource_id,
+                User.service_name == self._service_name,
                 User.account_pk == account.account_pk,
                 *([User.user_id == user_id] if user_id is not None else []),
             )
             await session.execute(
                 update(Credential)
                 .where(
-                    Credential.resource_id == self._resource_id,
+                    Credential.service_name == self._service_name,
                     Credential.user_pk.in_(user_ids),
                     Credential.revoked.is_(False),
                 )
@@ -1243,19 +1249,19 @@ class MySQLAccountStore(AccountStore):
                 .join(
                     User,
                     and_(
-                        User.resource_id == Credential.resource_id,
+                        User.service_name == Credential.service_name,
                         User.user_pk == Credential.user_pk,
                     ),
                 )
                 .join(
                     Account,
                     and_(
-                        Account.resource_id == User.resource_id,
+                        Account.service_name == User.service_name,
                         Account.account_pk == User.account_pk,
                     ),
                 )
                 .where(
-                    Credential.resource_id == self._resource_id,
+                    Credential.service_name == self._service_name,
                     Credential.revoked.is_(False),
                     Account.account_id == account_id,
                     Account.deletion_task_id.is_(None),

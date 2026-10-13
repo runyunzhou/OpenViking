@@ -3,12 +3,19 @@
 
 import asyncio
 import base64
+import json
+import os
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import delete
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from openviking.server.account_stores.mysql_schema import Account, Base
 from openviking.server.account_stores.redis_mysql import RedisMySQLAccountStore
 from openviking.server.api_keys.new import APIKeyManager
 from openviking.server.identity import Role
+from openviking.server.store_assembly import build_api_key_manager
 from openviking_cli.exceptions import InvalidArgumentError, UnauthenticatedError
 
 
@@ -87,8 +94,8 @@ class FakeRedis:
 
 
 class FakeMySQLAuthority:
-    def __init__(self, api_key: str, resource_id: str = "test-resource"):
-        self._resource_id = resource_id
+    def __init__(self, api_key: str, service_name: str = "test-service"):
+        self._service_name = service_name
         self.api_key = api_key
         self.account_exists = True
         self.user_exists = True
@@ -200,10 +207,11 @@ class FakeMySQLAuthority:
 
 
 def _store(
-    api_key: str, *, redis_client=None, lock_wait_seconds: int = 30, resource_id="test-resource"
+    api_key: str, *, redis_client=None, lock_wait_seconds: int = 30, service_name="test-service"
 ) -> tuple[RedisMySQLAccountStore, FakeMySQLAuthority]:
-    mysql = FakeMySQLAuthority(api_key, resource_id)
+    mysql = FakeMySQLAuthority(api_key, service_name)
     store = RedisMySQLAccountStore(
+        service_name=service_name,
         params={
             "redis": {
                 "url": "redis://unused",
@@ -237,17 +245,18 @@ def test_redis_timeouts_must_be_positive_integers():
     ):
         with pytest.raises(InvalidArgumentError, match=f"redis.{name} must be a positive integer"):
             RedisMySQLAccountStore(
+                service_name="test-service",
                 params={"redis": {"url": "redis://unused", name: value}},
                 mysql_store=mysql,
                 redis_client=FakeRedis(),
             )
 
 
-async def test_resources_do_not_share_cached_identities():
+async def test_service_names_do_not_share_cached_identities():
     redis = FakeRedis()
     first_key, second_key = _api_key("first"), _api_key("second")
-    first, _ = _store(first_key, redis_client=redis, resource_id="first")
-    second, _ = _store(second_key, redis_client=redis, resource_id="second")
+    first, _ = _store(first_key, redis_client=redis, service_name="first")
+    second, _ = _store(second_key, redis_client=redis, service_name="second")
     await first.load()
     await second.load()
     try:
@@ -261,6 +270,83 @@ async def test_resources_do_not_share_cached_identities():
     finally:
         await first.close()
         await second.close()
+
+
+async def test_real_redis_mysql_service_name_isolation():
+    raw_mysql = os.environ.get("OV_TEST_MYSQL")
+    redis_url = os.environ.get("OV_TEST_REDIS")
+    if not raw_mysql or not redis_url:
+        pytest.skip("Set OV_TEST_MYSQL and OV_TEST_REDIS for the Redis MySQL integration test")
+
+    first_service = f"test-{uuid4().hex}"
+    second_service = f"test-{uuid4().hex}"
+    key_prefix = f"ov:test:{uuid4().hex}"
+    params = {
+        "mysql": json.loads(raw_mysql),
+        "redis": {
+            "url": redis_url,
+            "key_prefix": key_prefix,
+            "ttl_seconds": 60,
+            "lock_ttl_seconds": 60,
+        },
+    }
+    first = build_api_key_manager(
+        "root",
+        None,
+        service_name=first_service,
+        account_store_provider="redis_mysql",
+        account_store_params=params,
+    )
+    second = build_api_key_manager(
+        "root",
+        None,
+        service_name=second_service,
+        account_store_provider="redis_mysql",
+        account_store_params=params,
+    )
+    setup_engine = create_async_engine(first._store._mysql._url)
+    async with setup_engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+        await connection.execute(
+            delete(Account).where(Account.service_name.in_([first_service, second_service]))
+        )
+    await setup_engine.dispose()
+
+    await first.load()
+    await second.load()
+    try:
+        first_key = await first.create_account("acme", "alice")
+        second_key = await second.create_account("acme", "alice")
+
+        assert (await first.resolve_identity(first_key)).role == Role.ADMIN
+        assert (await second.resolve_identity(second_key)).role == Role.ADMIN
+        with pytest.raises(UnauthenticatedError):
+            await first.resolve_identity(second_key)
+        with pytest.raises(UnauthenticatedError):
+            await second.resolve_identity(first_key)
+
+        first_user_key = first._store._user_key("acme", "alice")
+        second_user_key = second._store._user_key("acme", "alice")
+        assert first_user_key != second_user_key
+        assert await first._store._redis.exists(first_user_key)
+        assert await second._store._redis.exists(second_user_key)
+
+        await first.register_user("acme", "dave")
+        await second.register_user("acme", "dave")
+        await first.set_role("acme", "dave", Role.ADMIN)
+        assert await first.get_registered_user_role("acme", "dave") == Role.ADMIN
+        assert await second.get_registered_user_role("acme", "dave") == Role.USER
+    finally:
+        redis_client = first._store._redis
+        keys = [key async for key in redis_client.scan_iter(match=f"{key_prefix}:*")]
+        if keys:
+            await redis_client.delete(*keys)
+        async with first._store._mysql._engine.begin() as connection:
+            await connection.execute(
+                delete(Account).where(Account.service_name.in_([first_service, second_service]))
+            )
+        await second.close()
+        await first.close()
 
 
 async def test_cached_binding_respects_user_id_hint():

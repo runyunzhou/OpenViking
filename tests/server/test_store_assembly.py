@@ -32,6 +32,24 @@ def test_unknown_account_store_is_rejected_during_config_validation():
         AccountStoreConfig(provider="missing")
 
 
+def test_mysql_account_store_uses_service_name():
+    store = build_account_store(
+        viking_fs=None,
+        api_key_hashing_enabled=False,
+        service_name="account-cluster",
+        account_store_provider="mysql",
+        account_store_params={
+            "user": "unused",
+            "password": "unused",
+            "database": "unused",
+        },
+        account_store_watch_enabled=False,
+        account_store_watch_interval_seconds=30,
+    )
+
+    assert store._service_name == "account-cluster"
+
+
 @pytest.mark.parametrize("injected", [False, True])
 async def test_assembled_manager_supports_account_authentication(injected):
     account_store = FileStore(SimpleNamespace(agfs=InMemoryAGFS()))

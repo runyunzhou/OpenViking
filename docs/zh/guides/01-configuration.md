@@ -1909,18 +1909,19 @@ prefix；加密模式可为同一列表工作流解密展示 key。`credential_s
 迁移到哈希模式时，应保留 `credential_encryption_key`，直到所有旧加密凭证完成
 轮换。`aesgcm:v1` 记录不包含 key id，因此不支持直接替换该加密密钥。
 
-安装 MySQL extra 后，启动服务前必须设置非空的 `OV_RESOURCE_ID`。该值会作为
-每张 Account Store 表上的 `resource_id` 写入，并在多个 OpenViking resource
-共用一个数据库时充当部署隔离边界。未设置时 Provider 会拒绝启动。
+安装 MySQL extra 后，通过顶层 `service_name` 配置部署名称。该值会写入每张
+Account Store 表的 `service_name` 列，并在多个 OpenViking 集群共用一个数据库时
+充当隔离边界。修改 `service_name` 会选择另一组逻辑 Account Store 分区。
 
 Provider 不会创建或迁移数据库表。启动服务前，应通过现有 DBA 或部署流程手工创建
 `openviking/server/account_stores/sql/init.sql` 中定义的规范化表。后续经评审的
 schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`。
-五张 `ov_accounts*` 表的名称固定；多个 OpenViking resource 共用数据库时，
-通过 `OV_RESOURCE_ID` 隔离部署，不使用不同表前缀。
+五张 `ov_accounts*` 表的名称固定；多个 OpenViking 集群共用数据库时，通过不同的
+顶层 `service_name` 隔离部署，不使用不同表前缀。
 
 ```json
 {
+  "service_name": "production",
   "server": {
     "account_store": {
       "provider": "mysql",

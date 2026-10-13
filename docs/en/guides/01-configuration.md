@@ -1925,21 +1925,22 @@ encrypted storage to hash storage, retain `credential_encryption_key` until all
 encrypted credentials have been rotated. Replacing that encryption key directly
 is not supported because `aesgcm:v1` records do not carry a key identifier.
 
-Install the MySQL extra and set a non-empty `OV_RESOURCE_ID` before running the
-server. This value is stored as `resource_id` on every account-store table and
-is the deployment boundary when multiple OpenViking resources share a database.
-The provider rejects startup when it is absent.
+Install the MySQL extra and configure the top-level `service_name`. Its value is
+stored in the `service_name` column on every account-store table and is the
+deployment boundary when multiple OpenViking clusters share a database. Changing
+`service_name` selects a different logical account-store partition.
 
 The provider never creates or migrates database tables. Create the normalized
 tables in `openviking/server/account_stores/sql/init.sql` through your normal
 DBA or deployment process before starting the server. Future reviewed schema
 changes are stored as ordered SQL files in
 `openviking/server/account_stores/sql/changes/`. The five `ov_accounts*` table
-names are fixed; use `OV_RESOURCE_ID` rather than separate table prefixes to
-isolate OpenViking deployments that share a database.
+names are fixed; use distinct top-level `service_name` values rather than
+separate table prefixes to isolate OpenViking clusters that share a database.
 
 ```json
 {
+  "service_name": "production",
   "server": {
     "account_store": {
       "provider": "mysql",
