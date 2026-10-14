@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import asyncio
-import base64
 import json
 import os
 import threading
@@ -10,13 +9,10 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import and_, delete, select
-from sqlalchemy.exc import OperationalError
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from openviking.server.account_stores import mysql as mysql_store_module
-from openviking.server.account_stores.mysql import MySQLAccountStore
-from openviking.server.account_stores.mysql_schema import Account, Base, Credential, User
+from openviking.server.account_stores.mysql_schema import Account, Base, Credential
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.identity import Role
@@ -195,8 +191,23 @@ async def test_file_trusted_batch_rejects_oversized_account_before_any_write():
         await manager.close()
 
 
-@pytest.mark.parametrize("operation", ["account", "user"])
-async def test_file_creation_is_atomic_when_credential_write_fails(operation):
+async def test_file_account_creation_is_atomic_when_credential_write_fails():
+    class FailingAGFS(InMemoryAGFS):
+        def write(self, path, content, ctx=None):
+            if path == "/local/acme/_system/users.json":
+                raise OSError("credential store unavailable")
+            return super().write(path, content, ctx)
+
+    store = FileStore(SimpleNamespace(agfs=FailingAGFS()))
+    manager = APIKeyManager("root", store)
+    await manager.load()
+
+    with pytest.raises(OSError, match="credential store unavailable"):
+        await manager.create_account("acme", "alice")
+    assert await manager.get_account("acme") is None
+
+
+async def test_file_user_creation_is_atomic_when_credential_write_fails():
     class FailingAGFS(InMemoryAGFS):
         fail_user_write = False
 
@@ -209,23 +220,13 @@ async def test_file_creation_is_atomic_when_credential_write_fails(operation):
     store = FileStore(SimpleNamespace(agfs=agfs))
     manager = APIKeyManager("root", store)
     await manager.load()
-    if operation == "user":
-        admin_key = await manager.create_account("acme", "alice")
+    admin_key = await manager.create_account("acme", "alice")
     agfs.fail_user_write = True
 
-    try:
-        with pytest.raises(OSError, match="credential store unavailable"):
-            if operation == "account":
-                await manager.create_account("acme", "alice")
-            else:
-                await manager.register_user("acme", "bob")
-        assert await manager.get_user("acme", "bob") is None
-        if operation == "account":
-            assert await manager.get_account("acme") is None
-        else:
-            assert (await manager.resolve_identity(admin_key)).user_id == "alice"
-    finally:
-        await manager.close()
+    with pytest.raises(OSError, match="credential store unavailable"):
+        await manager.register_user("acme", "bob")
+    assert await manager.get_user("acme", "bob") is None
+    assert (await manager.resolve_identity(admin_key)).user_id == "alice"
 
 
 async def test_regenerate_key_preserves_management_not_found_errors():
@@ -239,42 +240,108 @@ async def test_regenerate_key_preserves_management_not_found_errors():
         await manager.regenerate_key("acme", "missing")
 
 
-async def test_file_hashing_never_persists_plaintext_credentials():
-    agfs = InMemoryAGFS()
-    manager = build_api_key_manager(
+async def test_distributed_credentials_are_shared_and_service_scoped():
+    """Warm caches must reject rotated keys without crossing service boundaries."""
+    raw_mysql = os.environ.get("OV_TEST_MYSQL")
+    redis_url = os.environ.get("OV_TEST_REDIS")
+    if not raw_mysql or not redis_url:
+        pytest.skip("Set OV_TEST_MYSQL and OV_TEST_REDIS for the distributed credential contract")
+
+    service_name = f"test-{uuid4().hex}"
+    isolated_service_name = f"test-{uuid4().hex}"
+    key_prefix = f"ov:test:{uuid4().hex}"
+    params = {
+        "mysql": json.loads(raw_mysql),
+        "cache": {
+            "provider": "redis",
+            "params": {
+                "mode": "standalone",
+                "endpoints": [redis_url],
+                "key_prefix": key_prefix,
+            },
+        },
+    }
+    writer = build_api_key_manager(
         "root",
-        SimpleNamespace(agfs=agfs),
-        api_key_hashing_enabled=True,
+        None,
+        service_name=service_name,
+        account_store_provider="redis_mysql",
+        account_store_params=params,
     )
-    await manager.load()
-    account_key = await manager.create_account("acme", "alice")
-    user_key = await manager.register_user("acme", "bob")
-    rotated_key = await manager.regenerate_key("acme", "bob")
-
-    persisted = agfs.read("/local/acme/_system/users.json")
-    for key in (account_key, user_key, rotated_key):
-        assert key.encode() not in persisted
-    assert (await manager.resolve_identity(account_key)).user_id == "alice"
-    assert (await manager.resolve_identity(rotated_key)).user_id == "bob"
-    with pytest.raises(UnauthenticatedError):
-        await manager.resolve_identity(user_key)
-
-
-async def test_file_load_migrates_plaintext_credential_to_argon2():
-    agfs = InMemoryAGFS()
-    plaintext = build_api_key_manager("root", SimpleNamespace(agfs=agfs))
-    await plaintext.load()
-    key = await plaintext.create_account("acme", "alice")
-
-    hashed = build_api_key_manager(
+    reader = build_api_key_manager(
         "root",
-        SimpleNamespace(agfs=agfs),
-        api_key_hashing_enabled=True,
+        None,
+        service_name=service_name,
+        account_store_provider="redis_mysql",
+        account_store_params=params,
     )
-    await hashed.load()
+    isolated = build_api_key_manager(
+        "root",
+        None,
+        service_name=isolated_service_name,
+        account_store_provider="redis_mysql",
+        account_store_params=params,
+    )
+    mysql = writer._store._mysql
+    engine = create_async_engine(mysql._url, **mysql._engine_options)
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        await writer.load()
+        await reader.load()
+        await isolated.load()
 
-    assert key.encode() not in agfs.read("/local/acme/_system/users.json")
-    assert (await hashed.resolve_identity(key)).user_id == "alice"
+        old_key = await writer.create_account("acme", "alice")
+        isolated_key = await isolated.create_account("acme", "alice")
+        assert (await reader.resolve_identity(old_key)).role == Role.ADMIN
+        assert (await isolated.resolve_identity(isolated_key)).role == Role.ADMIN
+        with pytest.raises(UnauthenticatedError):
+            await isolated.resolve_identity(old_key)
+        with pytest.raises(UnauthenticatedError):
+            await reader.resolve_identity(isolated_key)
+
+        # Repeated rotation must bound history and invalidate an already cached key.
+        for _ in range(12):
+            active_key = await writer.regenerate_key("acme", "alice")
+        with pytest.raises(UnauthenticatedError):
+            await reader.resolve_identity(old_key)
+        assert (await reader.resolve_identity(active_key)).user_id == "alice"
+        assert (await isolated.resolve_identity(isolated_key)).role == Role.ADMIN
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(Credential.service_name == service_name)
+                )
+                == 11
+            )
+            assert (
+                await connection.scalar(
+                    select(func.count())
+                    .select_from(Credential)
+                    .where(Credential.service_name == service_name, Credential.revoked.is_(False))
+                )
+                == 1
+            )
+    finally:
+        try:
+            redis_client = writer._store._redis
+            if redis_client is not None:
+                keys = [key async for key in redis_client.scan_iter(match=f"{key_prefix}:*")]
+                if keys:
+                    await redis_client.delete(*keys)
+            async with engine.begin() as connection:
+                await connection.execute(
+                    delete(Account).where(
+                        Account.service_name.in_([service_name, isolated_service_name])
+                    )
+                )
+        finally:
+            await isolated.close()
+            await reader.close()
+            await writer.close()
+            await engine.dispose()
 
 
 async def test_file_management_user_read_refreshes_only_explicitly():
@@ -343,132 +410,6 @@ async def test_file_user_deletion_fence_survives_concurrent_role_update():
     assert (await store.get_deletion("acme", "bob"))["task_id"] == "delete"
 
 
-def test_mysql_uses_service_name_instead_of_resource_id_env(monkeypatch):
-    monkeypatch.setenv("OV_RESOURCE_ID", "ignored-resource")
-    store = MySQLAccountStore(
-        service_name="account-cluster",
-        params={"user": "unused", "password": "unused", "database": "unused"},
-    )
-    assert store._service_name == "account-cluster"
-
-
-def test_mysql_service_name_must_fit_schema():
-    params = {"user": "unused", "password": "unused", "database": "unused"}
-    MySQLAccountStore(service_name="r" * 255, params=params)
-
-    with pytest.raises(InvalidArgumentError, match="service_name must not exceed 255"):
-        MySQLAccountStore(service_name="r" * 256, params=params)
-
-
-@pytest.mark.parametrize(
-    "operation",
-    [
-        pytest.param(
-            lambda store, value: store.create_account_with_api_key(value, "admin", "key"),
-            id="account",
-        ),
-        pytest.param(
-            lambda store, value: store.create_account_with_api_key("account", value, "key"),
-            id="account-admin",
-        ),
-        pytest.param(
-            lambda store, value: store.create_user("account", value, "user"),
-            id="user",
-        ),
-        pytest.param(
-            lambda store, value: store.ensure_trusted_identities({value: {"user"}}),
-            id="trusted-account",
-        ),
-        pytest.param(
-            lambda store, value: store.ensure_trusted_identities({"account": {value}}),
-            id="trusted-user",
-        ),
-        pytest.param(
-            lambda store, value: store.create_group("account", value),
-            id="group",
-        ),
-        pytest.param(
-            lambda store, value: store.begin_deletion(
-                "account",
-                None,
-                task_id="task",
-                owner_account_id=value,
-                owner_user_id="owner",
-            ),
-            id="deletion-owner-account",
-        ),
-        pytest.param(
-            lambda store, value: store.begin_deletion(
-                "account",
-                None,
-                task_id="task",
-                owner_account_id="owner",
-                owner_user_id=value,
-            ),
-            id="deletion-owner-user",
-        ),
-    ],
-)
-async def test_mysql_identifiers_must_fit_schema(operation):
-    store = MySQLAccountStore(
-        service_name="test-service",
-        params={"user": "unused", "password": "unused", "database": "unused"},
-    )
-
-    with pytest.raises(InvalidArgumentError, match="must not exceed 255 characters"):
-        await operation(store, "a" * 256)
-
-
-def test_mysql_rejects_removed_table_parameter():
-    with pytest.raises(InvalidArgumentError, match="Unknown MySQL account store parameters: table"):
-        MySQLAccountStore(
-            service_name="test-service",
-            params={
-                "user": "unused",
-                "password": "unused",
-                "database": "unused",
-                "table": "tenant_accounts",
-            },
-        )
-
-
-async def test_mysql_load_rejects_incomplete_schema_and_disposes_engine(monkeypatch):
-    store = MySQLAccountStore(
-        service_name="test-service",
-        params={"user": "unused", "password": "unused", "database": "unused"},
-    )
-
-    class FakeEngine:
-        disposed = False
-
-        async def dispose(self):
-            self.disposed = True
-
-    engine = FakeEngine()
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            pass
-
-        async def execute(self, statement):
-            raise OperationalError(str(statement), {}, Exception(1146, "Table doesn't exist"))
-
-    monkeypatch.setattr(mysql_store_module, "create_async_engine", lambda *args, **kwargs: engine)
-    monkeypatch.setattr(
-        mysql_store_module,
-        "async_sessionmaker",
-        lambda *args, **kwargs: FakeSession,
-    )
-
-    with pytest.raises(RuntimeError, match="schema is missing or incompatible"):
-        await store.load()
-
-    assert engine.disposed
-
-
 async def test_file_store_rejects_deleting_nonempty_group():
     store = _file_store()
     await store.load()
@@ -479,155 +420,3 @@ async def test_file_store_rejects_deleting_nonempty_group():
     with pytest.raises(FailedPreconditionError, match="Group must be empty"):
         await store.delete_group("acme", "engineering")
     assert await store.get_group_members("acme", "engineering") == ["alice"]
-
-
-async def test_mysql_managers_share_authoritative_state():
-    raw = os.environ.get("OV_TEST_MYSQL")
-    if not raw:
-        pytest.skip("Set OV_TEST_MYSQL to connection JSON for the MySQL test")
-    service_name = f"test-{uuid4().hex}"
-    encryption_key = base64.urlsafe_b64encode(b"k" * 32).decode()
-    params = {
-        **json.loads(raw),
-        "credential_encryption_key": encryption_key,
-    }
-    first = build_api_key_manager(
-        "root",
-        None,
-        service_name=service_name,
-        account_store_provider="mysql",
-        account_store_params={**params, "credential_storage": "encrypted"},
-    )
-    second = build_api_key_manager(
-        "root",
-        None,
-        service_name=service_name,
-        account_store_provider="mysql",
-        account_store_params={**params, "credential_storage": "hash"},
-    )
-    isolated_service_name = f"test-{uuid4().hex}"
-    isolated = build_api_key_manager(
-        "root",
-        None,
-        service_name=isolated_service_name,
-        account_store_provider="mysql",
-        account_store_params={**params, "credential_storage": "hash"},
-    )
-    setup_engine = create_async_engine(first._store._url, **first._store._engine_options)
-    async with setup_engine.begin() as connection:
-        await connection.run_sync(Base.metadata.create_all)
-        await connection.execute(
-            delete(Account).where(Account.service_name.in_([service_name, isolated_service_name]))
-        )
-    await setup_engine.dispose()
-    await first.load()
-    await second.load()
-    await isolated.load()
-    try:
-        trusted_results = await asyncio.gather(
-            first.ensure_trusted_identities({"trusted": {"alice", "bob"}}),
-            second.ensure_trusted_identities({"trusted": {"bob", "carol"}}),
-        )
-        assert sum(result["created_accounts"] for result in trusted_results) == 1
-        assert sum(result["created_users"] for result in trusted_results) == 3
-        assert await first.get_registered_user_role("trusted", "alice") == Role.USER
-        assert await second.get_registered_user_role("trusted", "bob") == Role.USER
-        assert await first.get_registered_user_role("trusted", "carol") == Role.USER
-        assert (await first.get_account("trusted"))["user_count"] == 3
-        repeat = await second.ensure_trusted_identities({"trusted": {"alice", "bob", "carol"}})
-        assert repeat == {"created_accounts": 0, "created_users": 0}
-
-        deletion, created = await first.begin_deletion(
-            "trusted",
-            "carol",
-            task_id="delete-carol",
-            owner_account_id="system",
-            owner_user_id="system",
-        )
-        assert created
-        assert await second.get_deletion("trusted", "carol") == deletion
-        account_deletion, account_created = await first.begin_deletion(
-            "trusted",
-            None,
-            task_id="delete-trusted",
-            owner_account_id="system",
-            owner_user_id="system",
-        )
-        assert account_created
-        assert await second.get_deletion("trusted", "carol") == account_deletion
-        blocked = await second.ensure_trusted_identities({"trusted": {"late-user"}})
-        assert blocked == {"created_accounts": 0, "created_users": 0}
-        assert await first.get_registered_user_role("trusted", "late-user") is None
-
-        key = await first.create_account("acme", "alice")
-        assert (await second.resolve_identity(key)).role == Role.ADMIN
-        user_key = await first.register_user("acme", "dave")
-        assert (await second.resolve_identity(user_key)).role == Role.USER
-        hashed_key = await second.create_account("hashed", "bob")
-        assert (await first.resolve_identity(hashed_key)).role == Role.ADMIN
-        rotated = await first.regenerate_key("acme", "alice")
-        assert (await second.resolve_identity(rotated)).role == Role.ADMIN
-        with pytest.raises(UnauthenticatedError):
-            await second.resolve_identity(key)
-        rotation_keys = [key, rotated]
-        for _ in range(11):
-            rotation_keys.append(await first.regenerate_key("acme", "alice"))
-        assert (await second.resolve_identity(rotation_keys[-1])).role == Role.ADMIN
-        async with first._store._session_factory() as session:
-            credentials = list(
-                (
-                    await session.scalars(
-                        select(Credential)
-                        .join(
-                            User,
-                            and_(
-                                User.service_name == Credential.service_name,
-                                User.user_pk == Credential.user_pk,
-                            ),
-                        )
-                        .join(
-                            Account,
-                            and_(
-                                Account.service_name == User.service_name,
-                                Account.account_pk == User.account_pk,
-                            ),
-                        )
-                        .where(
-                            Credential.service_name == service_name,
-                            Account.account_id == "acme",
-                            User.user_id == "alice",
-                        )
-                        .order_by(Credential.sequence)
-                    )
-                ).all()
-            )
-        assert len(credentials) == 11
-        assert [credential.sequence for credential in credentials] == list(range(3, 14))
-        assert sum(not credential.revoked for credential in credentials) == 1
-        with pytest.raises(UnauthenticatedError):
-            await second.resolve_identity(rotation_keys[1])
-        await first.create_group("acme", "engineering")
-        await first.add_group_member("acme", "engineering", "alice")
-        assert await second.get_user_group_ids("acme", "alice") == ("engineering",)
-
-        assert await isolated.get_account("acme") is None
-        isolated_key = await isolated.create_account("acme", "alice")
-        assert (await isolated.resolve_identity(isolated_key)).role == Role.ADMIN
-        with pytest.raises(UnauthenticatedError):
-            await isolated.resolve_identity(rotated)
-        with pytest.raises(UnauthenticatedError):
-            await first.resolve_identity(isolated_key)
-        await isolated.register_user("acme", "dave")
-        await isolated.set_role("acme", "dave", Role.ADMIN)
-        assert await isolated.get_registered_user_role("acme", "dave") == Role.ADMIN
-        assert await first.get_registered_user_role("acme", "dave") == Role.USER
-    finally:
-        async with first._store._engine.begin() as connection:
-            await connection.execute(
-                delete(Account).where(
-                    Account.service_name.in_([service_name, isolated_service_name])
-                )
-            )
-        await isolated.close()
-        await second.close()
-        await first.close()

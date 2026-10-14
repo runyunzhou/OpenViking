@@ -124,7 +124,7 @@ async def test_trusted_explicit_user_role_with_root_key(runtime):
     assert identity.role == Role.USER
 
 
-async def test_oversized_trusted_account_does_not_block_valid_registration(runtime):
+async def test_oversized_trusted_identity_does_not_block_valid_registration(runtime):
     request = await make_request(runtime, "trusted", trusted_flush_interval=300)
     plugin = request.app.state.auth_plugin
     account_id = "a" * 255
