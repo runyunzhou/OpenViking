@@ -181,6 +181,8 @@ curl -X POST http://localhost:1933/api/v1/search/find \
 
 Tags 必须使用严格的 `k=v` 字符串。传入多个 tags 时，`find()` 会要求全部命中；上面的例子只返回显式检索标签同时包含 `env=prod` 和 `team=search` 的上下文。
 
+完整索引记录写回或显式标签字段更新时，会丢弃存储中的遗留非法标签。读取只过滤非法标签，不修改存储。如需修复已知受影响的文件或目录，同时保留合法标签且不重新生成向量，可调用 `POST /api/v1/content/set_tags`，请求体为 `{"uri": "<affected-uri>", "tags": [], "mode": "append"}`。仅在需要同时修复目录后代时添加 `"recursive": true`。`default` 等裸值会被移除，不会通过猜测键名进行转换。
+
 **Python SDK**
 
 ```python
@@ -394,6 +396,7 @@ ov find "红色海报风格" --image ./poster.png --uri "viking://resources/imag
 | query | str | 否 | "" | 搜索查询字符串；未提供 `image_url` 时必填 |
 | image_url | str | 否 | None | 图片查询，支持 `data:image/...;base64,...`、`http(s)://` 或 `viking://` URI；需要 multimodal embedding 模型 |
 | search_type | `"semantic"` \| `"keywords"` | 否 | `"semantic"` | 检索类型。`semantic` 使用 Embedding 和向量召回；`keywords` 使用 BM25 关键词召回 |
+| mode | `"list"` \| `"context"` | 否 | `"list"` | 返回排序命中列表或组装好的上下文。CLI `--mode` 会映射到这个字段；context 专用参数见下文 |
 | target_uri | str \| List[str] | 否 | "" | 限制搜索范围到指定的 URI 前缀 |
 | session | Session | 否 | None | 用于上下文感知搜索的会话（SDK）|
 | session_id | str | 否 | None | 用于上下文感知搜索的会话 ID（HTTP）|
@@ -568,6 +571,12 @@ fmt.Println(result.Total)
 # 带会话 ID 的搜索
 ov search "best practices" --session-id abc123
 
+# 按服务端默认配置组装上下文，并启用事件时间衰减
+ov search "recent decisions" --mode context --events-time-decay-protection 7d
+
+# 以 JSON 返回完整的 context 结果
+ov -o json search "best practices" --mode context
+
 # 限定上下文类型
 ov search "best practices" --context-type skill
 
@@ -593,6 +602,8 @@ ov search "how to implement OAuth" -L 1,2
 # 图片查询同样使用 --image；会直接检索并跳过 session planning
 ov search "similar poster" --image ./poster.png --uri "viking://resources/images"
 ```
+
+`ov search --mode list` 为默认行为，返回常规命中列表。使用 `--mode context` 时，默认终端输出展示组装后的 `rendered` 文本（返回非空 `digest` 时优先展示摘要）；`-o json` 保留完整结果，包括 `entries`、`rendered`、`digest` 和 `stats`。CLI 暂未提供 `max_tokens`、`detail`、`rewrite` 等 context 专用选项，使用服务端默认值。context 模式拒绝 `--uri` 和 `--read-content`；服务端会忽略 `--level`，由组装流程选择内容档位。
 
 **响应示例**
 

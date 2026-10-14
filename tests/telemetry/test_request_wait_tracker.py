@@ -54,6 +54,44 @@ def test_request_wait_tracker_records_requeues():
     }
 
 
+def test_request_wait_tracker_completes_except_coordinator_after_siblings_settle():
+    tracker = RequestWaitTracker()
+    telemetry_id = "tm_batch_coordinator"
+
+    tracker.register_request(telemetry_id)
+    tracker.register_semantic_root(telemetry_id, "coordinator")
+    tracker.register_semantic_root(telemetry_id, "semantic-1")
+    tracker.register_embedding_root(telemetry_id, "embedding-1")
+
+    assert tracker.is_complete_except(telemetry_id, "coordinator") is False
+
+    tracker.mark_semantic_done(telemetry_id, "semantic-1")
+    assert tracker.is_complete_except(telemetry_id, "coordinator") is False
+
+    tracker.mark_embedding_done(telemetry_id, "embedding-1")
+    assert tracker.is_complete_except(telemetry_id, "coordinator") is True
+    assert tracker.is_complete(telemetry_id) is False
+
+    tracker.mark_semantic_done(telemetry_id, "coordinator")
+    tracker.cleanup(telemetry_id)
+
+
+def test_request_wait_tracker_retains_coordinator_after_request_cleanup():
+    tracker = RequestWaitTracker()
+    telemetry_id = "tm_batch_cleanup"
+
+    tracker.register_request(telemetry_id)
+    tracker.register_semantic_root(telemetry_id, "coordinator")
+    tracker.retain_request(telemetry_id, "coordinator")
+    tracker.cleanup(telemetry_id)
+
+    assert tracker.has_request(telemetry_id) is True
+
+    tracker.mark_semantic_done(telemetry_id, "coordinator")
+
+    assert tracker.has_request(telemetry_id) is False
+
+
 def test_request_wait_tracker_counts_contexts_indexed_by_request():
     tracker = RequestWaitTracker()
     telemetry_id = "tm_vectors"
@@ -86,12 +124,17 @@ def test_request_wait_tracker_accumulates_queue_wait_and_execution_durations():
     }
 
 
-async def test_wait_for_request_timeout_keeps_existing_error():
+async def test_wait_for_request_timeout_preserves_pending_work():
     tracker = RequestWaitTracker()
     telemetry_id = "tm_wait_timeout"
 
     tracker.register_request(telemetry_id)
     tracker.register_embedding_root(telemetry_id, "embedding-1")
 
-    with pytest.raises(TimeoutError, match="Request processing not complete after 0.01s"):
-        await tracker.wait_for_request(telemetry_id, timeout=0.01, poll_interval=0.001)
+    with pytest.raises(TimeoutError):
+        await tracker.wait_for_request(telemetry_id, timeout=0.01)
+
+    assert not tracker.is_complete(telemetry_id)
+    tracker.mark_embedding_done(telemetry_id, "embedding-1")
+    await tracker.wait_for_request(telemetry_id)
+    assert tracker.build_queue_status(telemetry_id)["Embedding"]["processed"] == 1

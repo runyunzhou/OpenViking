@@ -261,11 +261,21 @@ class RequestWaitTracker:
                 return True
             return not state.pending_semantic_roots and not state.pending_embedding_roots
 
+    def is_complete_except(self, telemetry_id: str, semantic_root_id: str) -> bool:
+        """Return whether all work except one coordinating semantic root has settled."""
+        if not telemetry_id:
+            return True
+        with self._lock:
+            state = self._states.get(telemetry_id)
+            if state is None:
+                return True
+            pending_semantic = state.pending_semantic_roots - {semantic_root_id}
+            return not pending_semantic and not state.pending_embedding_roots
+
     async def wait_for_request(
         self,
         telemetry_id: str,
         timeout: Optional[float] = None,
-        poll_interval: float = 0.05,
     ) -> None:
         if not telemetry_id:
             return
@@ -275,12 +285,11 @@ class RequestWaitTracker:
                 return
             if timeout is not None and (time.time() - start) > timeout:
                 raise TimeoutError(f"Request processing not complete after {timeout}s")
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(0.05)
 
     async def wait_for_embeddings(
         self,
         telemetry_id: str,
-        poll_interval: float = 0.05,
         *,
         stop_waiting: Optional[Callable[[], bool]] = None,
     ) -> None:
@@ -297,7 +306,7 @@ class RequestWaitTracker:
                 # Leave this semantic delivery unacked for recovery rather than
                 # waiting forever for embeddings still in the persistent queue.
                 raise asyncio.CancelledError("Embedding worker stopped with queued work")
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(0.05)
 
     def build_queue_status(self, telemetry_id: str) -> Dict[str, Dict[str, object]]:
         with self._lock:
