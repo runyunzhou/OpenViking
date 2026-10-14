@@ -69,7 +69,7 @@ async def test_reindex_processor_terminalizes_root_after_descendants(monkeypatch
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.reindex_processor.get_task_tracker", Mock(return_value=tracker)
@@ -101,7 +101,7 @@ async def test_reindex_processor_terminalizes_root_after_descendants(monkeypatch
     )
 
     assert outcome.outcome.value == "success"
-    tracker.wait_for_descendants.assert_awaited_once_with("task-1", "root-work")
+    tracker.wait_for_task_work.assert_awaited_once_with("task-1", exclude_work_id="root-work")
     tracker.complete.assert_awaited_once_with(
         "task-1", result, account_id="account-1", user_id="user-1"
     )
@@ -122,7 +122,7 @@ async def test_reindex_processor_restores_root_telemetry_for_executor(monkeypatc
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.reindex_processor.get_task_tracker", Mock(return_value=tracker)
@@ -177,7 +177,7 @@ async def test_reindex_processor_replay_of_completed_task_skips_force_rebuild(mo
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.reindex_processor.get_task_tracker", Mock(return_value=tracker)
@@ -225,7 +225,7 @@ async def test_reindex_processor_requeues_lock_handoff_failure_before_ack(monkey
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     queue_manager = SimpleNamespace(REINDEX="Reindex", enqueue=AsyncMock(return_value="retry-1"))
     monkeypatch.setattr(
@@ -250,7 +250,12 @@ async def test_reindex_processor_requeues_lock_handoff_failure_before_ack(monkey
 
     assert outcome.outcome.value == "requeued"
     queue_manager.enqueue.assert_awaited_once_with(
-        "Reindex", {**message.to_dict(), "lock_handoff_retry": 1}
+        "Reindex",
+        {
+            **message.to_dict(),
+            "_task_work_id": "root-work",
+            "lock_handoff_retry": 1,
+        },
     )
     tracker.fail.assert_not_awaited()
 
@@ -264,7 +269,7 @@ async def test_reindex_processor_fails_after_lock_handoff_retry_limit(monkeypatc
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.reindex_processor.get_task_tracker", Mock(return_value=tracker)
@@ -324,7 +329,7 @@ async def test_reindex_processor_does_not_release_lease_owned_by_failed_executor
         start=AsyncMock(),
         complete=AsyncMock(),
         fail=AsyncMock(),
-        wait_for_descendants=AsyncMock(),
+        wait_for_task_work=AsyncMock(),
     )
     monkeypatch.setattr(
         "openviking.storage.queuefs.reindex_processor.get_task_tracker", Mock(return_value=tracker)

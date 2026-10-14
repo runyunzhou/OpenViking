@@ -17,7 +17,6 @@ import pytest
 from openviking.storage.queuefs.process_result import ProcessOutcome
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.circuit_breaker import CircuitBreakerOpen
 
 
@@ -53,7 +52,17 @@ def _build_data(msg: SemanticMsg) -> dict:
 
 @pytest.mark.parametrize("context_type", ["resource", "memory", "skill"])
 async def test_retry_cancellation_keeps_skill_wait_isolated(monkeypatch, context_type):
+    from openviking.service.task_store import PersistentTaskStore
+    from openviking.service.task_tracker import TaskTracker
+    from tests.test_task_tracker import _FakeAgfs
+
+    monkeypatch.setattr(
+        "openviking.service.task_tracker._instance", TaskTracker(PersistentTaskStore(_FakeAgfs()))
+    )
     processor = _processor()
+    processor._circuit_breakers["acc1"] = SimpleNamespace(
+        check=MagicMock(side_effect=CircuitBreakerOpen), retry_after=0
+    )
     entered, release = asyncio.Event(), asyncio.Event()
     written = []
 
@@ -88,7 +97,6 @@ async def test_retry_cancellation_keeps_skill_wait_isolated(monkeypatch, context
         if not worker.done():
             worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)
-        get_request_wait_tracker().cleanup(msg.telemetry_id)
 
 
 @pytest.mark.asyncio

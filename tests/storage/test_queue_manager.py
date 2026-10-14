@@ -14,7 +14,11 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openviking.pyagfs import AsyncAGFSClient
-from openviking.service.task_work_index import bind_task_context
+from openviking.service.task_work_index import (
+    QueueTaskMetadata,
+    bind_task_context,
+    record_enqueued_work,
+)
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase, NamedQueue
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.queue_manager import QueueManager
@@ -86,17 +90,18 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
     from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
     from openviking.storage.queuefs.semantic_msg import SemanticMsg
     from openviking.storage.queuefs.semantic_processor import SemanticProcessor
-    from openviking.telemetry import OperationTelemetry
-    from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 
-    tracker = get_request_wait_tracker()
-    telemetry_id = OperationTelemetry("skill-shutdown").telemetry_id
-    tracker.register_request(telemetry_id)
     msg = SemanticMsg(
-        uri="viking://agent/skills/demo", context_type="skill", telemetry_id=telemetry_id
+        uri="viking://agent/skills/demo",
+        context_type="skill",
+        task_id="skill-task",
+        _task_work_id="semantic",
     )
     started, queued, release = threading.Event(), threading.Event(), threading.Event()
     events = []
+    work_index = None
+    active_work = QueueTaskMetadata("skill-task", "active")
+    queued_work = QueueTaskMetadata("skill-task", "queued")
 
     class Lease:
         lock = {"lease_ref": "demo"}
@@ -111,8 +116,11 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
             pass
 
         async def run(self, uri):
-            tracker.register_embedding_root(telemetry_id, "active")
-            tracker.register_embedding_root(telemetry_id, "queued")
+            assert work_index is not None
+            assert work_index.register("Embedding", active_work)
+            assert work_index.register("Embedding", queued_work)
+            record_enqueued_work("Embedding", active_work.work_id)
+            record_enqueued_work("Embedding", queued_work.work_id)
             queued.set()
 
         def get_stats(self):
@@ -124,7 +132,8 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
             while not release.is_set():
                 await asyncio.sleep(0.01)
             events.append("write-finished")
-            tracker.mark_embedding_done(telemetry_id, "active")
+            assert work_index is not None
+            work_index.record_result(active_work, "completed")
 
         await run_to_completion(finish)
         return ProcessResult.success()
@@ -146,6 +155,9 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
             return {"id": self.name, "data": msg.to_json()}
 
         async def process_dequeued(self, data):
+            if self.name == QueueManager.SEMANTIC:
+                with bind_task_context("skill-task", "", "", enqueued_work=[]):
+                    return await self.handler(data)
             return await self.handler(data)
 
         async def ack(self, *args):
@@ -170,6 +182,11 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
     )
     manager = QueueManager(
         object(), max_concurrent_semantic=concurrency, max_concurrent_embedding=concurrency
+    )
+    work_index = manager._task_work_index
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_work.get_task_tracker",
+        lambda: SimpleNamespace(wait_for_work=work_index.wait_for_work),
     )
     manager._poll_interval = 0.001
     manager.set_vlm_resolver(SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace())))
@@ -197,14 +214,13 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
         assert all(not thread.is_alive() for thread in threads)
         assert events.index("write-finished") < events.index("lock-released")
         assert f"ack-{manager.SEMANTIC}" not in events
-        assert not tracker.is_complete(telemetry_id)  # Queued vectors await restart.
+        assert work_index.has_work("skill-task")  # Queued vectors await restart.
     finally:
         release.set()
         if stopping is not None:
             await stopping
         else:
             await asyncio.to_thread(manager.stop)
-        tracker.cleanup(telemetry_id)
 
 
 async def test_status_waits_for_processing_messages_from_other_workers(monkeypatch) -> None:

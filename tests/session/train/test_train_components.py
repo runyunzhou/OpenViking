@@ -307,7 +307,9 @@ async def test_dry_run_policy_updater_does_not_mutate_policy_set():
 @pytest.mark.asyncio
 async def test_dry_run_policy_updater_simulates_patch_plan_items():
     policy_set = _experience_set()
-    gradient = _patch_gradient(uri=policy_set.policies[0].uri, before="content", after="new content")
+    gradient = _patch_gradient(
+        uri=policy_set.policies[0].uri, before="content", after="new content"
+    )
     plan = _plan_from_gradient(gradient)
 
     result = await DryRunPolicyUpdater().apply(plan, policy_set)
@@ -823,7 +825,9 @@ async def test_patch_merge_policy_optimizer_merges_all_patch_gradients_once(monk
                 [],
             )
 
-    monkeypatch.setattr("openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop
+    )
 
     plan = await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
         gradients,
@@ -925,7 +929,9 @@ async def test_patch_merge_policy_optimizer_keeps_distinct_output_source_links_s
                 [],
             )
 
-    monkeypatch.setattr("openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop
+    )
 
     plan = await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
         gradients,
@@ -941,7 +947,9 @@ async def test_patch_merge_policy_optimizer_keeps_distinct_output_source_links_s
 
 
 @pytest.mark.asyncio
-async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all_source_links(monkeypatch):
+async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all_source_links(
+    monkeypatch,
+):
     from openviking.session.memory.dataclass import (
         ResolvedOperation,
         ResolvedOperations,
@@ -1006,7 +1014,9 @@ async def test_patch_merge_policy_optimizer_single_canonical_output_inherits_all
                 [],
             )
 
-    monkeypatch.setattr("openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop
+    )
 
     plan = await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
         gradients,
@@ -1070,7 +1080,9 @@ async def test_patch_merge_policy_optimizer_runs_llm_for_single_patch(monkeypatc
                 [],
             )
 
-    monkeypatch.setattr("openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop)
+    monkeypatch.setattr(
+        "openviking.session.train.components.policy_optimizer.ExtractLoop", FakeExtractLoop
+    )
 
     plan = await PatchMergePolicyOptimizer(viking_fs=FakeVikingFS({}), vlm=object()).plan(
         [gradient],
@@ -1279,12 +1291,8 @@ async def test_skill_policy_creation_preserves_lock_ownership(tmp_path, monkeypa
         await fs._async_agfs.pathlock_release(lease)
     finally:
         from openviking.telemetry import unregister_telemetry
-        from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 
         if queue.enqueue.await_args:
             msg = queue.enqueue.await_args.args[0]
-            tracker = get_request_wait_tracker()
-            tracker.mark_semantic_done(msg.telemetry_id, msg.id)
-            tracker.cleanup(msg.telemetry_id)
             unregister_telemetry(msg.telemetry_id)
         agfs.close()

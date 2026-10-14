@@ -81,7 +81,6 @@ class ReindexProcessor(DequeueHandlerBase):
         msg = ReindexMsg.from_dict(payload)
         ctx = self._ctx(msg)
         tracker = get_task_tracker()
-        metadata = extract_task_metadata(data)
         task = await tracker.get(
             msg.task_id,
             account_id=ctx.account_id,
@@ -151,8 +150,11 @@ class ReindexProcessor(DequeueHandlerBase):
                     ctx=ctx,
                     existing_lease=executor_lease,
                 )
-            if metadata is not None:
-                await tracker.wait_for_descendants(msg.task_id, metadata.work_id)
+            metadata = extract_task_metadata(data)
+            await tracker.wait_for_task_work(
+                msg.task_id,
+                exclude_work_id=metadata.work_id if metadata is not None else None,
+            )
             await tracker.complete(
                 msg.task_id, result, account_id=ctx.account_id, user_id=ctx.user.user_id
             )

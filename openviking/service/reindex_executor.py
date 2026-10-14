@@ -26,7 +26,8 @@ from openviking.core.namespace import (
 )
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
-from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
+from openviking.service.task_work_index import get_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
@@ -34,7 +35,6 @@ from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import get_current_telemetry
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.embedding_input import truncate_embedding_input
 from openviking.utils.embedding_utils import (
     _apply_ingest_options,
@@ -218,26 +218,40 @@ class ReindexExecutor:
 
         tracker = get_task_tracker()
         if wait:
-            if await tracker.has_running(
+            task = await tracker.create_if_no_running(
                 REINDEX_TASK_TYPE,
                 uri,
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
-            ):
+            )
+            if task is None:
                 raise OpenVikingError(
                     f"URI {uri} already has a reindex in progress",
                     code="CONFLICT",
                     details={"uri": uri},
                 )
-            return await self._run(
-                uri=uri,
-                object_type=object_type,
-                mode=mode,
-                force=force,
-                recursive=recursive,
-                ingest_options=ingest_options,
-                ctx=ctx,
+
+            async def execute_run() -> dict[str, Any]:
+                return await self._run(
+                    uri=uri,
+                    object_type=object_type,
+                    mode=mode,
+                    force=force,
+                    recursive=recursive,
+                    ingest_options=ingest_options,
+                    ctx=ctx,
+                )
+
+            result, _task_id = await run_tracked_operation(
+                REINDEX_TASK_TYPE,
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
+                operation=execute_run,
+                wait=True,
+                resource_id=uri,
+                existing_task=task,
             )
+            return result
 
         task = await tracker.create_if_no_running(
             REINDEX_TASK_TYPE,
@@ -569,10 +583,6 @@ class ReindexExecutor:
         started_at = time.perf_counter()
         counters = _ReindexCounters()
         telemetry_id = get_current_telemetry().telemetry_id
-        wait_tracker = get_request_wait_tracker()
-        if telemetry_id:
-            wait_tracker.register_request(telemetry_id)
-
         acquire_lock = service.viking_fs._async_agfs.pathlock_acquire_tree
         stat = await service.viking_fs.stat(uri, ctx=ctx, skip_count=True)
         root_is_dir = bool(stat.get("isDir", stat.get("is_dir")))
@@ -633,22 +643,23 @@ class ReindexExecutor:
                     details={"uri": uri},
                 )
 
-            if telemetry_id:
-                await wait_tracker.wait_for_request(telemetry_id)
+            task_context = get_task_context()
+            if task_context is not None:
+                await get_task_tracker().wait_for_task_work(
+                    task_context.task_id, exclude_work_id=task_context.work_id
+                )
                 self._apply_semantic_tree_stats(
                     counters,
                     SemanticProcessor.consume_tree_stats(telemetry_id=telemetry_id),
                 )
                 self._apply_embedding_wait_status(
                     counters,
-                    wait_tracker.build_queue_status(telemetry_id),
+                    get_task_tracker().build_queue_status(task_context.task_id),
                 )
         finally:
             active_lease = run.lease if run is not None else lease
             if active_lease is not None and (run is None or not run.lease_handed_off):
                 await service.viking_fs._async_agfs.pathlock_release(active_lease)
-            if telemetry_id:
-                wait_tracker.cleanup(telemetry_id)
 
         return {
             "status": "completed",
@@ -842,23 +853,10 @@ class ReindexExecutor:
             propagate_to_parent=recursive,
             plan=semantic_plan,
         )
-        tracker = get_request_wait_tracker()
-        if telemetry_id:
-            tracker.register_semantic_root(telemetry_id, msg.id)
-
         queue_manager = get_queue_manager()
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
         if run.lease is None:
-            try:
-                enqueue_id = await semantic_queue.enqueue(msg)
-            except Exception:
-                if telemetry_id:
-                    tracker.mark_semantic_failed(
-                        telemetry_id, msg.id, "semantic plan enqueue failed"
-                    )
-                raise
-            if enqueue_id == "deduplicated" and telemetry_id:
-                tracker.mark_semantic_done(telemetry_id, msg.id, processed_delta=0)
+            await semantic_queue.enqueue(msg)
             return
 
         viking_fs = get_service().viking_fs
@@ -895,8 +893,6 @@ class ReindexExecutor:
                     run.lease_handed_off = True
                     run.lease = None
                     run.lock = None
-                if telemetry_id:
-                    tracker.mark_semantic_done(telemetry_id, msg.id, processed_delta=0)
                 return
             if not acquired_plan_lease:
                 run.lease_handed_off = True
@@ -912,8 +908,6 @@ class ReindexExecutor:
                     run.lock = await agfs.pathlock_as_borrowed(run.lease)
             elif acquired_plan_lease:
                 await agfs.pathlock_release(plan_lease)
-            if telemetry_id:
-                tracker.mark_semantic_failed(telemetry_id, msg.id, "semantic plan enqueue failed")
             raise
 
     async def _reindex_skill(
@@ -1579,17 +1573,11 @@ class ReindexExecutor:
                 code="FAILED_PRECONDITION",
                 details={"uri": uri},
             )
-        wait_tracker = get_request_wait_tracker()
-        wait_tracker.register_embedding_root(msg.telemetry_id, msg.id)
+        enqueue_error = f"Failed to enqueue reindex vector for {uri}"
         enqueued = await service.vikingdb_manager.enqueue_embedding_msg(msg)
         if not enqueued:
-            wait_tracker.mark_embedding_failed(
-                msg.telemetry_id,
-                msg.id,
-                f"Failed to enqueue reindex vector for {uri}",
-            )
             raise OpenVikingError(
-                f"Failed to enqueue reindex vector for {uri}",
+                enqueue_error,
                 code="PROCESSING_ERROR",
                 details={"uri": uri, "level": int(level)},
             )

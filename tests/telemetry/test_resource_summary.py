@@ -17,14 +17,6 @@ def test_record_resource_queue_metrics_collects_queue_and_tree_stats(monkeypatch
         requeue_count = 0
         error_count = 1
 
-    class _Timing:
-        @staticmethod
-        def get_queue_timing(_tid):
-            return {
-                "semantic": {"queue_wait_ms": 12.5, "execute_ms": 30.0},
-                "embedding": {"queue_wait_ms": 8.0, "execute_ms": 20.0},
-            }
-
     class _SemanticTreeStats:
         total_nodes = 9
         done_nodes = 8
@@ -43,15 +35,14 @@ def test_record_resource_queue_metrics_collects_queue_and_tree_stats(monkeypatch
         "openviking.telemetry.resource_summary._consume_semantic_tree_stats",
         lambda _tid, _uri: _SemanticTreeStats(),
     )
-    monkeypatch.setattr(
-        "openviking.telemetry.resource_summary.get_request_wait_tracker",
-        lambda: _Timing(),
-    )
-
     record_resource_queue_metrics(
         telemetry=telemetry,
         telemetry_id=telemetry_id,
         root_uri="viking://resources/demo",
+        queue_timing={
+            "semantic": {"queue_wait_ms": 12.5, "execute_ms": 30.0},
+            "embedding": {"queue_wait_ms": 8.0, "execute_ms": 20.0},
+        },
     )
 
     summary = telemetry.finish().summary

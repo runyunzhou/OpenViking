@@ -22,7 +22,11 @@ async def test_rm_preserves_memory_cleanup(monkeypatch):
     cleanup = {"status": "success", "memory_uris": ["viking://user/alice/memories/entities/a.md"]}
 
     async def fake_rm(uri, ctx=None, recursive=False, wait=False):
-        return {"estimated_deleted_count": 1, "memory_cleanup": cleanup}
+        return {
+            "estimated_deleted_count": 1,
+            "memory_cleanup": cleanup,
+            "task_id": "task-1",
+        }
 
     monkeypatch.setattr(
         filesystem,
@@ -39,6 +43,7 @@ async def test_rm_preserves_memory_cleanup(monkeypatch):
     assert response.result["uri"] == "viking://resources/id_card.pdf"
     assert response.result["estimated_deleted_count"] == 1
     assert response.result["memory_cleanup"] == cleanup
+    assert response.result["task_id"] == "task-1"
 
 
 @pytest.mark.asyncio

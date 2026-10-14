@@ -1324,10 +1324,17 @@ async def test_embedding_handler_honors_existing_record_id_override(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_embedding_handler_generates_id_when_no_existing_override(monkeypatch):
+async def test_embedding_handler_generates_id_and_counts_written_context(monkeypatch):
+    from openviking.service.task_tracker import TaskTracker
+    from openviking.service.task_work_index import QueueTaskMetadata, TaskWorkIndex
     from openviking.storage.vector_ids import vector_record_id
 
     captured = {}
+    tracker = TaskTracker(AsyncMock())
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    index.register("Embedding", QueueTaskMetadata("task-1", "work-1"))
+    monkeypatch.setattr("openviking.storage.collection_schemas.get_task_tracker", lambda: tracker)
 
     class _CapturingVikingDB:
         is_closing = False
@@ -1343,48 +1350,16 @@ async def test_embedding_handler_generates_id_when_no_existing_override(monkeypa
         lambda: _DummyConfig(embedder),
     )
     payload = _build_queue_payload_for_account("acct-new-id")
+    queue_data = json.loads(payload["data"])
+    queue_data["task_id"] = "task-1"
+    queue_data["_task_work_id"] = "work-1"
+    payload["data"] = json.dumps(queue_data)
 
     await TextEmbeddingHandler(_CapturingVikingDB()).on_dequeue(payload)
 
     assert captured["data"]["id"] == vector_record_id("acct-new-id", "viking://resources/sample", 2)
-
-
-@pytest.mark.asyncio
-async def test_embedding_handler_settles_request_wait_by_message_id(monkeypatch):
-    class _CapturingVikingDB:
-        is_closing = False
-        mode = "local"
-        uses_content_field = False
-
-        async def upsert(self, _data, *, ctx, options=UpsertOptions()):
-            assert options.partial_update is False
-            return "rec-1"
-
-    embedder = _DummyEmbedder()
-    monkeypatch.setattr(
-        "openviking_cli.utils.config.get_openviking_config",
-        lambda: _DummyConfig(embedder),
-    )
-
-    completed = []
-    monkeypatch.setattr(
-        "openviking.storage.collection_schemas.get_request_wait_tracker",
-        lambda: SimpleNamespace(
-            mark_embedding_done=lambda telemetry_id, root_id, **kwargs: completed.append(
-                (telemetry_id, root_id, kwargs)
-            )
-        ),
-    )
-
-    handler = TextEmbeddingHandler(_CapturingVikingDB())
-    payload = _build_queue_payload()
-    queue_data = json.loads(payload["data"])
-    queue_data["telemetry_id"] = "request-1"
-    payload["data"] = json.dumps(queue_data)
-
-    await handler.on_dequeue(payload)
-
-    assert completed == [("request-1", queue_data["id"], {"vector_written": True})]
+    assert tracker.get_context_count("task-1") == 1
+    assert tracker.get_context_count("unrelated-task") == 0
 
 
 def test_context_collection_uses_acl_mode_and_excludes_parent_uri():

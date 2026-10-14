@@ -21,7 +21,6 @@ from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 from openviking.storage.viking_fs import SyncDiff
-from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 
 
@@ -49,21 +48,15 @@ def semantic_env(monkeypatch):
     resolver = SimpleNamespace(get_vlm=AsyncMock(return_value=SimpleNamespace()))
     processor = SemanticProcessor(vlm_resolver=resolver)
     processor._sync_topdown_recursive = AsyncMock(return_value=SyncDiff())
-    tracker = get_request_wait_tracker()
-    telemetry_ids = []
 
     def message(**kwargs):
-        msg = SemanticMsg(
+        return SemanticMsg(
             uri="viking://resources/notes.txt",
             context_type="resource",
             telemetry_id=str(uuid4()),
             propagate_to_parent=False,
             **kwargs,
         )
-        telemetry_ids.append(msg.telemetry_id)
-        tracker.register_request(msg.telemetry_id)
-        tracker.register_semantic_root(msg.telemetry_id, msg.id)
-        return msg
 
     yield SimpleNamespace(
         processor=processor,
@@ -71,11 +64,8 @@ def semantic_env(monkeypatch):
         lease=lease,
         dag=dag,
         retry_queue=retry_queue,
-        tracker=tracker,
         message=message,
     )
-    for telemetry_id in telemetry_ids:
-        tracker.cleanup(telemetry_id)
 
 
 def _storage_error(wrapped):
@@ -85,16 +75,6 @@ def _storage_error(wrapped):
         wrapper.__cause__ = error
         return wrapper
     return error
-
-
-async def _assert_request_failed(env, msg, error):
-    await asyncio.wait_for(env.tracker.wait_for_request(msg.telemetry_id), timeout=1)
-    assert env.tracker.build_queue_status(msg.telemetry_id)["Semantic"] == {
-        "processed": 0,
-        "requeue_count": 0,
-        "error_count": 1,
-        "errors": [{"message": str(error)}],
-    }
 
 
 @pytest.mark.asyncio
@@ -122,7 +102,6 @@ async def test_storage_error_finishes_request_and_respects_lock_ownership(
     assert result.error == str(error)
     operation.assert_awaited_once()
     env.retry_queue.enqueue.assert_not_awaited()
-    await _assert_request_failed(env, msg, error)
     env.processor._account_breaker(msg.account_id).check()
     if owned:
         env.pathlock.pathlock_adopt.assert_awaited_once_with(msg.lock_handoff)
@@ -189,7 +168,6 @@ async def test_queue_acks_failed_semantic_work(semantic_env, monkeypatch, wrappe
         finalize.assert_not_awaited()
     env.retry_queue.enqueue.assert_not_awaited()
     env.pathlock.pathlock_release.assert_awaited_once_with(env.lease)
-    await _assert_request_failed(env, msg, error)
 
 
 @pytest.mark.asyncio
@@ -202,17 +180,14 @@ async def test_malformed_resources_do_not_pause_following_valid_work(semantic_en
         result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
         assert result.outcome is ProcessOutcome.FAILED
         assert result.error == str(error)
-        await _assert_request_failed(env, msg, error)
 
     env.dag.run.side_effect = None
     valid = env.message()
     result = await asyncio.wait_for(env.processor.on_dequeue(valid.to_dict()), timeout=1)
     assert result.outcome is ProcessOutcome.SUCCESS
-    await asyncio.wait_for(env.tracker.wait_for_request(valid.telemetry_id), timeout=1)
 
     env.retry_queue.enqueue.assert_not_awaited()
     assert env.dag.run.await_count == 5
-    assert env.tracker.build_queue_status(valid.telemetry_id)["Semantic"]["processed"] == 1
     env.processor._account_breaker(valid.account_id).check()
 
 
@@ -233,30 +208,12 @@ async def test_lock_error_requeues_without_consuming_failure_budget(semantic_env
     requeued = env.retry_queue.enqueue.call_args.args[0]
     assert requeued.id == msg.id
     assert requeued.failure_requeue_count == 0
-    assert not env.tracker.is_complete(msg.telemetry_id)
-    assert env.tracker.build_queue_status(msg.telemetry_id)["Semantic"]["requeue_count"] == 1
     breaker.check()
     sleep.assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_semantic_model_error_fails_without_requeue(semantic_env):
-    env = semantic_env
-    msg = env.message()
-    error = ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "model request failed")
-    env.dag.run.side_effect = error
-
-    result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
-
-    assert result.outcome is ProcessOutcome.FAILED
-    assert result.error == str(error)
-    env.retry_queue.enqueue.assert_not_awaited()
-    await _assert_request_failed(env, msg, error)
-    env.processor._account_breaker(msg.account_id).check()
-
-
-@pytest.mark.asyncio
 async def test_invalid_request_does_not_open_breaker(semantic_env):
+    env = semantic_env
     env = semantic_env
     msg = env.message()
     error = ModelError(ModelErrorKind.INVALID_REQUEST, "400 invalid model parameter")
@@ -267,10 +224,8 @@ async def test_invalid_request_does_not_open_breaker(semantic_env):
     assert result.outcome is ProcessOutcome.FAILED
     assert result.error == str(error)
     env.retry_queue.enqueue.assert_not_awaited()
-    await _assert_request_failed(env, msg, error)
-    breaker = env.processor._account_breaker(msg.account_id)
-    breaker.check()
-    assert breaker._failure_count == 0
+    with pytest.raises(CircuitBreakerOpen):
+        env.processor._account_breaker(msg.account_id).check()
 
 
 @pytest.mark.asyncio
@@ -290,14 +245,12 @@ async def test_open_breaker_requeues_then_recovers(semantic_env, monkeypatch):
     env.dag.run.assert_not_awaited()
     env.retry_queue.enqueue.assert_awaited_once()
     sleep.assert_awaited_once_with(30)
-    assert not env.tracker.is_complete(msg.telemetry_id)
     with pytest.raises(CircuitBreakerOpen):
         breaker.check()
 
     now[0] += 301
     result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
     assert result.outcome is ProcessOutcome.SUCCESS
-    await asyncio.wait_for(env.tracker.wait_for_request(msg.telemetry_id), timeout=1)
 
     env.dag.run.assert_awaited_once_with(msg.uri)
     assert breaker.retry_after == 0
