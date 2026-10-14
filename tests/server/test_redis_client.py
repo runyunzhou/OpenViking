@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 import pytest
-from redis.asyncio import Redis
-from redis.asyncio.cluster import RedisCluster
 
 from openviking.server.account_stores.redis_client import create_redis_client
 from openviking_cli.exceptions import InvalidArgumentError
@@ -11,35 +9,40 @@ from openviking_cli.exceptions import InvalidArgumentError
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode", "endpoints", "extra", "expected_type"),
+    ("mode", "endpoints", "expected_type_name"),
     [
-        ("standalone", ["redis://127.0.0.1:6379"], {}, Redis),
+        ("standalone", ["redis://127.0.0.1:6379"], "Redis"),
         (
             "cluster",
             ["redis://127.0.0.1:7000", "redis://127.0.0.1:7001"],
-            {},
-            RedisCluster,
+            "RedisCluster",
         ),
     ],
 )
-async def test_create_redis_client_supports_direct_topologies(
-    mode, endpoints, extra, expected_type
-):
+async def test_create_redis_client_supports_direct_topologies(mode, endpoints, expected_type_name):
+    redis_asyncio = pytest.importorskip("redis.asyncio")
+    if mode == "cluster":
+        from redis.asyncio.cluster import RedisCluster
+
+        expected_type = RedisCluster
+    else:
+        expected_type = redis_asyncio.Redis
     handle = create_redis_client(
         {
             "mode": mode,
             "endpoints": endpoints,
-            **extra,
         }
     )
     try:
         assert isinstance(handle.client, expected_type)
+        assert type(handle.client).__name__ == expected_type_name
     finally:
         await handle.close()
 
 
 @pytest.mark.asyncio
 async def test_create_redis_client_supports_sentinel():
+    redis_asyncio = pytest.importorskip("redis.asyncio")
     handle = create_redis_client(
         {
             "mode": "sentinel",
@@ -51,8 +54,24 @@ async def test_create_redis_client_supports_sentinel():
         }
     )
     try:
-        assert isinstance(handle.client, Redis)
+        assert isinstance(handle.client, redis_asyncio.Redis)
         assert len(handle.sentinel_clients) == 2
+    finally:
+        await handle.close()
+
+
+@pytest.mark.asyncio
+async def test_create_redis_client_supports_standalone_tls_url():
+    pytest.importorskip("redis.asyncio")
+    handle = create_redis_client(
+        {
+            "mode": "standalone",
+            "endpoints": ["rediss://127.0.0.1:6379"],
+            "tls_insecure_skip_verify": True,
+        }
+    )
+    try:
+        assert handle.client.connection_pool.connection_class.__name__ == "SSLConnection"
     finally:
         await handle.close()
 

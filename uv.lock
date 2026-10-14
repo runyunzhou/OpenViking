@@ -3696,6 +3696,7 @@ test = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ragas" },
+    { name = "redis" },
     { name = "sqlalchemy", extra = ["asyncio"] },
 ]
 
@@ -3804,6 +3805,7 @@ requires-dist = [
     { name = "rapidfuzz", specifier = ">=3.14,<4" },
     { name = "readability-lxml", marker = "extra == 'bot'", specifier = ">=0.8.0" },
     { name = "redis", marker = "extra == 'redis-mysql'", specifier = ">=5.0,<7" },
+    { name = "redis", marker = "extra == 'test'", specifier = ">=5.0,<7" },
     { name = "requests", specifier = ">=2.33.0" },
     { name = "rich", marker = "extra == 'bot'", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.1.0" },

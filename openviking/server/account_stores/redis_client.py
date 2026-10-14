@@ -26,12 +26,19 @@ def _secret(value: str, env_name: str, field_name: str) -> str | None:
     return value or None
 
 
-def _tls_options(config: RedisCacheConfig, scheme: str) -> dict[str, Any]:
+def _tls_options(
+    config: RedisCacheConfig,
+    scheme: str,
+    *,
+    include_ssl_flag: bool,
+) -> dict[str, Any]:
     if scheme == "rediss":
-        return {
-            "ssl": True,
+        options = {
             "ssl_cert_reqs": "none" if config.tls_insecure_skip_verify else "required",
         }
+        if include_ssl_flag:
+            options["ssl"] = True
+        return options
     return {}
 
 
@@ -83,7 +90,6 @@ def create_redis_client(raw_params: dict[str, object]) -> RedisClientHandle:
         "username": config.username or None,
         "password": password,
         "max_connections": config.pool_size,
-        **_tls_options(config, scheme),
     }
 
     if config.mode == "standalone":
@@ -94,6 +100,7 @@ def create_redis_client(raw_params: dict[str, object]) -> RedisClientHandle:
                 config.endpoints[0],
                 db=config.db,
                 **common,
+                **_tls_options(config, scheme, include_ssl_flag=False),
             )
         )
 
@@ -105,6 +112,7 @@ def create_redis_client(raw_params: dict[str, object]) -> RedisClientHandle:
                 startup_nodes=[ClusterNode(host, port) for host, port in _endpoint_parts(config)],
                 db=0,
                 **common,
+                **_tls_options(config, scheme, include_ssl_flag=True),
             )
         )
 
@@ -114,7 +122,7 @@ def create_redis_client(raw_params: dict[str, object]) -> RedisClientHandle:
         "decode_responses": True,
         "socket_connect_timeout": config.connect_timeout_ms / 1000,
         "socket_timeout": config.command_timeout_ms / 1000,
-        **_tls_options(config, scheme),
+        **_tls_options(config, scheme, include_ssl_flag=True),
     }
     sentinel = Sentinel(
         _endpoint_parts(config),
@@ -124,9 +132,14 @@ def create_redis_client(raw_params: dict[str, object]) -> RedisClientHandle:
             "password": sentinel_password,
         },
         **common,
+        **_tls_options(config, scheme, include_ssl_flag=True),
         db=config.db,
     )
     return RedisClientHandle(
-        sentinel.master_for(config.master_name or "", **common),
+        sentinel.master_for(
+            config.master_name or "",
+            **common,
+            **_tls_options(config, scheme, include_ssl_flag=True),
+        ),
         tuple(sentinel.sentinels),
     )
