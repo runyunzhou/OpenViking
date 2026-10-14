@@ -1091,6 +1091,65 @@ async def test_invalid_trusted_identity_does_not_block_later_registration(
         await plugin.shutdown()
 
 
+async def test_oversized_trusted_user_does_not_block_later_registration(
+    auth_service,
+):
+    """A user id beyond the shared limit is rejected before it reaches the batch."""
+    from openviking.server.auth.plugins import TrustedAuthPlugin
+
+    config = ServerConfig(
+        auth_mode="trusted",
+        root_api_key=ROOT_KEY,
+        trusted_identity_flush_interval_seconds=300,
+    )
+    app = FastAPI()
+    app.state.config = config
+    app.state.service_name = "openviking-server"
+    plugin = TrustedAuthPlugin()
+    await plugin.initialize(app, auth_service, config)
+    try:
+        oversized_request = _make_request(
+            "/api/v1/resources",
+            headers={
+                "X-OpenViking-Account": "long-account",
+                "X-OpenViking-User": "u" * 256,
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        oversized_request.app.state.config = config
+        with pytest.raises(InvalidArgumentError, match="user_id.*255"):
+            await plugin.resolve_identity(
+                oversized_request,
+                x_openviking_account="long-account",
+                x_openviking_user="u" * 256,
+            )
+
+        valid_request = _make_request(
+            "/api/v1/resources",
+            headers={
+                "X-OpenViking-Account": "good-account",
+                "X-OpenViking-User": "alice",
+            },
+            auth_enabled=False,
+            auth_mode="trusted",
+        )
+        valid_request.app.state.config = config
+        await plugin.resolve_identity(
+            valid_request,
+            x_openviking_account="good-account",
+            x_openviking_user="alice",
+        )
+        await plugin.flush_trusted_identities()
+
+        assert await _stored_users(auth_service, "long-account") == []
+        assert await _stored_users(auth_service, "good-account") == [
+            {"user_id": "alice", "role": "user"}
+        ]
+    finally:
+        await plugin.shutdown()
+
+
 async def test_trusted_identity_registration_skips_identity_loaded_from_registry(auth_service):
     """A restarted plugin must not queue an identity already loaded from storage."""
     from openviking.server.auth.plugins import TrustedAuthPlugin

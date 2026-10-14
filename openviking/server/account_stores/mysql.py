@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sqlalchemy import and_, case, func, select, update
+from sqlalchemy import and_, case, delete, func, select, update
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import (
@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from openviking.core.identifiers import MAX_IDENTIFIER_LENGTH
 from openviking.server.account_stores.base import AccountStore
 from openviking.server.account_stores.models import (
     AccountSummary,
@@ -56,7 +57,8 @@ from openviking_cli.session.user_id import (
 )
 from openviking_cli.utils.config.config_utils import normalize_service_name
 
-_MYSQL_IDENTIFIER_MAX_LENGTH = 255
+_MYSQL_IDENTIFIER_MAX_LENGTH = MAX_IDENTIFIER_LENGTH
+_RETAINED_REVOKED_CREDENTIALS = 10
 
 
 def _validate_length(value: str, name: str) -> None:
@@ -1165,6 +1167,28 @@ class MySQLAccountStore(AccountStore):
                     sequence=sequence + 1,
                 )
             )
+            await session.flush()
+            old_credentials = list(
+                (
+                    await session.scalars(
+                        select(Credential.credential_id)
+                        .where(
+                            Credential.service_name == self._service_name,
+                            Credential.user_pk == user.user_pk,
+                            Credential.revoked.is_(True),
+                        )
+                        .order_by(Credential.sequence.desc())
+                        .offset(_RETAINED_REVOKED_CREDENTIALS)
+                    )
+                ).all()
+            )
+            if old_credentials:
+                await session.execute(
+                    delete(Credential).where(
+                        Credential.service_name == self._service_name,
+                        Credential.credential_id.in_(old_credentials),
+                    )
+                )
 
     async def verify_api_key(
         self,

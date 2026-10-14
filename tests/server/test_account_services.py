@@ -10,13 +10,13 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import delete
+from sqlalchemy import and_, delete, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from openviking.server.account_stores import mysql as mysql_store_module
 from openviking.server.account_stores.mysql import MySQLAccountStore
-from openviking.server.account_stores.mysql_schema import Account, Base
+from openviking.server.account_stores.mysql_schema import Account, Base, Credential, User
 from openviking.server.api_keys import APIKeyManager
 from openviking.server.api_keys.legacy import FileStore
 from openviking.server.identity import Role
@@ -55,6 +55,10 @@ async def test_legacy_user_without_role_defaults_to_user_during_authentication(a
     manager = build_api_key_manager("root", SimpleNamespace(agfs=agfs))
     await manager.load()
     try:
+        assert await manager.ensure_trusted_identities({account_id: {user_id}}) == {
+            "created_accounts": 0,
+            "created_users": 0,
+        }
         identity = await manager.resolve_identity("legacy-key")
         assert (identity.account_id, identity.user_id, identity.role) == (
             account_id,
@@ -113,7 +117,7 @@ async def test_file_account_creation_respects_path_component_limit(issue_user_ke
 
 @pytest.mark.parametrize("issue_user_keys", [True, False], ids=["api-key", "trusted"])
 @pytest.mark.parametrize("length", [255, 256, 1024])
-async def test_file_account_creation_allows_shortened_admin_user_component(
+async def test_file_account_creation_respects_admin_user_id_limit(
     issue_user_keys,
     length,
 ):
@@ -125,19 +129,23 @@ async def test_file_account_creation_allows_shortened_admin_user_component(
     account_id = "acme"
     admin_user_id = "u" * length
     try:
-        key = await manager.create_account(account_id, admin_user_id)
-        assert await manager.get_registered_user_role(account_id, admin_user_id) == Role.ADMIN
-        if issue_user_keys:
-            assert (await manager.resolve_identity(key)).user_id == admin_user_id
+        if length <= 255:
+            key = await manager.create_account(account_id, admin_user_id)
+            assert await manager.get_registered_user_role(account_id, admin_user_id) == Role.ADMIN
+            if issue_user_keys:
+                assert (await manager.resolve_identity(key)).user_id == admin_user_id
         else:
-            assert key is None
+            with pytest.raises(InvalidArgumentError, match="user_id.*255"):
+                await manager.create_account(account_id, admin_user_id)
+            assert await manager.get_account(account_id) is None
+            assert await manager.get_user(account_id, admin_user_id) is None
     finally:
         await manager.close()
 
 
 @pytest.mark.parametrize("issue_user_keys", [True, False], ids=["api-key", "trusted"])
 @pytest.mark.parametrize("length", [255, 256, 1024])
-async def test_file_user_creation_allows_shortened_user_component(issue_user_keys, length):
+async def test_file_user_creation_respects_user_id_limit(issue_user_keys, length):
     agfs = InMemoryAGFS()
     manager = build_api_key_manager(
         "root", SimpleNamespace(agfs=agfs), issue_user_keys=issue_user_keys
@@ -146,12 +154,17 @@ async def test_file_user_creation_allows_shortened_user_component(issue_user_key
     user_id = "u" * length
     try:
         await manager.create_account("acme", "alice")
-        key = await manager.register_user("acme", user_id)
-        assert await manager.get_registered_user_role("acme", user_id) == Role.USER
-        if issue_user_keys:
-            assert (await manager.resolve_identity(key)).user_id == user_id
+        if length <= 255:
+            key = await manager.register_user("acme", user_id)
+            assert await manager.get_registered_user_role("acme", user_id) == Role.USER
+            if issue_user_keys:
+                assert (await manager.resolve_identity(key)).user_id == user_id
+            else:
+                assert key is None
         else:
-            assert key is None
+            with pytest.raises(InvalidArgumentError, match="user_id.*255"):
+                await manager.register_user("acme", user_id)
+            assert await manager.get_user("acme", user_id) is None
     finally:
         await manager.close()
 
@@ -556,6 +569,43 @@ async def test_mysql_managers_share_authoritative_state():
         assert (await second.resolve_identity(rotated)).role == Role.ADMIN
         with pytest.raises(UnauthenticatedError):
             await second.resolve_identity(key)
+        rotation_keys = [key, rotated]
+        for _ in range(11):
+            rotation_keys.append(await first.regenerate_key("acme", "alice"))
+        assert (await second.resolve_identity(rotation_keys[-1])).role == Role.ADMIN
+        async with first._store._session_factory() as session:
+            credentials = list(
+                (
+                    await session.scalars(
+                        select(Credential)
+                        .join(
+                            User,
+                            and_(
+                                User.service_name == Credential.service_name,
+                                User.user_pk == Credential.user_pk,
+                            ),
+                        )
+                        .join(
+                            Account,
+                            and_(
+                                Account.service_name == User.service_name,
+                                Account.account_pk == User.account_pk,
+                            ),
+                        )
+                        .where(
+                            Credential.service_name == service_name,
+                            Account.account_id == "acme",
+                            User.user_id == "alice",
+                        )
+                        .order_by(Credential.sequence)
+                    )
+                ).all()
+            )
+        assert len(credentials) == 11
+        assert [credential.sequence for credential in credentials] == list(range(3, 14))
+        assert sum(not credential.revoked for credential in credentials) == 1
+        with pytest.raises(UnauthenticatedError):
+            await second.resolve_identity(rotation_keys[1])
         await first.create_group("acme", "engineering")
         await first.add_group_member("acme", "engineering", "alice")
         assert await second.get_user_group_ids("acme", "alice") == ("engineering",)
