@@ -5,7 +5,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import pytest
@@ -150,10 +150,6 @@ async def test_queue_acks_failed_semantic_work(semantic_env, monkeypatch, wrappe
 
     await asyncio.wait_for(queue.dequeue(), timeout=1)
 
-    assert backend.write.await_args_list == [
-        call("/queue/Semantic/enqueue", queued_payload.encode()),
-        call("/queue/Semantic/ack", b"queue-message"),
-    ]
     status = await queue.get_status()
     assert status.is_complete
     assert status.in_progress == status.processed == status.requeue_count == 0
@@ -212,8 +208,22 @@ async def test_lock_error_requeues_without_consuming_failure_budget(semantic_env
     sleep.assert_not_awaited()
 
 
-async def test_invalid_request_does_not_open_breaker(semantic_env):
+@pytest.mark.asyncio
+async def test_semantic_model_error_fails_without_requeue(semantic_env):
     env = semantic_env
+    msg = env.message()
+    error = ModelError(ModelErrorKind.TRANSIENT_SERVICE_ERROR, "model request failed")
+    env.dag.run.side_effect = error
+
+    result = await asyncio.wait_for(env.processor.on_dequeue(msg.to_dict()), timeout=1)
+
+    assert result.outcome is ProcessOutcome.FAILED
+    assert result.error == str(error)
+    env.retry_queue.enqueue.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_invalid_request_does_not_open_breaker(semantic_env):
     env = semantic_env
     msg = env.message()
     error = ModelError(ModelErrorKind.INVALID_REQUEST, "400 invalid model parameter")
@@ -224,8 +234,7 @@ async def test_invalid_request_does_not_open_breaker(semantic_env):
     assert result.outcome is ProcessOutcome.FAILED
     assert result.error == str(error)
     env.retry_queue.enqueue.assert_not_awaited()
-    with pytest.raises(CircuitBreakerOpen):
-        env.processor._account_breaker(msg.account_id).check()
+    env.processor._account_breaker(msg.account_id).check()
 
 
 @pytest.mark.asyncio

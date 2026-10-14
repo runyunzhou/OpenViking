@@ -903,7 +903,7 @@ class _SnapshotMixin:
             if op == "reindex_marker":
                 await executor.reindex_directory_marker(dir_uri=uri, level=level, ctx=ctx)
             elif op == "reindex_file":
-                await executor.execute(uri=uri, mode="vectors_only", wait=True, ctx=ctx)
+                await executor.execute_in_current_task(uri=uri, mode="vectors_only", ctx=ctx)
             elif op == "delete":
                 await executor.delete_uri_level(uri=uri, level=level, ctx=ctx)
             else:  # pragma: no cover - defensive

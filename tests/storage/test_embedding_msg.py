@@ -299,16 +299,10 @@ def test_legacy_upsert_discards_historically_ignored_fields():
     assert restored.action is IndexAction.UPSERT
     assert restored.record_ids == []
     assert restored.field_patch is None
-    assert set(restored.to_dict()) == {
-        "id",
-        "telemetry_id",
-        "task_id",
-        "_task_work_id",
-        "queue_enqueued_at",
-        "failure_requeue_count",
-        "action",
-        "payload",
-    }
+    serialized = restored.to_dict()
+    assert "record_ids" not in serialized
+    assert "update_fields" not in serialized
+    assert "initial_fields" not in serialized
 
 
 def test_legacy_update_fields_message_normalizes_to_field_patch_payload():

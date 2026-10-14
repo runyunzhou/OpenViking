@@ -608,6 +608,10 @@ class _SpyExecutor:
         self.calls.append(("reindex_file", uri))
         return {"ok": True}
 
+    async def execute_in_current_task(self, *, uri, mode, ctx):
+        self.calls.append(("reindex_file", uri))
+        return {"ok": True}
+
     async def reindex_directory_marker(self, *, dir_uri, level, ctx):
         self.calls.append(("reindex_marker", dir_uri, int(level)))
 
@@ -826,16 +830,27 @@ async def test_restore_relations_json_has_no_vector_side_effect(vfs, monkeypatch
 @pytest.mark.asyncio
 async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
     """An applied restore with vector side-effects returns a ``task_id`` that
-    can be polled via the TaskTracker and reaches ``completed``.
+    can be polled without leaving an orphaned admin reindex task.
     """
-    spy = _SpyExecutor()
-
-    _patch_reindex_executor(monkeypatch, vfs, spy)
-
+    from openviking.service.reindex_executor import ReindexExecutor
     from openviking.service.task_tracker import (
         TaskTracker,
+        get_task_tracker,
         set_task_tracker,
     )
+
+    reindexed = []
+
+    async def run_reindex(_executor, **kwargs):
+        reindexed.append(kwargs["uri"])
+        return {
+            "status": "completed",
+            "uri": kwargs["uri"],
+            "object_type": kwargs["object_type"],
+            "mode": kwargs["mode"],
+        }
+
+    monkeypatch.setattr(ReindexExecutor, "_run", run_reindex)
 
     class _MemTaskStore:
         async def create(self, task):
@@ -870,8 +885,6 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
         task_id = result.get("task_id")
         assert task_id
 
-        from openviking.service.task_tracker import get_task_tracker
-
         tracker = get_task_tracker()
         task = await tracker.wait(
             task_id,
@@ -881,7 +894,24 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
         )
         assert task.task_type == "snapshot_restore_reindex"
         assert task.status.value == "completed"
-        assert ("reindex_file", "viking://resources/proj/x.md") in spy.calls
+        assert reindexed == ["viking://resources/proj/x.md"]
+
+        tasks = await tracker.list_tasks(
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
+        assert [item.task_type for item in tasks] == ["snapshot_restore_reindex"]
+
+        follow_up = await ReindexExecutor(
+            vlm_resolver=vfs._vlm_resolver,
+            vector_config_resolver=vfs._vector_config_resolver,
+        ).execute(
+            uri="viking://resources/proj/x.md",
+            mode="vectors_only",
+            wait=True,
+            ctx=ctx,
+        )
+        assert follow_up["status"] == "completed"
     finally:
         set_task_tracker(None)
 

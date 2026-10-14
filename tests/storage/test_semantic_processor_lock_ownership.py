@@ -213,6 +213,14 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
     index = TaskWorkIndex()
     tracker.attach_work_index(index)
     monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
+    entered_embedding_drain = asyncio.Event()
+    original_wait_for_work = tracker.wait_for_work
+
+    async def wait_for_work(*args, **kwargs):
+        entered_embedding_drain.set()
+        await original_wait_for_work(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "wait_for_work", wait_for_work)
     owner = _owner_kwargs("acc", "alice")
     source = await tracker.create("content_write", **owner)
     queue = NamedQueue(
@@ -279,8 +287,7 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
         worker = asyncio.create_task(processor.on_dequeue({"data": msg.to_json()}))
     try:
         await asyncio.wait_for(enqueued.wait(), 1)
-        # A bounded wait lets the semantic handler reach its embedding drain.
-        await asyncio.wait({worker}, timeout=0.03)
+        await asyncio.wait_for(entered_embedding_drain.wait(), 1)
         assert not worker.done()
         assert released == []
         payload = json.loads(agfs.files["/queue/Embedding/enqueue"])

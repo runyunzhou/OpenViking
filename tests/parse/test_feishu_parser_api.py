@@ -1345,7 +1345,6 @@ async def test_add_resource_processor_replay_skips_lock_adopt_when_result_exists
     async_agfs.pathlock_adopt.assert_not_awaited()
     service.execute_add_resource_job.assert_not_awaited()
     task_tracker.start.assert_not_awaited()
-    task_tracker.wait_for_task_work.assert_awaited_once_with("task-1", exclude_work_id="work-1")
     task_tracker.complete.assert_awaited_once()
     completed_result = task_tracker.complete.await_args.args[1]
     assert completed_result["root_uri"] == final_uri

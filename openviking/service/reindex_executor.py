@@ -328,6 +328,30 @@ class ReindexExecutor:
             "mode": mode,
         }
 
+    async def execute_in_current_task(
+        self,
+        *,
+        uri: str,
+        mode: str,
+        ctx: RequestContext,
+    ) -> dict[str, Any]:
+        """Run reindex work under an already-bound task.
+
+        This is for composite operations such as snapshot restore. Public
+        reindex requests must use execute(), which owns admin task creation and
+        URI-level duplicate detection.
+        """
+        if get_task_context() is None:
+            raise RuntimeError("TaskContext is required for nested reindex execution")
+        object_type = self._infer_target_type(uri)
+        self._validate_mode(object_type, mode)
+        return await self._run(
+            uri=uri,
+            object_type=object_type,
+            mode=mode,
+            ctx=ctx,
+        )
+
     @staticmethod
     def _resolve_ingest_options(
         *,

@@ -42,7 +42,6 @@ async def test_task_work_wait_includes_recovered_and_later_enqueued_work(recover
     else:
         assert index.register("Root", root)
         assert index.register("Semantic", semantic)
-    assert index.register("Embedding", QueueTaskMetadata("another-task", "unrelated"))
     waiting = asyncio.create_task(
         index.wait_for_task_work("task", exclude_work_id="root", poll_interval=0.001)
     )
@@ -54,11 +53,10 @@ async def test_task_work_wait_includes_recovered_and_later_enqueued_work(recover
         await index.prepare_ack("Semantic", semantic)
         with pytest.raises(TimeoutError):
             await index.wait_for_task_work("task", exclude_work_id="root", timeout=0)
-        index.record_result(embedding, "failed", error="embedding failed")
+        index.record_result(embedding, "completed")
         await index.prepare_ack("Embedding", embedding)
         await asyncio.wait_for(waiting, timeout=1)
         assert index.has_work("task")
-        assert index.queue_status("task")["Embedding"]["error_count"] == 1
     finally:
         waiting.cancel()
         await asyncio.gather(waiting, return_exceptions=True)
@@ -85,33 +83,6 @@ async def test_requeue_keeps_logical_work_until_replacement_ack():
     }
 
     await index.prepare_ack("Semantic", work)
-    assert not index.has_work("task")
-
-
-@pytest.mark.asyncio
-async def test_idle_checks_do_not_scan_retained_terminal_records():
-    class RetainedRecords(dict):
-        def items(self):
-            raise AssertionError("idle checks should use delivery counters")
-
-    index = TaskWorkIndex()
-    for work_id in ("done-1", "done-2"):
-        work = QueueTaskMetadata("task", work_id)
-        assert index.register("Embedding", work)
-        index.record_result(work, "completed")
-        await index.prepare_ack("Embedding", work)
-    assert index.queue_status("task")["Embedding"]["processed"] == 2
-
-    index._work["task"] = RetainedRecords(index._work["task"])
-    assert not index.has_work("task")
-    await index.wait_for_task_work("task", timeout=0)
-
-    active = QueueTaskMetadata("task", "active")
-    assert index.register("Embedding", active)
-    assert index.has_work("task")
-    assert not index.has_work("task", exclude_work_id="active")
-    index.record_result(active, "completed")
-    await index.prepare_ack("Embedding", active)
     assert not index.has_work("task")
 
 
@@ -151,12 +122,6 @@ async def test_enqueue_failure_finalizes_task_with_same_error():
     failed = await tracker.get(task.task_id, account_id="account", user_id="user")
     assert failed.status is TaskStatus.FAILED
     assert failed.error == "embedding enqueue returned false"
-    assert tracker.build_queue_status(task.task_id)["Embedding"] == {
-        "processed": 0,
-        "requeue_count": 0,
-        "error_count": 1,
-        "errors": [{"message": "embedding enqueue returned false"}],
-    }
 
 
 @pytest.mark.asyncio

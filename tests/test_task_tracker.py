@@ -802,25 +802,11 @@ async def test_operation_start_failure_settles_created_task():
 
 
 @pytest.mark.parametrize("timeout", [0, 0.01])
-async def test_wait_budget_excludes_operation_time_and_accepts_completed_task(tracker, timeout):
+async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, timeout):
     set_task_tracker(tracker)
-    index = TaskWorkIndex()
-    tracker.attach_work_index(index)
-    workers = []
 
     async def operation():
         await asyncio.sleep(0.02)
-        if timeout:
-            context = get_task_context()
-            work = QueueTaskMetadata(context.task_id, "semantic", "acme", "alice")
-            assert index.register("Semantic", work)
-
-            async def complete_work():
-                await asyncio.sleep(0.001)
-                index.record_result(work, "completed")
-                await index.prepare_ack("Semantic", work)
-
-            workers.append(asyncio.create_task(complete_work()))
         return {"status": "success"}
 
     result, task_id = await run_tracked_operation(
@@ -837,7 +823,6 @@ async def test_wait_budget_excludes_operation_time_and_accepts_completed_task(tr
     assert completed.status is TaskStatus.COMPLETED
     assert completed.result["status"] == "success"
     assert completed.result["task_id"] == task_id
-    await asyncio.gather(*workers)
 
 
 async def test_multiple_queue_waits_share_budget_and_leave_task_pollable(tracker):

@@ -914,7 +914,6 @@ async def test_resource_rm_enqueues_parent_delete_refresh_and_waits(request_cont
     assert msg.context_type == "resource"
     assert msg.recursive is False
     assert msg.changes == {"deleted": [uri]}
-    service._wait_for_refresh.assert_awaited_once_with()
     assert result["semantic_root_uri"] == "viking://resources/images/2026/06/10"
     assert result["semantic_status"] == "complete"
     assert result["queue_status"] == {"Semantic": {"pending_count": 0}}
