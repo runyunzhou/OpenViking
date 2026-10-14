@@ -1958,8 +1958,10 @@ separate table prefixes to isolate OpenViking clusters that share a database.
 ```
 
 `redis_mysql` requires the `redis-mysql` extra and wraps the same MySQL
-parameters. It caches API-key bindings, users, per-user group IDs, and deletion
-records for a fixed 60 seconds by default. Cache fills and account mutations
+parameters. Its `cache` block follows the top-level `cache` `provider/params`
+shape. The Python client currently supports `standalone`, `cluster`, and
+`sentinel` Redis deployments. It caches API-key bindings, users, per-user group
+IDs, and deletion records for a fixed 60 seconds by default. Cache fills and account mutations
 share an account-scoped Redis lease; normal cache hits do not acquire that
 lease. Mutations commit to MySQL first, then invalidate affected cache entries.
 If Redis is unavailable, the MySQL mutation still succeeds and stale cache
@@ -1974,9 +1976,10 @@ Redis automatically removes the index when its last sorted-set member is removed
 Cleanup does not issue a separate index deletion, which could remove a newer
 fill's index after lease loss. Provisioning
 and key replacement clear negative lookups both with and without a user hint.
-Redis socket connect and read timeouts default to 5 seconds each; override them
-with `socket_connect_timeout` and `socket_timeout` query parameters in `redis.url`.
-These are socket timeouts, not an overall request deadline.
+Redis connection and command timeouts are configured with
+`cache.params.connect_timeout_ms` and `cache.params.command_timeout_ms`; both
+default to 5000 milliseconds when omitted. These are socket timeouts, not an
+overall request deadline.
 
 ```json
 {
@@ -1990,12 +1993,24 @@ These are socket timeouts, not an overall request deadline.
           "password": "secret",
           "database": "openviking"
         },
-        "redis": {
-          "url": "rediss://redis.example.com:6379/0",
-          "key_prefix": "ov:account-auth",
-          "ttl_seconds": 60,
-          "lock_ttl_seconds": 60,
-          "lock_wait_seconds": 30
+        "cache": {
+          "provider": "redis",
+          "params": {
+            "mode": "sentinel",
+            "endpoints": [
+              "rediss://sentinel-1.example.com:26379",
+              "rediss://sentinel-2.example.com:26379",
+              "rediss://sentinel-3.example.com:26379"
+            ],
+            "master_name": "openviking",
+            "username": "openviking",
+            "password_env": "OPENVIKING_REDIS_PASSWORD",
+            "sentinel_password_env": "OPENVIKING_SENTINEL_PASSWORD",
+            "key_prefix": "ov:account-auth",
+            "ttl_seconds": 60,
+            "lock_ttl_seconds": 60,
+            "lock_wait_seconds": 30
+          }
         }
       }
     }

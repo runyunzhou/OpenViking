@@ -13,6 +13,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any, TypeVar
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from openviking.server.account_stores.base import AccountStore
 from openviking.server.account_stores.models import (
@@ -23,6 +24,10 @@ from openviking.server.account_stores.models import (
     UserSummary,
 )
 from openviking.server.account_stores.mysql import MySQLAccountStore
+from openviking.server.account_stores.redis_client import (
+    RedisClientHandle,
+    create_redis_client,
+)
 from openviking_cli.exceptions import InvalidArgumentError
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.config_utils import normalize_service_name
@@ -89,7 +94,6 @@ return redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
 """
 
 _ACCOUNT_CACHE_CLEAR_BATCH_SIZE = 500
-_REDIS_SOCKET_TIMEOUT_SECONDS = 5
 
 
 class _CacheLockUnavailable(Exception):
@@ -114,6 +118,47 @@ def _decode(raw: str | bytes | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _legacy_redis_cache_params(values: dict[str, object]) -> dict[str, object]:
+    url = values.pop("url", None)
+    if not isinstance(url, str) or not url:
+        raise InvalidArgumentError("redis.url must be a non-empty string")
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+        raise InvalidArgumentError("redis.url must use a redis:// or rediss:// URL")
+    try:
+        port = parsed.port or 6379
+    except ValueError as exc:
+        raise InvalidArgumentError("redis.url port is invalid") from exc
+    host = parsed.hostname
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    params: dict[str, object] = {
+        "mode": "standalone",
+        "endpoints": [f"{parsed.scheme}://{host}:{port}"],
+        **values,
+    }
+    if parsed.username and "username" not in params:
+        params["username"] = unquote(parsed.username)
+    if parsed.password and "password" not in params:
+        params["password"] = unquote(parsed.password)
+    if parsed.path not in {"", "/"} and "db" not in params:
+        try:
+            params["db"] = int(parsed.path.lstrip("/"))
+        except ValueError as exc:
+            raise InvalidArgumentError("redis.url database path is invalid") from exc
+    query = parse_qs(parsed.query)
+    for query_name, config_name in (
+        ("socket_connect_timeout", "connect_timeout_ms"),
+        ("socket_timeout", "command_timeout_ms"),
+    ):
+        if query_name in query and config_name not in params:
+            try:
+                params[config_name] = max(1, int(float(query[query_name][0]) * 1000))
+            except (IndexError, ValueError) as exc:
+                raise InvalidArgumentError(f"redis.url {query_name} is invalid") from exc
+    return params
+
+
 class RedisMySQLAccountStore(AccountStore):
     """Cache hot account reads while preserving MySQL as the authority.
 
@@ -136,7 +181,8 @@ class RedisMySQLAccountStore(AccountStore):
             raise InvalidArgumentError(str(exc)) from None
         values = dict(params or {})
         mysql_params = values.pop("mysql", None)
-        redis_params = values.pop("redis", None)
+        cache_spec = values.pop("cache", None)
+        legacy_redis_params = values.pop("redis", None)
         if values:
             names = ", ".join(sorted(values))
             raise InvalidArgumentError(f"Unknown Redis MySQL account store parameters: {names}")
@@ -151,38 +197,57 @@ class RedisMySQLAccountStore(AccountStore):
             raise InvalidArgumentError(
                 "Redis and MySQL account stores must use the same service_name"
             )
-        if not isinstance(redis_params, dict):
-            raise InvalidArgumentError("redis_mysql account storage requires redis parameters")
-
-        redis_values = dict(redis_params)
-        url = redis_values.pop("url", None)
+        if cache_spec is None and legacy_redis_params is not None:
+            if not isinstance(legacy_redis_params, dict):
+                raise InvalidArgumentError("redis_mysql account storage requires cache parameters")
+            legacy_values = dict(legacy_redis_params)
+            cache_spec = {
+                "provider": "redis",
+                "params": _legacy_redis_cache_params(legacy_values),
+            }
+        if not isinstance(cache_spec, dict):
+            raise InvalidArgumentError("redis_mysql account storage requires cache parameters")
+        unknown_cache_fields = set(cache_spec) - {"provider", "params"}
+        if unknown_cache_fields:
+            names = ", ".join(sorted(unknown_cache_fields))
+            raise InvalidArgumentError(f"Unknown Redis cache fields: {names}")
+        cache_provider = cache_spec.get("provider")
+        cache_params = cache_spec.get("params")
+        if cache_provider != "redis" or not isinstance(cache_params, dict):
+            raise InvalidArgumentError(
+                "redis_mysql account storage cache must use provider='redis' with a params object"
+            )
+        redis_values = dict(cache_params)
         self._key_prefix = redis_values.pop("key_prefix", "ov:account-cache")
-        self._ttl_seconds = redis_values.pop("ttl_seconds", 60)
+        self._ttl_seconds = redis_values.pop(
+            "ttl_seconds",
+            redis_values.get("default_ttl_seconds", 60),
+        )
         self._lock_ttl_seconds = redis_values.pop("lock_ttl_seconds", 60)
         self._lock_wait_seconds = redis_values.pop("lock_wait_seconds", 30)
-        if redis_values:
-            names = ", ".join(sorted(redis_values))
-            raise InvalidArgumentError(f"Unknown Redis cache parameters: {names}")
-        if not isinstance(url, str) or not url:
-            raise InvalidArgumentError("redis.url must be a non-empty string")
+        redis_values.setdefault("connect_timeout_ms", 5000)
+        redis_values.setdefault("command_timeout_ms", 5000)
         if not isinstance(self._key_prefix, str) or not self._key_prefix:
-            raise InvalidArgumentError("redis.key_prefix must be a non-empty string")
+            raise InvalidArgumentError("cache.params.key_prefix must be a non-empty string")
         if "{" in self._key_prefix or "}" in self._key_prefix:
             raise InvalidArgumentError(
-                "redis.key_prefix must not contain Redis hash-tag characters"
+                "cache.params.key_prefix must not contain Redis hash-tag characters"
             )
         for name in ("ttl_seconds", "lock_ttl_seconds", "lock_wait_seconds"):
             value = getattr(self, f"_{name}")
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise InvalidArgumentError(f"redis.{name} must be a positive integer")
+                raise InvalidArgumentError(f"cache.params.{name} must be a positive integer")
         if self._lock_ttl_seconds < self._ttl_seconds:
-            raise InvalidArgumentError("redis.lock_ttl_seconds must be at least redis.ttl_seconds")
+            raise InvalidArgumentError(
+                "cache.params.lock_ttl_seconds must be at least cache.params.ttl_seconds"
+            )
 
         self._mysql = mysql_store
         self._index_ttl_seconds = self._ttl_seconds + self._lock_ttl_seconds
         self._service_name = normalized_service_name
         self._redis = redis_client
-        self._redis_url = url
+        self._redis_config = redis_values
+        self._redis_handle: RedisClientHandle | None = None
         self._owns_redis = redis_client is None
 
     async def load(self) -> None:
@@ -190,17 +255,12 @@ class RedisMySQLAccountStore(AccountStore):
         try:
             if self._redis is None:
                 try:
-                    from redis.asyncio import Redis
+                    self._redis_handle = create_redis_client(self._redis_config)
                 except ImportError:
                     raise RuntimeError(
                         "Redis MySQL account storage requires openviking[redis-mysql]"
                     ) from None
-                self._redis = Redis.from_url(
-                    self._redis_url,
-                    decode_responses=True,
-                    socket_connect_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-                    socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-                )
+                self._redis = self._redis_handle.client
             await self._redis.ping()
         except BaseException:
             await self.close()
@@ -208,12 +268,11 @@ class RedisMySQLAccountStore(AccountStore):
 
     async def close(self) -> None:
         try:
-            if self._redis is not None and self._owns_redis:
-                close = getattr(self._redis, "aclose", None)
-                if close is not None:
-                    await close()
+            if self._redis_handle is not None and self._owns_redis:
+                await self._redis_handle.close()
         finally:
             self._redis = None
+            self._redis_handle = None
             await self._mysql.close()
 
     def _account_tag(self, account_id: str) -> str:

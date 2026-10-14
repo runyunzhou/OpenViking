@@ -213,11 +213,15 @@ def _store(
     store = RedisMySQLAccountStore(
         service_name=service_name,
         params={
-            "redis": {
-                "url": "redis://unused",
-                "ttl_seconds": 60,
-                "lock_ttl_seconds": 60,
-                "lock_wait_seconds": lock_wait_seconds,
+            "cache": {
+                "provider": "redis",
+                "params": {
+                    "mode": "standalone",
+                    "endpoints": ["redis://unused"],
+                    "ttl_seconds": 60,
+                    "lock_ttl_seconds": 60,
+                    "lock_wait_seconds": lock_wait_seconds,
+                },
             }
         },
         mysql_store=mysql,
@@ -243,13 +247,53 @@ def test_redis_timeouts_must_be_positive_integers():
         ("lock_ttl_seconds", 0),
         ("lock_wait_seconds", -1),
     ):
-        with pytest.raises(InvalidArgumentError, match=f"redis.{name} must be a positive integer"):
+        with pytest.raises(
+            InvalidArgumentError,
+            match=f"cache.params.{name} must be a positive integer",
+        ):
             RedisMySQLAccountStore(
                 service_name="test-service",
-                params={"redis": {"url": "redis://unused", name: value}},
+                params={
+                    "cache": {
+                        "provider": "redis",
+                        "params": {
+                            "mode": "standalone",
+                            "endpoints": ["redis://unused"],
+                            name: value,
+                        },
+                    }
+                },
                 mysql_store=mysql,
                 redis_client=FakeRedis(),
             )
+
+
+def test_legacy_redis_url_is_translated_to_cache_config():
+    mysql = FakeMySQLAuthority(_api_key())
+    store = RedisMySQLAccountStore(
+        service_name="test-service",
+        params={
+            "redis": {
+                "url": (
+                    "redis://cache-user:cache-password@redis.example.com:6381/2"
+                    "?socket_connect_timeout=0.25&socket_timeout=0.5"
+                ),
+                "key_prefix": "legacy-cache",
+            }
+        },
+        mysql_store=mysql,
+        redis_client=FakeRedis(),
+    )
+
+    assert store._redis_config == {
+        "mode": "standalone",
+        "endpoints": ["redis://redis.example.com:6381"],
+        "username": "cache-user",
+        "password": "cache-password",
+        "db": 2,
+        "connect_timeout_ms": 250,
+        "command_timeout_ms": 500,
+    }
 
 
 async def test_service_names_do_not_share_cached_identities():
@@ -283,11 +327,15 @@ async def test_real_redis_mysql_service_name_isolation():
     key_prefix = f"ov:test:{uuid4().hex}"
     params = {
         "mysql": json.loads(raw_mysql),
-        "redis": {
-            "url": redis_url,
-            "key_prefix": key_prefix,
-            "ttl_seconds": 60,
-            "lock_ttl_seconds": 60,
+        "cache": {
+            "provider": "redis",
+            "params": {
+                "mode": "standalone",
+                "endpoints": [redis_url],
+                "key_prefix": key_prefix,
+                "ttl_seconds": 60,
+                "lock_ttl_seconds": 60,
+            },
         },
     }
     first = build_api_key_manager(

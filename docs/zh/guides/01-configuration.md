@@ -1939,6 +1939,8 @@ schema 变更按顺序存放于 `openviking/server/account_stores/sql/changes/`�
 ```
 
 `redis_mysql` 需要安装 `redis-mysql` extra，并在参数中嵌套同一份 MySQL 配置。
+其 `cache` 配置沿用顶层 `cache` 的 `provider/params` 结构，目前 Python
+客户端支持 `standalone`、`cluster` 和 `sentinel` 三种 Redis 部署模式。
 它默认以固定 60 秒 TTL 缓存 API Key 绑定、User、每个 User 的 Group ID 和删除记录。
 缓存重建与同一 Account 的修改共用 Redis 租约，正常缓存命中不获取该租约。修改会先
 提交 MySQL，再失效相关缓存。Redis 不可用时 MySQL 修改仍会成功，遗留缓存最多保持到
@@ -1949,8 +1951,8 @@ Account 时只会清理该 Account 当前的 User、Group、删除记录和凭�
 索引的最后一个有序集合成员被移除后，Redis 会自动删除空索引；清理结束时不再单独删除
 索引，避免失去租约的旧请求误删新回填的索引。创建身份或换 Key 会同时清除携带和未携带
 User 提示的负缓存。
-Redis socket 连接和读取超时默认分别为 5 秒，可通过 `redis.url` 中的
-`socket_connect_timeout`、`socket_timeout` 查询参数覆盖；这不是整个请求的总超时。
+Redis 连接和命令超时通过 `cache.params.connect_timeout_ms` 和
+`cache.params.command_timeout_ms` 配置，未配置时均为 5000 毫秒；这不是整个请求的总超时。
 
 ```json
 {
@@ -1964,12 +1966,24 @@ Redis socket 连接和读取超时默认分别为 5 秒，可通过 `redis.url` 
           "password": "secret",
           "database": "openviking"
         },
-        "redis": {
-          "url": "rediss://redis.example.com:6379/0",
-          "key_prefix": "ov:account-auth",
-          "ttl_seconds": 60,
-          "lock_ttl_seconds": 60,
-          "lock_wait_seconds": 30
+        "cache": {
+          "provider": "redis",
+          "params": {
+            "mode": "sentinel",
+            "endpoints": [
+              "rediss://sentinel-1.example.com:26379",
+              "rediss://sentinel-2.example.com:26379",
+              "rediss://sentinel-3.example.com:26379"
+            ],
+            "master_name": "openviking",
+            "username": "openviking",
+            "password_env": "OPENVIKING_REDIS_PASSWORD",
+            "sentinel_password_env": "OPENVIKING_SENTINEL_PASSWORD",
+            "key_prefix": "ov:account-auth",
+            "ttl_seconds": 60,
+            "lock_ttl_seconds": 60,
+            "lock_wait_seconds": 30
+          }
         }
       }
     }
