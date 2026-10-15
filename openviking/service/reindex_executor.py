@@ -250,6 +250,7 @@ class ReindexExecutor:
                 wait=True,
                 resource_id=uri,
                 existing_task=task,
+                accept_failed_result=self._accept_partial_result,
             )
             return result
 
@@ -351,6 +352,11 @@ class ReindexExecutor:
             mode=mode,
             ctx=ctx,
         )
+
+    @staticmethod
+    def _accept_partial_result(result: Any) -> bool:
+        """Keep record-level reindex failures in the structured result."""
+        return isinstance(result, dict) and int(result.get("failed_records", 0) or 0) > 0
 
     @staticmethod
     def _resolve_ingest_options(

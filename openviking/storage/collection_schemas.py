@@ -44,7 +44,6 @@ from openviking.storage.viking_vector_index_backend import (
     normalize_upsert_options,
 )
 from openviking.telemetry import bind_telemetry, resolve_telemetry
-from openviking.service.task_tracker import get_task_tracker
 from openviking.utils.circuit_breaker import CircuitBreakerOpen
 from openviking.utils.log_correlation import log_correlation
 from openviking.utils.tags import merge_search_tags

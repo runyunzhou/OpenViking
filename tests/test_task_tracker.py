@@ -666,6 +666,52 @@ async def test_wait_timeout_preserves_recorded_operation_result(tracker):
     }
 
 
+async def test_accept_failed_result_returns_structured_partial_result(tracker):
+    index = TaskWorkIndex()
+    tracker.attach_work_index(index)
+    set_task_tracker(tracker)
+    workers = []
+
+    async def operation():
+        context = get_task_context()
+        work = QueueTaskMetadata(
+            context.task_id,
+            "embedding-work",
+            context.account_id,
+            context.user_id,
+        )
+        assert index.register("Embedding", work)
+
+        async def fail_work():
+            await asyncio.sleep(0)
+            index.record_result(work, "failed", error="embedding failed")
+            await index.prepare_ack("Embedding", work)
+
+        workers.append(asyncio.create_task(fail_work()))
+        return {
+            "status": "completed",
+            "failed_records": 1,
+            "warnings": ["Embedding queue failed during reindex: embedding failed"],
+        }
+
+    result, task_id = await run_tracked_operation(
+        "admin_reindex",
+        account_id="acme",
+        user_id="alice",
+        operation=operation,
+        wait=True,
+        accept_failed_result=lambda value: (
+            isinstance(value, dict) and value.get("failed_records", 0) > 0
+        ),
+    )
+
+    assert result["failed_records"] == 1
+    task = await tracker.wait(task_id, **_owner_kwargs(), timeout=1)
+    assert task.status is TaskStatus.FAILED
+    assert task.result["failed_records"] == 1
+    await asyncio.gather(*workers)
+
+
 @pytest.mark.parametrize(
     ("raised", "expected_message"),
     [

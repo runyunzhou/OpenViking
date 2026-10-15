@@ -185,8 +185,13 @@ async def run_tracked_operation(
     timeout: Optional[float] = None,
     resource_id: Optional[str] = None,
     existing_task: Optional[TaskRecord] = None,
+    accept_failed_result: Callable[[_OperationResult], bool] | None = None,
 ) -> tuple[_OperationResult, str]:
-    """Run a top-level operation under a Task, reusing an existing Task context."""
+    """Run a top-level operation under a Task, reusing an existing Task context.
+
+    ``accept_failed_result`` is reserved for operations whose result explicitly
+    reports record-level failures while the Task retains its failed status.
+    """
     from openviking.service.task_work_index import bind_task_context, get_task_context
 
     current = get_task_context()
@@ -281,7 +286,9 @@ async def run_tracked_operation(
                     user_id=user_id,
                     timeout=timeout,
                 )
-                if terminal.status == TaskStatus.FAILED:
+                if terminal.status == TaskStatus.FAILED and not (
+                    accept_failed_result is not None and accept_failed_result(result)
+                ):
                     raise OpenVikingError(
                         terminal.error or "Task processing failed",
                         code="PROCESSING_ERROR",

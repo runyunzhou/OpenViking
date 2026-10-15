@@ -635,6 +635,28 @@ def _patch_reindex_executor(monkeypatch, vfs, spy):
     monkeypatch.setattr(reindex_mod, "ReindexExecutor", factory)
 
 
+class _MemTaskStore:
+    def __init__(self, *, fail_creates: int = 0):
+        self.fail_creates = fail_creates
+
+    async def create(self, task):
+        if self.fail_creates:
+            self.fail_creates -= 1
+            raise OSError("task store temporarily unavailable")
+
+    async def update(self, task):
+        return None
+
+    async def get(self, task_id, *, account_id=None, user_id=None):
+        return None
+
+    async def list(self, account_id, *, user_id=None):
+        return []
+
+    async def delete(self, task_id, *, account_id, user_id=None):
+        return None
+
+
 @pytest.mark.asyncio
 async def test_restore_schedules_reindex_for_derived_only_change(vfs, monkeypatch):
     """When a restore only changes a directory `.abstract.md` (source file
@@ -852,22 +874,6 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
 
     monkeypatch.setattr(ReindexExecutor, "_run", run_reindex)
 
-    class _MemTaskStore:
-        async def create(self, task):
-            return None
-
-        async def update(self, task):
-            return None
-
-        async def get(self, task_id, *, account_id=None, user_id=None):
-            return None
-
-        async def list(self, account_id, *, user_id=None):
-            return []
-
-        async def delete(self, task_id, *, account_id, user_id=None):
-            return None
-
     set_task_tracker(TaskTracker(store=_MemTaskStore()))
     try:
         ctx = _make_ctx(account="acct_taskid")
@@ -912,6 +918,63 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
             ctx=ctx,
         )
         assert follow_up["status"] == "completed"
+    finally:
+        set_task_tracker(None)
+
+
+@pytest.mark.asyncio
+async def test_restore_task_registration_failure_falls_back_to_file_reindex(
+    vfs,
+    monkeypatch,
+):
+    from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.service.task_tracker import TaskStatus, TaskTracker, set_task_tracker
+
+    ctx = _make_ctx(account="acct_task_fallback")
+    restored_contents = []
+    rebuilt = asyncio.Event()
+
+    async def run_reindex(_executor, **kwargs):
+        restored_contents.append(await vfs.read(kwargs["uri"], ctx=kwargs["ctx"]))
+        rebuilt.set()
+        return {
+            "status": "completed",
+            "uri": kwargs["uri"],
+            "object_type": kwargs["object_type"],
+            "mode": kwargs["mode"],
+        }
+
+    monkeypatch.setattr(ReindexExecutor, "_run", run_reindex)
+    tracker = TaskTracker(store=_MemTaskStore(fail_creates=1))
+    set_task_tracker(tracker)
+    try:
+        uri = "viking://resources/proj/a.md"
+        await vfs.write_file(uri, b"first version", ctx=ctx)
+        first = await vfs.commit(message="v1", ctx=ctx)
+        await vfs.write_file(uri, b"second version", ctx=ctx)
+        await vfs.commit(message="v2", ctx=ctx)
+
+        result = await vfs.restore(
+            project_dir="viking://resources/proj",
+            source_commit=first["commit_oid"],
+            ctx=ctx,
+        )
+
+        assert result["result"] == "applied"
+        assert "task_id" not in result
+        await asyncio.wait_for(rebuilt.wait(), 1)
+        assert restored_contents == [b"first version"]
+
+        tasks = await tracker.list_tasks(account_id=ctx.account_id, user_id=ctx.user.user_id)
+        assert len(tasks) == 1
+        assert tasks[0].task_type == "admin_reindex"
+        task = await tracker.wait(
+            tasks[0].task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+            timeout=1,
+        )
+        assert task.status is TaskStatus.COMPLETED
     finally:
         set_task_tracker(None)
 
