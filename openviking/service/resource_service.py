@@ -695,6 +695,7 @@ class ResourceService:
     ) -> Any:
         """Persist a job and fully own the passed lock until handoff or release completes."""
         from openviking.service.task_tracker import get_task_tracker
+        from openviking.service.task_work_index import bind_task_context
         from openviking.storage.queuefs import get_queue_manager
 
         tracker = get_task_tracker()
@@ -712,7 +713,10 @@ class ResourceService:
                 ),
                 auth=task_auth,
             )
-            await get_queue_manager().enqueue(queue_name, msg.to_dict())
+            task_account_id = getattr(task, "account_id", msg.account_id)
+            task_user_id = getattr(task, "user_id", msg.user_id)
+            with bind_task_context(task.task_id, task_account_id, task_user_id):
+                await get_queue_manager().enqueue(queue_name, msg.to_dict())
             enqueued = True
             if on_enqueued is not None:
                 on_enqueued()

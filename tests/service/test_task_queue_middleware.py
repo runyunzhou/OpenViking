@@ -107,6 +107,54 @@ async def test_enqueue_registers_before_write_and_ack_finalizes_before_delete(tr
     assert not index.has_work("task-1")
 
 
+async def test_enqueue_keeps_content_owner_separate_from_task_owner(tracked_queue):
+    queue, _, transport, _, _ = tracked_queue
+    payload = {
+        "task_id": "task-1",
+        "account_id": "account",
+        "user_id": "content-owner",
+        "task_account_id": "business-account",
+        "task_user_id": "business-user",
+        "payload": {
+            "context_data": {
+                "account_id": "account",
+                "owner_user_id": "content-owner",
+            }
+        },
+    }
+
+    with bind_task_context("task-1", "account", "task-owner"):
+        await queue.enqueue(payload)
+
+    persisted = json.loads(transport.write.await_args.args[1])
+    assert persisted["user_id"] == "content-owner"
+    assert persisted["task_account_id"] == "business-account"
+    assert persisted["task_user_id"] == "business-user"
+    assert persisted["payload"]["context_data"]["owner_user_id"] == "content-owner"
+    assert persisted["_task_account_id"] == "account"
+    assert persisted["_task_user_id"] == "task-owner"
+    assert extract_task_metadata(persisted).user_id == "task-owner"
+
+
+async def test_enqueue_does_not_stamp_task_owner_without_authoritative_context(tracked_queue):
+    queue, _, transport, _, _ = tracked_queue
+
+    with bind_task_context("task-1", "", ""):
+        await queue.enqueue(
+            {
+                "task_id": "task-1",
+                "account_id": "account",
+                "user_id": "content-owner",
+            }
+        )
+
+    persisted = json.loads(transport.write.await_args.args[1])
+    assert persisted["account_id"] == "account"
+    assert persisted["user_id"] == "content-owner"
+    assert "_task_account_id" not in persisted
+    assert "_task_user_id" not in persisted
+
+
 async def test_enqueue_failure_records_failed_work(tracked_queue):
     queue, index, transport, finalize, _ = tracked_queue
     transport.write.side_effect = OSError("write failed")

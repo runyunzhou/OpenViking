@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
-from openviking.service.task_work_index import bind_task_context, extract_task_metadata
+from openviking.service.task_work_index import bind_task_context_from_message, extract_task_metadata
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.reindex_msg import ReindexMsg
@@ -75,6 +75,10 @@ class ReindexProcessor(DequeueHandlerBase):
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         if not data:
             return ProcessResult.success()
+        with bind_task_context_from_message(data):
+            return await self._on_dequeue_bound(data)
+
+    async def _on_dequeue_bound(self, data: Dict[str, Any]) -> ProcessResult:
         payload = data.get("data", data)
         if isinstance(payload, str):
             payload = json.loads(payload)
@@ -129,10 +133,7 @@ class ReindexProcessor(DequeueHandlerBase):
                 vlm_resolver=service._vlm_resolver,
                 vector_config_resolver=service._vector_config_resolver,
             )
-            with (
-                bind_telemetry(telemetry),
-                bind_task_context(msg.task_id, ctx.account_id, ctx.user.user_id),
-            ):
+            with bind_telemetry(telemetry):
                 # _run owns an existing lease and releases or hands it off on
                 # every exit path. Clear this consumer's reference before the
                 # call so an exception cannot release the same lease twice.

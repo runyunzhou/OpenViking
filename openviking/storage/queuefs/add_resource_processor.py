@@ -12,7 +12,7 @@ from openviking.observability.context import bind_execution_context
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.service.task_work_index import (
-    bind_task_context,
+    bind_task_context_from_message,
     extract_task_metadata,
 )
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
@@ -140,6 +140,10 @@ class AddResourceProcessor(DequeueHandlerBase):
         return True
 
     async def _process(self, msg: AddResourceMsg, data: Dict[str, Any]) -> ProcessResult:
+        with bind_task_context_from_message(data):
+            return await self._process_bound(msg, data)
+
+    async def _process_bound(self, msg: AddResourceMsg, data: Dict[str, Any]) -> ProcessResult:
         telemetry_id = msg.telemetry_id or ""
         ctx = RequestContext(
             user=UserIdentifier(msg.account_id, msg.user_id),
@@ -225,11 +229,7 @@ class AddResourceProcessor(DequeueHandlerBase):
                 user_id=ctx.user.user_id,
             )
 
-        with (
-            bind_execution_context(),
-            bind_telemetry(telemetry),
-            bind_task_context(msg.task_id, ctx.account_id, ctx.user.user_id),
-        ):
+        with bind_execution_context(), bind_telemetry(telemetry):
             terminal = False
             try:
                 queue_message_id = str(data.get("id") or "")

@@ -20,6 +20,8 @@ from typing import Any, Awaitable, Callable, Dict, Generator, Iterable, Mapping,
 from uuid import uuid4
 
 TASK_WORK_ID_FIELD = "_task_work_id"
+TASK_ACCOUNT_ID_FIELD = "_task_account_id"
+TASK_USER_ID_FIELD = "_task_user_id"
 _TERMINAL_WORK_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
 
@@ -155,6 +157,11 @@ def _payload_dict(message: Any) -> Optional[Dict[str, Any]]:
 
 
 def _owner_from_payload(payload: Mapping[str, Any]) -> tuple[str, str]:
+    task_account_id = payload.get(TASK_ACCOUNT_ID_FIELD)
+    task_user_id = payload.get(TASK_USER_ID_FIELD)
+    if task_account_id and task_user_id:
+        return str(task_account_id), str(task_user_id)
+
     account_id = payload.get("account_id")
     user_id = payload.get("user_id")
 
@@ -187,14 +194,23 @@ def prepare_task_payload(
         return payload, None
 
     task_id = str(task_id)
-    account_id, user_id = _owner_from_payload(payload)
-    if current is not None and current.task_id == task_id:
-        account_id = account_id or current.account_id
-        user_id = user_id or current.user_id
+    has_authoritative_context = (
+        current is not None
+        and current.task_id == task_id
+        and current.account_id
+        and current.user_id
+    )
+    if has_authoritative_context:
+        account_id, user_id = current.account_id, current.user_id
+    else:
+        account_id, user_id = "", ""
 
     work_id = str(payload.get(TASK_WORK_ID_FIELD) or uuid4())
     payload["task_id"] = task_id
     payload[TASK_WORK_ID_FIELD] = work_id
+    if has_authoritative_context:
+        payload[TASK_ACCOUNT_ID_FIELD] = account_id
+        payload[TASK_USER_ID_FIELD] = user_id
     if account_id and user_id:
         payload.setdefault("account_id", account_id)
         payload.setdefault("user_id", user_id)
@@ -214,6 +230,39 @@ def extract_task_metadata(message: Any) -> Optional[QueueTaskMetadata]:
         return None
     account_id, user_id = _owner_from_payload(payload)
     return QueueTaskMetadata(str(task_id), str(work_id), account_id, user_id)
+
+
+@contextmanager
+def bind_task_context_from_message(message: Any) -> Generator[None, None, None]:
+    """Bind TaskContext for direct queue handler calls that bypass middleware."""
+    if _current_task_context.get() is not None:
+        yield
+        return
+
+    metadata = extract_task_metadata(message)
+    if metadata is None:
+        payload = _payload_dict(message)
+        if payload is None or not payload.get("task_id"):
+            yield
+            return
+        account_id, user_id = _owner_from_payload(payload)
+        metadata = QueueTaskMetadata(
+            str(payload["task_id"]),
+            str(payload.get(TASK_WORK_ID_FIELD) or ""),
+            account_id,
+            user_id,
+        )
+    if not metadata.account_id or not metadata.user_id:
+        yield
+        return
+
+    with bind_task_context(
+        metadata.task_id,
+        metadata.account_id,
+        metadata.user_id,
+        work_id=metadata.work_id or None,
+    ):
+        yield
 
 
 class TaskWorkIndex:

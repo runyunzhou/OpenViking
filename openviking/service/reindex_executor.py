@@ -27,7 +27,7 @@ from openviking.core.namespace import (
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
 from openviking.service.task_tracker import get_task_tracker, run_tracked_operation
-from openviking.service.task_work_index import get_task_context
+from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage.abstract_overview import body_for_preview, embedding_text_for_body
 from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
@@ -303,7 +303,8 @@ class ReindexExecutor:
                 lock_handoff=handoff,
             )
             queue_manager = get_queue_manager()
-            await queue_manager.enqueue(queue_manager.REINDEX, msg.to_dict())
+            with bind_task_context(task.task_id, task.account_id, task.user_id):
+                await queue_manager.enqueue(queue_manager.REINDEX, msg.to_dict())
             enqueued = True
             await service.viking_fs._async_agfs.pathlock_handoff(lease)
             lease = None

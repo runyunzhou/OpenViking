@@ -358,3 +358,32 @@ async def test_bootstrap_restores_legacy_messages_into_middleware_index(transpor
     await queue.ack("legacy-message", message)
     assert not attached[0].has_work("task")
     transport.write.assert_awaited_once_with("/queue/Test/ack", b"legacy-message")
+
+
+async def test_bootstrap_restores_task_owner_from_cross_user_child_work(transport):
+    manager = QueueManager(object())
+    manager.get_queue("Test", allow_create=True)
+    message = {
+        "id": "cross-user-child",
+        "data": json.dumps(
+            {
+                "task_id": "task",
+                "_task_work_id": "work",
+                "account_id": "account",
+                "user_id": "content-owner",
+                "_task_account_id": "account",
+                "_task_user_id": "task-owner",
+            }
+        ),
+    }
+    transport.read.return_value = json.dumps([message]).encode()
+
+    class Tracker:
+        def attach_work_index(self, index):
+            assert index.has_work("task")
+
+        async def restore_work_tasks(self, owners):
+            assert owners == {"task": ("account", "task-owner")}
+            return ["restored"]
+
+    assert await manager.prepare_task_tracking(Tracker()) == ["restored"]
