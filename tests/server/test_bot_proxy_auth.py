@@ -371,9 +371,9 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
     }
     private_payload = {"args": private_args} if private_args else {}
     assert task.to_dict()["meta"]["request"].get("args", {}) == public_args
-    stored = await store.get(task.task_id, **owner)
+    stored = await store.get_task(task.task_id, **owner)
     assert stored is not None
-    assert stored["meta"]["request"].get("args", {}) == public_args
+    assert stored.meta["request"].get("args", {}) == public_args
 
     tracker = TaskTracker(store)
     restored = await tracker.get(task.task_id, **owner)
@@ -483,6 +483,7 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
     queue._async_agfs = backend
     store = PersistentTaskStore(MockLocalAGFS(root_path=tmp_path))
     tracker = TaskTracker(store)
+    monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
     monkeypatch.setattr(external_task_service_module, "get_task_tracker", lambda: tracker)
     monkeypatch.setattr(external_task_service_module, "get_queue_manager", lambda: manager)
     monkeypatch.setattr(
@@ -559,13 +560,21 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
         include_events=False,
         _ctx=ctx,
     )
-    assert queried.result == (await state(first)).to_dict()
+    queried_task = dict(queried.result)
+    current_task = (await state(first)).to_dict()
+    assert queried_task.pop("processing_seconds") >= 0
+    assert current_task.pop("processing_seconds") >= 0
+    assert queried_task == current_task
     assert queried.result["meta"]["request"].get("args", {}) == public_args
 
     await queue.dequeue()  # Same target rotates, including across users.
     assert (await state(waiting)).status == TaskStatus.PENDING
     assert waiting.task_id not in submitted
-    assert tracker.has_work(waiting.task_id)  # Requeue survives ACK of the old delivery.
+    assert await tracker.has_work(
+        waiting.task_id,
+        account_id=waiting.account_id,
+        user_id=waiting.user_id,
+    )  # Requeue survives ACK of the old delivery.
     await queue.dequeue()
     assert (await state(independent)).status == TaskStatus.COMPLETED
     await tracker.cancel(cancelled.task_id, account_id="acct", user_id="alice")
@@ -584,6 +593,7 @@ async def test_compile_api_client_session_protocol_retry_and_cancellation(
         with pytest.raises(asyncio.CancelledError):
             await worker
         tracker = TaskTracker(store)
+        monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
         tasks = ExternalTaskService()
         tasks.register(CompileService(service._config, tasks, SimpleNamespace()))
         queue.set_dequeue_handler(ExternalTaskProcessor(tasks))

@@ -10,7 +10,7 @@ from openviking.core.context import ContextLevel
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskTracker
-from openviking.service.task_work_index import TaskWorkIndex, bind_task_context
+from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.storage import content_write as content_write_module
 from openviking.storage.abstract_overview import (
@@ -31,7 +31,6 @@ from tests.test_task_tracker import _FakeAgfs
 @pytest.fixture(autouse=True)
 def run_content_write_operations_inline(monkeypatch):
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-    tracker.attach_work_index(TaskWorkIndex())
     monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
 
     async def run_tracked_operation(_task_type, *, operation, **_kwargs):

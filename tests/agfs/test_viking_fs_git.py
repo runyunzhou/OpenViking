@@ -21,9 +21,11 @@ from openviking.pyagfs.exceptions import (
     AGFSNotSupportedError,
 )
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_store import PersistentTaskStore
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
+from tests.test_task_tracker import _FakeAgfs
 
 ragfs_python = pytest.importorskip("ragfs_python")
 
@@ -635,26 +637,16 @@ def _patch_reindex_executor(monkeypatch, vfs, spy):
     monkeypatch.setattr(reindex_mod, "ReindexExecutor", factory)
 
 
-class _MemTaskStore:
+class _MemTaskStore(PersistentTaskStore):
     def __init__(self, *, fail_creates: int = 0):
+        super().__init__(_FakeAgfs())
         self.fail_creates = fail_creates
 
-    async def create(self, task):
+    async def create(self, task, *, reject_if_active=False):
         if self.fail_creates:
             self.fail_creates -= 1
             raise OSError("task store temporarily unavailable")
-
-    async def update(self, task):
-        return None
-
-    async def get(self, task_id, *, account_id=None, user_id=None):
-        return None
-
-    async def list(self, account_id, *, user_id=None):
-        return []
-
-    async def delete(self, task_id, *, account_id, user_id=None):
-        return None
+        return await super().create(task, reject_if_active=reject_if_active)
 
 
 @pytest.mark.asyncio

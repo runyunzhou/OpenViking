@@ -9,7 +9,7 @@ import openviking.storage.content_write as content_write_module
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskTracker
-from openviking.service.task_work_index import TaskWorkIndex, bind_task_context
+from openviking.service.task_work_index import bind_task_context
 from openviking.session.memory.dataclass import MemoryFile
 from openviking.session.memory.utils import MemoryFileUtils
 from openviking.storage.content_write import ContentWriteCoordinator
@@ -131,7 +131,6 @@ def _coordinator_queue_for_unit_tests(monkeypatch, request):
     )
     monkeypatch.setattr(content_write_module, "get_queue_manager", lambda: queue_manager)
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-    tracker.attach_work_index(TaskWorkIndex())
     monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
 
     async def run_tracked_operation(_task_type, *, operation, **_kwargs):

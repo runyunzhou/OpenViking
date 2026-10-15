@@ -858,7 +858,11 @@ class _SnapshotMixin:
         from openviking.service.task_work_index import bind_task_context
 
         tracker = get_task_tracker()
-        tracker.register_running_task(task_id)
+        await tracker.register_running_task(
+            task_id,
+            account_id=ctx.account_id,
+            user_id=ctx.user.user_id,
+        )
         try:
             await tracker.start(
                 task_id,

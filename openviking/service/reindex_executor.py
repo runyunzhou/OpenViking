@@ -685,7 +685,7 @@ class ReindexExecutor:
                 )
                 self._apply_embedding_wait_status(
                     counters,
-                    get_task_tracker().build_queue_status(task_context.task_id),
+                    await get_task_tracker().build_queue_status(task_context.task_id),
                 )
         finally:
             active_lease = run.lease if run is not None else lease

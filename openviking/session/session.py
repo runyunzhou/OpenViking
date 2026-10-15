@@ -1197,7 +1197,7 @@ class Session:
             from openviking.service.task_tracker import get_task_tracker
 
             tracker = get_task_tracker()
-            if not task_id or not tracker.has_work(str(task_id)):
+            if not task_id or not await tracker.has_work(str(task_id)):
                 error = "Phase 1 has no QueueFS work to resume"
                 await self._write_failed_marker(
                     archive_uri,
@@ -2516,7 +2516,7 @@ class Session:
             telemetry.set_error("session.commit.phase2", "CANCELLED", "session commit cancelled")
             snapshot = telemetry.finish("cancelled")
             _publish_telemetry_summary_best_effort(snapshot)
-            if tracker.is_cancellation_requested(task_id):
+            if await tracker.is_cancellation_requested(task_id):
                 await self._write_failed_marker(
                     archive_uri,
                     stage="cancelled",
@@ -2836,7 +2836,7 @@ class Session:
         from openviking.service.task_tracker import get_task_tracker
 
         tracker = get_task_tracker()
-        if tracker.has_work(str(task_id)):
+        if await tracker.has_work(str(task_id)):
             return False
 
         error = "Session commit queue work is missing"

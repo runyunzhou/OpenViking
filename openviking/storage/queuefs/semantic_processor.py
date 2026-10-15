@@ -598,9 +598,11 @@ class SemanticProcessor(DequeueHandlerBase):
                             account_id=task_context.account_id,
                             user_id=task_context.user_id,
                         )
-                        siblings_pending = tracker.has_work(
+                        siblings_pending = await tracker.has_work(
                             task_context.task_id,
                             exclude_work_id=task_context.work_id,
+                            account_id=task_context.account_id,
+                            user_id=task_context.user_id,
                         )
                     else:
                         enqueue_complete = True

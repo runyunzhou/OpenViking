@@ -2075,7 +2075,7 @@ class ContentWriteCoordinator:
                 await tracker.wait_for_work(context.task_id, work_ids, timeout=None)
         except (TimeoutError, asyncio.TimeoutError) as exc:
             raise DeadlineExceededError("queue processing", None) from exc
-        return tracker.build_queue_status(
+        return await tracker.build_queue_status(
             context.task_id, work_ids if context.work_id is not None else None
         )
 
