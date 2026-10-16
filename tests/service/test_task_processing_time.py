@@ -60,28 +60,6 @@ async def _create_work(
 
 
 @pytest.mark.asyncio
-async def test_requeued_work_restarts_execution_time(monkeypatch):
-    now = [0.0]
-    monkeypatch.setattr("openviking.service.task_store.time.time", lambda: now[0])
-    tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-
-    await _create_work(tracker, "task")
-    now[0] = 30
-    assert (await tracker.get("task", **OWNER)).processing_seconds == 30
-
-    await tracker.mark_work_requeued("task", "worker", **OWNER)
-    assert (await tracker.get("task", **OWNER)).processing_seconds is None
-
-    now[0] = 50
-    await tracker.start_work("task", "worker", **OWNER)
-    now[0] = 55
-    assert (await tracker.get("task", **OWNER)).processing_seconds == 5
-
-    await tracker.mark_work_done("task", "worker", **OWNER)
-    assert (await tracker.get("task", **OWNER)).processing_seconds == 5
-
-
-@pytest.mark.asyncio
 async def test_saturated_dag_scheduler_counts_claimed_handler_time(monkeypatch):
     now = [0.0]
     monkeypatch.setattr("openviking.service.task_store.time.time", lambda: now[0])
@@ -91,9 +69,7 @@ async def test_saturated_dag_scheduler_counts_claimed_handler_time(monkeypatch):
         "openviking.storage.queuefs.semantic_executor.get_semantic_tree_scheduler",
         lambda _: scheduler,
     )
-    monkeypatch.setattr(
-        "openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: None
-    )
+    monkeypatch.setattr("openviking.storage.queuefs.semantic_executor.get_viking_fs", lambda: None)
     entered = {name: asyncio.Event() for name in ["a", "b"]}
     release = {name: asyncio.Event() for name in ["a", "b"]}
     queued = asyncio.Event()
@@ -153,9 +129,7 @@ async def test_downstream_work_wait_remains_worker_occupied_time(monkeypatch):
 
     now[0] = 3
     waiter = asyncio.create_task(
-        tracker.wait_for_work(
-            "task", ["embedding"], poll_interval=0.001, **OWNER
-        )
+        tracker.wait_for_work("task", ["embedding"], poll_interval=0.001, **OWNER)
     )
     await asyncio.sleep(0.01)
     now[0] = 20
@@ -178,9 +152,7 @@ async def test_semantic_retry_cooldown_counts_full_worker_occupied_time(
     monkeypatch.setattr("openviking.service.task_store.time.time", lambda: now[0])
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
     await _create_work(tracker, "task")
-    message = SimpleNamespace(
-        uri="viking://resources/retry-test", account_id="account"
-    )
+    message = SimpleNamespace(uri="viking://resources/retry-test", account_id="account")
     enqueued = []
 
     async def sleep(delay):
@@ -211,7 +183,13 @@ async def test_semantic_retry_cooldown_counts_full_worker_occupied_time(
     await SemanticProcessor._reenqueue_semantic_msg(
         processor, message, enqueue=custom if custom_enqueue else None
     )
-    await tracker.mark_work_done("task", "worker", **OWNER)
-
     assert enqueued == [message]
     assert (await tracker.get("task", **OWNER)).processing_seconds == 35
+
+    await tracker.mark_work_requeued("task", "worker", **OWNER)
+    assert (await tracker.get("task", **OWNER)).processing_seconds is None
+    now[0] = 50
+    await tracker.start_work("task", "worker", **OWNER)
+    now[0] = 55
+    await tracker.mark_work_done("task", "worker", **OWNER)
+    assert (await tracker.get("task", **OWNER)).processing_seconds == 5

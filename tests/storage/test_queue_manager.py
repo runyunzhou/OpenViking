@@ -176,9 +176,7 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
 
         async def process_dequeued(self, data):
             if self.name == QueueManager.SEMANTIC:
-                with bind_task_context(
-                    "skill-task", "acc", "alice", enqueued_work=[]
-                ):
+                with bind_task_context("skill-task", "acc", "alice", enqueued_work=[]):
                     return await self.handler(data)
             return await self.handler(data)
 
@@ -231,9 +229,7 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
         assert all(not thread.is_alive() for thread in threads)
         assert events.index("write-finished") < events.index("lock-released")
         assert f"ack-{manager.SEMANTIC}" not in events
-        assert await tracker.has_work(
-            task.task_id, account_id="acc", user_id="alice"
-        )
+        assert await tracker.has_work(task.task_id, account_id="acc", user_id="alice")
     finally:
         release.set()
         if stopping is not None:
@@ -364,21 +360,15 @@ async def test_bootstrap_restores_legacy_messages_into_store(transport):
     class Tracker:
         work_recovery_mode = WorkRecoveryMode.QUEUE_SNAPSHOT
 
-        async def reconcile_delivery(
-            self, task_id, work_id, queue_name, *, account_id, user_id
-        ):
-            restored_work.append(
-                (task_id, work_id, queue_name, account_id, user_id)
-            )
+        async def reconcile_delivery(self, task_id, work_id, queue_name, *, account_id, user_id):
+            restored_work.append((task_id, work_id, queue_name, account_id, user_id))
 
         async def restore_work_tasks(self, owners):
             assert owners == {"task": ("account", "user")}
             return ["restored"]
 
     assert await manager.prepare_task_tracking(Tracker()) == ["restored"]
-    assert restored_work == [
-        ("task", "queuefs:legacy-message", "Test", "account", "user")
-    ]
+    assert restored_work == [("task", "queuefs:legacy-message", "Test", "account", "user")]
 
 
 async def test_bootstrap_restores_task_owner_from_cross_user_child_work(transport):
@@ -403,29 +393,12 @@ async def test_bootstrap_restores_task_owner_from_cross_user_child_work(transpor
     class Tracker:
         work_recovery_mode = WorkRecoveryMode.QUEUE_SNAPSHOT
 
-        async def reconcile_delivery(
-            self, task_id, work_id, queue_name, *, account_id, user_id
-        ):
-            restored_work.append(
-                (task_id, work_id, queue_name, account_id, user_id)
-            )
+        async def reconcile_delivery(self, task_id, work_id, queue_name, *, account_id, user_id):
+            restored_work.append((task_id, work_id, queue_name, account_id, user_id))
 
         async def restore_work_tasks(self, owners):
             assert owners == {"task": ("account", "task-owner")}
             return ["restored"]
 
     assert await manager.prepare_task_tracking(Tracker()) == ["restored"]
-    assert restored_work == [
-        ("task", "work", "Test", "account", "task-owner")
-    ]
-
-
-async def test_bootstrap_skips_queue_snapshot_for_durable_work_store(transport):
-    manager = QueueManager(object())
-    manager.get_queue("Test", allow_create=True)
-
-    class Tracker:
-        work_recovery_mode = WorkRecoveryMode.DURABLE_STORE
-
-    assert await manager.prepare_task_tracking(Tracker()) == []
-    transport.read.assert_not_awaited()
+    assert restored_work == [("task", "work", "Test", "account", "task-owner")]

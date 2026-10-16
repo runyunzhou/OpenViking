@@ -858,8 +858,13 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
 
     async def run_reindex(_executor, **kwargs):
         context = get_task_context()
-        assert context is not None
-        assert context.work_id is not None
+        await get_task_tracker().wait_for_task_work(
+            context.task_id,
+            exclude_work_id=context.work_id,
+            timeout=0,
+            account_id=context.account_id,
+            user_id=context.user_id,
+        )
         reindexed.append(kwargs["uri"])
         return {
             "status": "completed",

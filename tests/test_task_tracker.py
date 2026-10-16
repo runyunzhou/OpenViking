@@ -8,6 +8,7 @@ import json
 import threading
 import time
 from copy import deepcopy
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -590,12 +591,26 @@ async def test_delete_expired_retries_after_persistent_delete_fails():
     assert all(call["ctx"]["disable_auto_pathlock"] == "true" for call in agfs.rm_calls)
 
 
-async def test_evict_keeps_recent_completed(tracker: TaskTracker):
-    task = await tracker.create("session_commit", **_owner_kwargs())
-    await tracker.start(task.task_id)
-    await tracker.complete(task.task_id, {})
-    assert (await tracker.delete_expired()).deleted_count == 0
-    assert await tracker.get(task.task_id) is not None
+async def test_evict_keeps_recent_completed_with_bounded_reads(monkeypatch):
+    agfs = _FakeAgfs()
+    writer = TaskTracker(PersistentTaskStore(agfs))
+    for index in range(4):
+        task = await writer.create("session_commit", task_id=f"task-{index}", **_owner_kwargs())
+        await writer.complete(task.task_id, {}, **_owner_kwargs())
+    tracker = TaskTracker(PersistentTaskStore(agfs))
+    monkeypatch.setattr(tracker, "CLEANUP_BATCH", 2)
+    for task_id in ("task-0", "task-1"):
+        await tracker.get(task_id, **_owner_kwargs())
+    read = create_autospec(agfs.read, side_effect=agfs.read)
+    monkeypatch.setattr(agfs, "read", read)
+
+    first = await tracker.delete_expired()
+    assert first.scanned == 2 and first.deleted_count == 0
+    assert read.call_count == 0
+    second = await tracker.delete_expired()
+    assert second.scanned == 2 and second.deleted_count == 0
+    assert read.call_count == 2
+    assert len(agfs.files) == 4
 
 
 # ── Singleton ──
@@ -653,80 +668,6 @@ async def test_wait_timeout_preserves_recorded_operation_result(tracker):
         "root_uri": "resource-result",
         "task_id": state["task_id"],
     }
-
-
-async def test_inline_operation_can_wait_for_task_work_without_waiting_for_itself(
-    tracker,
-):
-    set_task_tracker(tracker)
-
-    async def operation():
-        context = get_task_context()
-        assert context is not None
-        assert context.work_id is not None
-        await tracker.wait_for_task_work(
-            context.task_id,
-            exclude_work_id=context.work_id,
-            timeout=0,
-            **_owner_kwargs(),
-        )
-        return {"status": "success"}
-
-    result, task_id = await run_tracked_operation(
-        "content_write",
-        **_owner_kwargs(),
-        operation=operation,
-        wait=True,
-        timeout=0,
-    )
-
-    assert result == {"status": "success"}
-    assert (await tracker.get(task_id, **_owner_kwargs())).status is TaskStatus.COMPLETED
-
-
-async def test_wait_can_return_terminal_projected_result(tracker):
-    set_task_tracker(tracker)
-    workers = []
-
-    async def operation():
-        context = get_task_context()
-        await tracker.register_work(
-            context.task_id,
-            "embedding-work",
-            "Embedding",
-            account_id=context.account_id,
-            user_id=context.user_id,
-        )
-
-        async def complete_work():
-            await asyncio.sleep(0)
-            await tracker.mark_work_done(
-                context.task_id,
-                "embedding-work",
-                account_id=context.account_id,
-                user_id=context.user_id,
-            )
-
-        workers.append(asyncio.create_task(complete_work()))
-        return {
-            "status": "success",
-            "vector_status": "queued",
-            "queue_status": None,
-        }
-
-    result, task_id = await run_tracked_operation(
-        "content_write",
-        **_owner_kwargs(),
-        operation=operation,
-        wait=True,
-        return_terminal_result=True,
-    )
-
-    assert "task_id" not in result
-    assert result["vector_status"] == "complete"
-    assert result["queue_status"]["Embedding"]["processed"] == 1
-    assert (await tracker.get(task_id, **_owner_kwargs())).status is TaskStatus.COMPLETED
-    await asyncio.gather(*workers)
 
 
 async def test_accept_failed_result_returns_structured_partial_result(tracker):
@@ -920,12 +861,15 @@ async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, 
 
     async def operation():
         await asyncio.sleep(0.02)
+        context = get_task_context()
+        await tracker.wait_for_task_work(
+            context.task_id, exclude_work_id=context.work_id, timeout=0, **_owner_kwargs()
+        )
         if timeout:
-            context = get_task_context()
             await tracker.register_work(
                 context.task_id,
-                "semantic",
-                "Semantic",
+                "embedding",
+                "Embedding",
                 account_id="acme",
                 user_id="alice",
             )
@@ -934,13 +878,13 @@ async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, 
                 await asyncio.sleep(0.001)
                 await tracker.mark_work_done(
                     context.task_id,
-                    "semantic",
+                    "embedding",
                     account_id="acme",
                     user_id="alice",
                 )
 
             workers.append(asyncio.create_task(complete_work()))
-        return {"status": "success"}
+        return {"status": "success", "vector_status": "queued" if timeout else "skipped"}
 
     result, task_id = await run_tracked_operation(
         "content_write",
@@ -949,9 +893,14 @@ async def test_wait_timeout_excludes_operation_time_for_completed_task(tracker, 
         operation=operation,
         wait=True,
         timeout=timeout,
+        return_terminal_result=True,
     )
 
-    assert result == {"status": "success"}
+    assert result["status"] == "success"
+    assert "task_id" not in result
+    assert result["vector_status"] == ("complete" if timeout else "skipped")
+    if timeout:
+        assert result["queue_status"]["Embedding"]["processed"] == 1
     completed = await tracker.wait(task_id, **_owner_kwargs(), timeout=0)
     assert completed.status is TaskStatus.COMPLETED
     assert completed.result["status"] == "success"
@@ -997,7 +946,7 @@ async def test_multiple_queue_waits_share_budget_and_leave_task_pollable(tracker
     ).status is TaskStatus.COMPLETED
 
 
-async def test_persistent_store_cross_tracker_visibility():
+async def test_persistent_store_cross_tracker_visibility_after_cancelled_write(monkeypatch):
     agfs = _FakeAgfs()
     store = PersistentTaskStore(agfs)
     tracker1 = TaskTracker(store=store)
@@ -1005,13 +954,39 @@ async def test_persistent_store_cross_tracker_visibility():
 
     task = await tracker1.create("session_commit", resource_id="sess-123", **_owner_kwargs())
     await tracker1.start(task.task_id, account_id="acme", user_id="alice")
-    await tracker1.complete(task.task_id, {"ok": True}, account_id="acme", user_id="alice")
+    entered, release = threading.Event(), threading.Event()
+    write = agfs.write
+
+    def blocked_write(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=3)
+        return write(*args, **kwargs)
+
+    monkeypatch.setattr(agfs, "write", blocked_write)
+    completing = asyncio.create_task(
+        tracker1.complete(task.task_id, {"ok": True}, **_owner_kwargs())
+    )
+    try:
+        assert await asyncio.to_thread(entered.wait, 3)
+        completing.cancel()
+        await asyncio.sleep(0)
+        assert not completing.done()
+        assert (await tracker2.get(task.task_id, **_owner_kwargs())).status is TaskStatus.RUNNING
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await completing
+    finally:
+        release.set()
+        await asyncio.gather(completing, return_exceptions=True)
 
     loaded = await tracker2.get(task.task_id, account_id="acme", user_id="alice")
 
     assert loaded is not None
     assert loaded.status == TaskStatus.COMPLETED
     assert loaded.result == {"ok": True}
+    restored = await TaskTracker(PersistentTaskStore(agfs)).get(task.task_id, **_owner_kwargs())
+    assert restored.status is TaskStatus.COMPLETED
+    assert restored.result == loaded.result
 
 
 @pytest.mark.parametrize(
@@ -1121,12 +1096,6 @@ async def test_persistent_store_writes_task_record_json():
     )
     assert terminal_payload["auth"] == {}
     assert all(call["ctx"]["disable_auto_pathlock"] == "true" for call in agfs.write_calls)
-
-
-async def test_tracker_reads_tasks_from_persistent_store():
-    tracker = TaskTracker(store=PersistentTaskStore(_FakeAgfs()))
-    task = await tracker.create("session_commit", **_owner_kwargs())
-    assert await tracker.get(task.task_id, **_owner_kwargs()) == task
 
 
 async def test_persistent_store_survives_tracker_reset():

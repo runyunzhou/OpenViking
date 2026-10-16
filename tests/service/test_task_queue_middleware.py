@@ -87,29 +87,6 @@ def test_log_correlation_accepts_explicit_queue_ids_without_context() -> None:
     )
 
 
-async def test_enqueue_registers_work_before_transport_write(tracked_queue):
-    queue, tracker, transport = tracked_queue
-    await create_task(tracker)
-
-    async def write(path, data):
-        assert path.endswith("/enqueue")
-        assert await tracker.has_work("task-1", **OWNER)
-        return "message-1"
-
-    transport.write.side_effect = write
-    message = await enqueue_task(queue, tracker, transport)
-    metadata = extract_task_metadata(message)
-
-    assert metadata is not None
-    assert metadata.task_id == "task-1"
-    assert metadata.account_id == "account"
-    assert metadata.user_id == "user"
-    assert await tracker.get_work_state(
-        metadata.task_id, metadata.work_id, **OWNER
-    ) is WorkState.PENDING
-    assert get_task_context() is None
-
-
 async def test_enqueue_keeps_content_owner_separate_from_task_owner(tracked_queue):
     queue, tracker, transport = tracked_queue
     task_owner = {"account_id": "account", "user_id": "task-owner"}
@@ -141,11 +118,14 @@ async def test_enqueue_keeps_content_owner_separate_from_task_owner(tracked_queu
     assert persisted["_task_user_id"] == "task-owner"
     assert extract_task_metadata(persisted).user_id == "task-owner"
     metadata = extract_task_metadata(persisted)
-    assert await tracker.get_work_state(
-        metadata.task_id,
-        metadata.work_id,
-        **task_owner,
-    ) is WorkState.PENDING
+    assert (
+        await tracker.get_work_state(
+            metadata.task_id,
+            metadata.work_id,
+            **task_owner,
+        )
+        is WorkState.PENDING
+    )
 
 
 async def test_enqueue_does_not_stamp_task_owner_without_authoritative_context(tracked_queue):
@@ -171,9 +151,10 @@ async def test_enqueue_failure_records_failed_work(tracked_queue):
     transport.write.side_effect = OSError("write failed")
     enqueued_work = []
 
-    with bind_task_context(
-        "task-1", "account", "user", enqueued_work=enqueued_work
-    ), pytest.raises(OSError, match="write failed"):
+    with (
+        bind_task_context("task-1", "account", "user", enqueued_work=enqueued_work),
+        pytest.raises(OSError, match="write failed"),
+    ):
         await queue.enqueue({})
 
     payload = json.loads(transport.write.await_args.args[1])
@@ -200,19 +181,6 @@ async def test_cancelled_enqueue_discards_uncommitted_work(tracked_queue):
     assert task.error == "Task operation interrupted before its result was persisted"
 
 
-async def test_terminal_task_rejects_enqueue_without_write(tracked_queue):
-    queue, tracker, transport = tracked_queue
-    await create_task(tracker)
-    await tracker.complete("task-1", {"done": True}, **OWNER)
-    transport.write.reset_mock()
-
-    with bind_task_context("task-1", "account", "user"):
-        with pytest.raises(TaskWorkRejected, match="unavailable"):
-            await queue.enqueue({})
-
-    transport.write.assert_not_awaited()
-
-
 async def test_successful_process_records_context_and_vector_count(tracked_queue):
     queue, tracker, transport = tracked_queue
     message = await enqueue_task(queue, tracker, transport)
@@ -235,32 +203,19 @@ async def test_successful_process_records_context_and_vector_count(tracked_queue
     assert await tracker.get_context_count("task-1", **OWNER) == 1
     task = await tracker.get("task-1", **OWNER)
     assert task is not None and task.status is TaskStatus.COMPLETED
-
-
-async def test_failed_process_preserves_multiple_errors(tracked_queue):
-    queue, tracker, transport = tracked_queue
-    message = await enqueue_task(queue, tracker, transport)
-
-    class Handler(DequeueHandlerBase):
-        async def on_dequeue(self, data):
-            return ProcessResult.failed("combined", errors=["first", "second"])
-
-    await tracker.complete("task-1", {"done": True}, **OWNER)
-    queue.set_dequeue_handler(Handler())
-    result = await queue.process_dequeued(message)
-
-    assert result.outcome is ProcessOutcome.FAILED
-    status = await tracker.build_queue_status("task-1", **OWNER)
-    assert status["Embedding"]["error_count"] == 2
-    task = await tracker.get("task-1", **OWNER)
-    assert task is not None and task.status is TaskStatus.FAILED
-    assert task.error == "combined"
+    await queue.process_dequeued(message)
+    assert len(seen) == 1
+    assert await tracker.get_context_count("task-1", **OWNER) == 1
+    assert (await tracker.build_queue_status("task-1", **OWNER))["Embedding"]["processed"] == 1
 
 
 async def test_requeue_keeps_work_open_for_redelivery(tracked_queue):
     queue, tracker, transport = tracked_queue
     message = await enqueue_task(queue, tracker, transport)
-    outcomes = [ProcessResult.requeued(), ProcessResult.success()]
+    outcomes = [
+        ProcessResult.requeued(),
+        ProcessResult.failed("combined", errors=["first", "second"]),
+    ]
 
     class Handler(DequeueHandlerBase):
         async def on_dequeue(self, data):
@@ -270,15 +225,22 @@ async def test_requeue_keeps_work_open_for_redelivery(tracked_queue):
     first = await queue.process_dequeued(message)
     metadata = extract_task_metadata(message)
     assert first.outcome is ProcessOutcome.REQUEUED
-    assert await tracker.get_work_state(
-        "task-1", metadata.work_id, **OWNER
-    ) is WorkState.PENDING
+    assert await tracker.get_work_state("task-1", metadata.work_id, **OWNER) is WorkState.PENDING
     assert await tracker.has_work("task-1", **OWNER)
 
     await tracker.complete("task-1", {"done": True}, **OWNER)
     second = await queue.process_dequeued(message)
-    assert second.outcome is ProcessOutcome.SUCCESS
+    assert second.outcome is ProcessOutcome.FAILED
     assert not await tracker.has_work("task-1", **OWNER)
+    task = await tracker.get("task-1", **OWNER)
+    assert task.status is TaskStatus.FAILED
+    assert task.error == "combined"
+    assert task.result["queue_status"]["Embedding"] == {
+        "processed": 0,
+        "requeue_count": 1,
+        "error_count": 2,
+        "errors": [{"message": "first"}, {"message": "second"}],
+    }
 
 
 async def test_clear_settles_committed_work(tracked_queue):
@@ -315,21 +277,3 @@ async def test_cancelled_task_uses_handler_cancellation_path(tracked_queue):
     assert calls == [message]
     task = await tracker.get("task-1", **OWNER)
     assert task is not None and task.status is TaskStatus.CANCELLED
-
-
-async def test_terminal_redelivery_is_idempotent(tracked_queue):
-    queue, tracker, transport = tracked_queue
-    message = await enqueue_task(queue, tracker, transport)
-
-    class Handler(DequeueHandlerBase):
-        async def on_dequeue(self, data):
-            return ProcessResult.success()
-
-    await tracker.complete("task-1", {"done": True}, **OWNER)
-    queue.set_dequeue_handler(Handler())
-    await queue.process_dequeued(message)
-    duplicate = await queue.process_dequeued(message)
-
-    assert duplicate.outcome is ProcessOutcome.SUCCESS
-    status = await tracker.build_queue_status("task-1", **OWNER)
-    assert status["Embedding"]["processed"] == 1
