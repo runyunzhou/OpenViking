@@ -18,7 +18,8 @@ from openviking.service.task_domain import (
 )
 from openviking.service.task_store import (
     PersistentTaskStore,
-    TaskWorkRejected,
+    StoreOperationCode,
+    StoreOperationOutcome,
     WorkRegistration,
 )
 from openviking.service.task_tracker import TaskTracker
@@ -98,8 +99,12 @@ async def test_work_registration_is_idempotent_and_rejects_terminal_task(store):
     await create_running_task(store)
     work = WorkRecord(work_id="work", task_id="task", queue_name="Semantic")
 
-    assert await store.add_work(work, **OWNER) is WorkRegistration.CREATED
-    assert await store.add_work(work, **OWNER) is WorkRegistration.EXISTING
+    result = await store.add_work(work, **OWNER)
+    assert result.outcome is StoreOperationOutcome.APPLIED
+    assert result.code is StoreOperationCode.OK
+    duplicate = await store.add_work(work, **OWNER)
+    assert duplicate.outcome is StoreOperationOutcome.NOOP
+    assert duplicate.code is StoreOperationCode.DUPLICATE
 
     await store.finish_work(
         "task",
@@ -112,38 +117,65 @@ async def test_work_registration_is_idempotent_and_rejects_terminal_task(store):
     )
     task = await store.get_task("task", **OWNER)
     assert task is not None and task.status is TaskStatus.FAILED
-    with pytest.raises(TaskWorkRejected):
-        await store.add_work(
-            WorkRecord(work_id="later", task_id="task", queue_name="Semantic"),
-            **OWNER,
-        )
+    rejected = await store.add_work(
+        WorkRecord(work_id="later", task_id="task", queue_name="Semantic"),
+        **OWNER,
+    )
+    assert rejected.outcome is StoreOperationOutcome.REJECTED
+    assert rejected.code is StoreOperationCode.ALREADY_TERMINAL
 
 
 @pytest.mark.asyncio
 async def test_cancellation_reports_whether_the_owned_task_exists(store):
-    assert (
-        await store.request_cancellation(
-            "missing",
-            cancellable_types={"content_write"},
-            allow_terminal=False,
-            **OWNER,
-        )
-        is False
+    missing = await store.request_cancellation(
+        "missing",
+        cancellable_types={"content_write"},
+        allow_terminal=False,
+        **OWNER,
     )
+    assert missing.outcome is StoreOperationOutcome.REJECTED
+    assert missing.code is StoreOperationCode.NOT_FOUND
     await create_running_task(store)
     assert await store.get_task_status("task", **OWNER) is TaskStatus.RUNNING
     assert await store.get_task_status("task", account_id="account", user_id="other") is None
-    for _ in range(2):
-        assert (
-            await store.request_cancellation(
-                "task",
-                cancellable_types={"content_write"},
-                allow_terminal=False,
-                **OWNER,
-            )
-            is True
-        )
+    accepted = await store.request_cancellation(
+        "task",
+        cancellable_types={"content_write"},
+        allow_terminal=False,
+        **OWNER,
+    )
+    assert accepted.outcome is StoreOperationOutcome.APPLIED
+    repeated = await store.request_cancellation(
+        "task",
+        cancellable_types={"content_write"},
+        allow_terminal=False,
+        **OWNER,
+    )
+    assert repeated.outcome is StoreOperationOutcome.NOOP
+    assert repeated.code is StoreOperationCode.ALREADY_CANCELLED
     assert await store.get_task_status("task", **OWNER) is TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_task_mutations_report_business_rejection_after_terminal(store):
+    await create_running_task(store)
+    await store.record_outcome(
+        "task",
+        result={"done": True},
+        error=None,
+        resource_id=None,
+        cancelled=False,
+        **OWNER,
+    )
+
+    rejected = await store.update_stage("task", "late-stage", meta=None, **OWNER)
+
+    assert rejected.outcome is StoreOperationOutcome.REJECTED
+    assert rejected.code is StoreOperationCode.ALREADY_TERMINAL
+    task = await store.get_task("task", **OWNER)
+    assert task is not None
+    assert task.status is TaskStatus.COMPLETED
+    assert task.stage == TaskStatus.COMPLETED.value
 
 
 @pytest.mark.asyncio

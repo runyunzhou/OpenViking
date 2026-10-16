@@ -29,7 +29,6 @@ from openviking.service.task_domain import (
     TaskRecord,
     TaskRetentionPolicy,
     TaskStatus,
-    TaskWorkRejected,
     WorkRecord,
     WorkRecoveryMode,
     WorkState,
@@ -58,6 +57,58 @@ class WorkRegistration(str, Enum):
 
     def __bool__(self) -> bool:
         return self is not WorkRegistration.REJECTED
+
+
+class StoreOperationOutcome(str, Enum):
+    APPLIED = "applied"
+    NOOP = "noop"
+    REJECTED = "rejected"
+
+
+class StoreOperationCode(str, Enum):
+    OK = "ok"
+    NOT_FOUND = "not_found"
+    ALREADY_TERMINAL = "already_terminal"
+    ALREADY_CANCELLED = "already_cancelled"
+    INVALID_STATE = "invalid_state"
+    NOT_CANCELLABLE = "not_cancellable"
+    WORK_NOT_OPEN = "work_not_open"
+    DUPLICATE = "duplicate"
+
+
+@dataclass(frozen=True)
+class StoreOperationResult:
+    outcome: StoreOperationOutcome
+    code: StoreOperationCode = StoreOperationCode.OK
+    message: Optional[str] = None
+
+    @property
+    def accepted(self) -> bool:
+        return self.outcome is not StoreOperationOutcome.REJECTED
+
+    @property
+    def is_applied(self) -> bool:
+        return self.outcome is StoreOperationOutcome.APPLIED
+
+    @classmethod
+    def applied(cls, code: StoreOperationCode = StoreOperationCode.OK) -> "StoreOperationResult":
+        return cls(StoreOperationOutcome.APPLIED, code)
+
+    @classmethod
+    def noop(
+        cls,
+        code: StoreOperationCode = StoreOperationCode.OK,
+        message: Optional[str] = None,
+    ) -> "StoreOperationResult":
+        return cls(StoreOperationOutcome.NOOP, code, message)
+
+    @classmethod
+    def rejected(
+        cls,
+        code: StoreOperationCode,
+        message: Optional[str] = None,
+    ) -> "StoreOperationResult":
+        return cls(StoreOperationOutcome.REJECTED, code, message)
 
 
 class TaskAlreadyActive(RuntimeError):
@@ -123,7 +174,7 @@ class TaskWorkStore(Protocol):
         stage: Optional[str],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def update_stage(
         self,
@@ -133,7 +184,7 @@ class TaskWorkStore(Protocol):
         meta: Optional[Dict[str, Any]],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def update_auth(
         self,
@@ -142,7 +193,7 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def merge_meta(
         self,
@@ -151,7 +202,7 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def record_event(
         self,
@@ -161,7 +212,7 @@ class TaskWorkStore(Protocol):
         operation: Optional[str],
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def record_outcome(
         self,
@@ -173,7 +224,7 @@ class TaskWorkStore(Protocol):
         cancelled: bool,
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def request_cancellation(
         self,
@@ -183,7 +234,7 @@ class TaskWorkStore(Protocol):
         allow_terminal: bool,
         account_id: str,
         user_id: str,
-    ) -> bool: ...
+    ) -> StoreOperationResult: ...
 
     async def mark_enqueue_complete(
         self,
@@ -192,7 +243,7 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def is_enqueue_complete(
         self,
@@ -205,15 +256,15 @@ class TaskWorkStore(Protocol):
 
     async def add_work(
         self, work: WorkRecord, *, account_id: str, user_id: str
-    ) -> WorkRegistration: ...
+    ) -> StoreOperationResult: ...
 
     async def reconcile_delivery(
         self, work: WorkRecord, *, account_id: str, user_id: str
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def discard_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def get_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
@@ -230,7 +281,7 @@ class TaskWorkStore(Protocol):
 
     async def start_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def finish_work(
         self,
@@ -243,7 +294,7 @@ class TaskWorkStore(Protocol):
         context_count_delta: int,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def requeue_work(
         self,
@@ -253,7 +304,7 @@ class TaskWorkStore(Protocol):
         delta: int,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def record_work_error(
         self,
@@ -263,11 +314,11 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def settle_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None: ...
+    ) -> StoreOperationResult: ...
 
     async def has_open_work(
         self,
@@ -318,6 +369,7 @@ class _WorkSet:
 class _WorkMutationResult:
     changed: bool
     work: Optional[WorkRecord]
+    result: StoreOperationResult = StoreOperationResult.applied()
 
 
 class PersistentTaskStore(TaskWorkStore):
@@ -398,16 +450,16 @@ class PersistentTaskStore(TaskWorkStore):
         stage: Optional[str],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                return False
+                return _inactive_task_result(task, "Task cannot be started")
             task.status = TaskStatus.RUNNING
             if stage is not None:
                 task.stage = stage
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def update_stage(
         self,
@@ -417,16 +469,16 @@ class PersistentTaskStore(TaskWorkStore):
         meta: Optional[Dict[str, Any]],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in ACTIVE_TASK_STATUSES:
-                return False
+                return _inactive_task_result(task, "Task stage cannot be updated")
             task.stage = stage
             if meta:
                 _deep_merge(task.meta, deepcopy(meta))
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def update_auth(
         self,
@@ -435,14 +487,14 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in ACTIVE_TASK_STATUSES:
-                return False
+                return _inactive_task_result(task, "Task auth cannot be updated")
             _deep_merge(task.auth, deepcopy(values))
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def merge_meta(
         self,
@@ -451,14 +503,14 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
-                raise ValueError("Task is no longer active")
+                return _inactive_task_result(task, "Task meta cannot be updated")
             _deep_merge(task.meta, deepcopy(values))
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def record_event(
         self,
@@ -468,10 +520,13 @@ class PersistentTaskStore(TaskWorkStore):
         operation: Optional[str],
         account_id: str,
         user_id: str,
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in ACTIVE_TASK_STATUSES:
-                return False
+                return StoreOperationResult.noop(
+                    StoreOperationCode.ALREADY_TERMINAL,
+                    f"Task is already {task.status.value}",
+                )
             task.execution_events = append_task_event(
                 task.execution_events,
                 kind=kind,
@@ -479,9 +534,9 @@ class PersistentTaskStore(TaskWorkStore):
                 stage=sanitize_error(task.stage) if task.stage else None,
                 operation=operation,
             )
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def record_outcome(
         self,
@@ -493,10 +548,13 @@ class PersistentTaskStore(TaskWorkStore):
         cancelled: bool,
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> None:
-        def mutate(task: TaskRecord, work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in ACTIVE_TASK_STATUSES:
-                return False
+                return StoreOperationResult.noop(
+                    StoreOperationCode.ALREADY_TERMINAL,
+                    f"Task is already {task.status.value}",
+                )
             if result is not None:
                 task.result = deepcopy(result)
             if resource_id is not None:
@@ -510,9 +568,9 @@ class PersistentTaskStore(TaskWorkStore):
                 {"enqueue_complete_work_ids": deepcopy(enqueue_markers)} if enqueue_markers else {}
             )
             self._try_finalize(task, work_set)
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def request_cancellation(
         self,
@@ -522,17 +580,26 @@ class PersistentTaskStore(TaskWorkStore):
         allow_terminal: bool,
         account_id: str,
         user_id: str,
-    ) -> bool:
-        def mutate(task: TaskRecord, work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, work_set: _WorkSet) -> StoreOperationResult:
             if task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED):
-                return False
+                return StoreOperationResult.noop(
+                    StoreOperationCode.ALREADY_CANCELLED,
+                    f"Task is already {task.status.value}",
+                )
             if task.task_type not in cancellable_types:
-                raise ValueError(f"Task type '{task.task_type}' does not support cancellation")
+                return StoreOperationResult.rejected(
+                    StoreOperationCode.NOT_CANCELLABLE,
+                    f"Task type '{task.task_type}' does not support cancellation",
+                )
             if task.status in TERMINAL_TASK_STATUSES and not allow_terminal:
-                raise ValueError(f"Task is already {task.status.value}")
+                return StoreOperationResult.rejected(
+                    StoreOperationCode.ALREADY_TERMINAL,
+                    f"Task is already {task.status.value}",
+                )
             task.status = TaskStatus.CANCELLING
             self._try_finalize(task, work_set)
-            return True
+            return StoreOperationResult.applied()
 
         return await self._mutate_task(task_id, account_id, user_id, mutate)
 
@@ -543,18 +610,21 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> None:
-        def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
+    ) -> StoreOperationResult:
+        def mutate(task: TaskRecord, _work_set: _WorkSet) -> StoreOperationResult:
             if task.status not in ACTIVE_TASK_STATUSES:
-                return False
+                return StoreOperationResult.noop(
+                    StoreOperationCode.ALREADY_TERMINAL,
+                    f"Task is already {task.status.value}",
+                )
             completed = set(task.auth.get("enqueue_complete_work_ids") or ())
             if work_id in completed:
-                return False
+                return StoreOperationResult.noop(StoreOperationCode.DUPLICATE)
             completed.add(work_id)
             task.auth["enqueue_complete_work_ids"] = sorted(completed)
-            return True
+            return StoreOperationResult.applied()
 
-        await self._mutate_task(task_id, account_id, user_id, mutate)
+        return await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def is_enqueue_complete(
         self,
@@ -569,41 +639,65 @@ class PersistentTaskStore(TaskWorkStore):
 
     async def add_work(
         self, work: WorkRecord, *, account_id: str, user_id: str
-    ) -> WorkRegistration:
-        registration = WorkRegistration.CREATED
-
+    ) -> StoreOperationResult:
         def mutate(task: TaskRecord, existing: Optional[WorkRecord]) -> _WorkMutationResult:
-            nonlocal registration
-            if task.is_terminal() or task.status == TaskStatus.CANCELLING:
-                raise TaskWorkRejected(f"Task {work.task_id} is {task.status.value}; rejected work")
+            if task.is_terminal():
+                return _WorkMutationResult(
+                    False,
+                    existing,
+                    StoreOperationResult.rejected(
+                        StoreOperationCode.ALREADY_TERMINAL,
+                        f"Task {work.task_id} is {task.status.value}; rejected work",
+                    ),
+                )
+            if task.status == TaskStatus.CANCELLING:
+                return _WorkMutationResult(
+                    False,
+                    existing,
+                    StoreOperationResult.rejected(
+                        StoreOperationCode.INVALID_STATE,
+                        f"Task {work.task_id} is cancelling; rejected work",
+                    ),
+                )
             if existing is not None:
-                registration = WorkRegistration.EXISTING
-                return _WorkMutationResult(False, existing)
+                return _WorkMutationResult(
+                    False,
+                    existing,
+                    StoreOperationResult.noop(StoreOperationCode.DUPLICATE),
+                )
             return _WorkMutationResult(True, deepcopy(work))
 
-        found = await self._mutate_work(
+        return await self._mutate_work(
             work.task_id,
             work.work_id,
             account_id,
             user_id,
             mutate,
         )
-        return registration if found else WorkRegistration.REJECTED
 
-    async def reconcile_delivery(self, work: WorkRecord, *, account_id: str, user_id: str) -> None:
+    async def reconcile_delivery(
+        self, work: WorkRecord, *, account_id: str, user_id: str
+    ) -> StoreOperationResult:
         """Ensure a delivered QueueFS message has local Work state."""
 
         def mutate(task: TaskRecord, existing: Optional[WorkRecord]) -> _WorkMutationResult:
             if task.is_terminal():
-                return _WorkMutationResult(False, existing)
+                return _WorkMutationResult(
+                    False,
+                    existing,
+                    StoreOperationResult.noop(
+                        StoreOperationCode.ALREADY_TERMINAL,
+                        f"Task is already {task.status.value}",
+                    ),
+                )
             if existing is None:
                 return _WorkMutationResult(True, deepcopy(work))
             if existing.is_open() and existing.queue_name != work.queue_name:
                 existing.queue_name = work.queue_name
                 return _WorkMutationResult(True, existing)
-            return _WorkMutationResult(False, existing)
+            return _WorkMutationResult(False, existing, StoreOperationResult.noop())
 
-        await self._mutate_work(
+        return await self._mutate_work(
             work.task_id,
             work.work_id,
             account_id,
@@ -613,11 +707,17 @@ class PersistentTaskStore(TaskWorkStore):
 
     async def discard_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None:
+    ) -> StoreOperationResult:
         def mutate(_task: TaskRecord, existing: Optional[WorkRecord]) -> _WorkMutationResult:
-            return _WorkMutationResult(existing is not None, None)
+            if existing is None:
+                return _WorkMutationResult(
+                    False,
+                    None,
+                    StoreOperationResult.noop(StoreOperationCode.NOT_FOUND),
+                )
+            return _WorkMutationResult(True, None)
 
-        await self._mutate_work(
+        return await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -659,10 +759,17 @@ class PersistentTaskStore(TaskWorkStore):
 
     async def start_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None:
+    ) -> StoreOperationResult:
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None or not work.is_open():
-                return _WorkMutationResult(False, work)
+                return _WorkMutationResult(
+                    False,
+                    work,
+                    StoreOperationResult.rejected(
+                        StoreOperationCode.WORK_NOT_OPEN,
+                        f"Work {work_id} is unavailable",
+                    ),
+                )
             now = time.time()
             work.state = WorkState.RUNNING
             work.started_at = work.started_at or now
@@ -670,7 +777,7 @@ class PersistentTaskStore(TaskWorkStore):
             work.updated_at = now
             return _WorkMutationResult(True, work)
 
-        await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
+        return await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
 
     async def finish_work(
         self,
@@ -683,13 +790,20 @@ class PersistentTaskStore(TaskWorkStore):
         context_count_delta: int,
         account_id: str,
         user_id: str,
-    ) -> None:
+    ) -> StoreOperationResult:
         if state not in (WorkState.DONE, WorkState.FAILED):
             raise ValueError(f"Non-terminal Work state: {state}")
 
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None or not work.is_open():
-                return _WorkMutationResult(False, work)
+                return _WorkMutationResult(
+                    False,
+                    work,
+                    StoreOperationResult.noop(
+                        StoreOperationCode.WORK_NOT_OPEN,
+                        f"Work {work_id} is unavailable",
+                    ),
+                )
             now = time.time()
             work.state = state
             work.finished_at = now
@@ -703,7 +817,7 @@ class PersistentTaskStore(TaskWorkStore):
                 work.context_count += context_count_delta
             return _WorkMutationResult(True, work)
 
-        await self._mutate_work(
+        return await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -720,10 +834,17 @@ class PersistentTaskStore(TaskWorkStore):
         delta: int,
         account_id: str,
         user_id: str,
-    ) -> None:
+    ) -> StoreOperationResult:
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None or not work.is_open():
-                return _WorkMutationResult(False, work)
+                return _WorkMutationResult(
+                    False,
+                    work,
+                    StoreOperationResult.noop(
+                        StoreOperationCode.WORK_NOT_OPEN,
+                        f"Work {work_id} is unavailable",
+                    ),
+                )
             work.state = WorkState.PENDING
             work.requeue_count += max(delta, 0)
             work.started_at = None
@@ -731,7 +852,7 @@ class PersistentTaskStore(TaskWorkStore):
             work.updated_at = time.time()
             return _WorkMutationResult(True, work)
 
-        await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
+        return await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
 
     async def record_work_error(
         self,
@@ -741,31 +862,45 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> None:
+    ) -> StoreOperationResult:
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None or work.error:
-                return _WorkMutationResult(False, work)
+                return _WorkMutationResult(
+                    False,
+                    work,
+                    StoreOperationResult.noop(
+                        StoreOperationCode.WORK_NOT_OPEN if work is None else StoreOperationCode.OK
+                    ),
+                )
             work.error = sanitize_error(error)
             work.updated_at = time.time()
             return _WorkMutationResult(True, work)
 
-        await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
+        return await self._mutate_work(task_id, work_id, account_id, user_id, mutate)
 
     async def settle_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> None:
+    ) -> StoreOperationResult:
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None:
-                return _WorkMutationResult(False, None)
+                return _WorkMutationResult(
+                    False,
+                    None,
+                    StoreOperationResult.noop(StoreOperationCode.NOT_FOUND),
+                )
             changed = False
             if work.is_open():
                 work.state = WorkState.FAILED if work.error else WorkState.DONE
                 work.finished_at = time.time()
                 work.updated_at = work.finished_at
                 changed = True
-            return _WorkMutationResult(changed, work)
+            return _WorkMutationResult(
+                changed,
+                work,
+                StoreOperationResult.applied() if changed else StoreOperationResult.noop(),
+            )
 
-        await self._mutate_work(
+        return await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -1131,31 +1266,33 @@ class PersistentTaskStore(TaskWorkStore):
         task_id: str,
         account_id: Optional[str],
         user_id: Optional[str],
-        mutate: Callable[[TaskRecord, _WorkSet], bool],
-    ) -> bool:
+        mutate: Callable[[TaskRecord, _WorkSet], StoreOperationResult],
+    ) -> StoreOperationResult:
         task = await self._load_task(task_id, account_id, user_id)
         if task is None or not task.account_id or not task.user_id:
-            return False
+            return StoreOperationResult.rejected(StoreOperationCode.NOT_FOUND)
         owner = (task.account_id, task.user_id, task_id)
         async with self._record_locks.acquire(owner):
             await self._load_task(task_id, owner[0], owner[1])
             with self._lock:
                 live_task = self._task_cache.get(owner)
                 if live_task is None:
-                    return False
+                    return StoreOperationResult.rejected(StoreOperationCode.NOT_FOUND)
                 work_set = self._work_sets.setdefault(owner, _WorkSet({}))
                 candidate = deepcopy(live_task)
                 previous = deepcopy(live_task)
                 mutation = mutate(candidate, work_set)
                 if inspect.isawaitable(mutation):
                     raise TypeError("File store mutations must be synchronous")
-                if not mutation:
-                    return True
+                if not isinstance(mutation, StoreOperationResult):
+                    raise TypeError("Task mutations must return StoreOperationResult")
+                if not mutation.is_applied:
+                    return mutation
                 candidate.updated_at = TaskRecord.next_updated_at(candidate.updated_at)
                 self._append_events(candidate, previous)
                 snapshot = deepcopy(candidate)
             await self._write_task_and_publish(snapshot, owner, candidate)
-            return True
+            return mutation
 
     async def _mutate_work(
         self,
@@ -1167,17 +1304,17 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         try_finalize: bool = False,
         finalize_when_unchanged: bool = False,
-    ) -> bool:
+    ) -> StoreOperationResult:
         task = await self._load_task(task_id, account_id, user_id)
         if task is None or not task.account_id or not task.user_id:
-            return False
+            return StoreOperationResult.rejected(StoreOperationCode.NOT_FOUND)
         owner = (task.account_id, task.user_id, task_id)
         async with self._record_locks.acquire(owner):
             await self._load_task(task_id, owner[0], owner[1])
             with self._lock:
                 live_task = self._task_cache.get(owner)
                 if live_task is None:
-                    return False
+                    return StoreOperationResult.rejected(StoreOperationCode.NOT_FOUND)
                 work_set = self._work_sets.setdefault(owner, _WorkSet({}))
                 existing = work_set.works.get(work_id)
                 mutation = mutate(live_task, deepcopy(existing) if existing is not None else None)
@@ -1223,11 +1360,11 @@ class PersistentTaskStore(TaskWorkStore):
                         else:
                             work_set.works[work_id] = mutation.work
                         work_set.open_count = open_count
-                    return True
+                    return mutation.result
             assert candidate_task is not None
             assert candidate_work_set is not None
             await self._write_task_and_publish(snapshot, owner, candidate_task, candidate_work_set)
-            return True
+            return StoreOperationResult.applied()
 
     async def _write_task_and_publish(
         self,
@@ -1544,6 +1681,18 @@ def _deep_merge(target: Dict[str, Any], values: Dict[str, Any]) -> None:
             _deep_merge(target[key], value)
         else:
             target[key] = value
+
+
+def _inactive_task_result(task: TaskRecord, message: str) -> StoreOperationResult:
+    if task.status in TERMINAL_TASK_STATUSES:
+        return StoreOperationResult.rejected(
+            StoreOperationCode.ALREADY_TERMINAL,
+            f"{message}: task is already {task.status.value}",
+        )
+    return StoreOperationResult.rejected(
+        StoreOperationCode.INVALID_STATE,
+        f"{message}: task is {task.status.value}",
+    )
 
 
 def _queue_result(summary: Optional[QueueWorkSummary]) -> Dict[str, Any]:

@@ -49,6 +49,8 @@ from openviking.service.task_events import PROCESS_EVENT_KINDS
 from openviking.service.task_store import (
     SYSTEM_TASK_ACCOUNT_ID,
     SYSTEM_TASK_USER_ID,
+    StoreOperationCode,
+    StoreOperationResult,
     TaskAlreadyActive,
     TaskWorkStore,
     WorkRegistration,
@@ -570,8 +572,10 @@ class TaskTracker:
             user_id=user_id,
             allow_terminal=False,
         )
-        if not found:
+        if found.code is StoreOperationCode.NOT_FOUND:
             return None
+        if not found.accepted:
+            raise ValueError(found.message or found.code.value)
         self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
         return await self.get(task_id, account_id=account_id, user_id=user_id)
 
@@ -587,8 +591,10 @@ class TaskTracker:
             user_id=user_id,
             allow_terminal=True,
         )
-        if not found:
+        if found.code is StoreOperationCode.NOT_FOUND:
             return None
+        if not found.accepted:
+            raise ValueError(found.message or found.code.value)
         self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
         return await self.get(task_id, account_id=account_id, user_id=user_id)
 
@@ -599,7 +605,7 @@ class TaskTracker:
         account_id: str,
         user_id: str,
         allow_terminal: bool,
-    ) -> bool:
+    ) -> StoreOperationResult:
         return await run_to_completion(
             lambda: self._store.request_cancellation(
                 task_id,
@@ -867,9 +873,14 @@ class TaskTracker:
 
         async def register() -> WorkRegistration:
             try:
-                return await self._store.add_work(work, account_id=account_id, user_id=user_id)
+                result = await self._store.add_work(work, account_id=account_id, user_id=user_id)
             except TaskWorkRejected:
                 return WorkRegistration.REJECTED
+            if result.is_applied:
+                return WorkRegistration.CREATED
+            if result.accepted and result.code is StoreOperationCode.DUPLICATE:
+                return WorkRegistration.EXISTING
+            return WorkRegistration.REJECTED
 
         return await register()
 
