@@ -372,6 +372,46 @@ async def test_deleting_task_releases_work_projection(store):
 
 
 @pytest.mark.asyncio
+async def test_delete_tasks_does_not_preflight_list_before_store_delete():
+    class CountingListStore(PersistentTaskStore):
+        def __init__(self) -> None:
+            super().__init__(_FakeAgfs())
+            self.list_calls = 0
+
+        async def list(self, *args, **kwargs):
+            self.list_calls += 1
+            return await super().list(*args, **kwargs)
+
+    store = CountingListStore()
+    tracker = TaskTracker(store)
+    for task_id in ("task-0", "task-1"):
+        task = await tracker.create("content_write", task_id=task_id, **OWNER)
+        await tracker.complete(task.task_id, {"done": True}, **OWNER)
+    store.list_calls = 0
+
+    assert await tracker.delete_tasks(**OWNER) == 2
+
+    assert store.list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_tasks_raises_store_business_rejection_message(store):
+    tracker = TaskTracker(store)
+    await create_running_task(store, task_id="task-a")
+    await create_running_task(store, task_id="task-b")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await tracker.delete_tasks(**OWNER)
+
+    message = str(exc_info.value)
+    assert message.startswith("Cannot delete active task records: ")
+    assert "task-a(content_write)" in message
+    assert "task-b(content_write)" in message
+    assert await tracker.get("task-a", **OWNER) is not None
+    assert await tracker.get("task-b", **OWNER) is not None
+
+
+@pytest.mark.asyncio
 async def test_cancelled_persisted_mutation_updates_read_view_after_write_finishes():
     class DelayedWriteStore(PersistentTaskStore):
         def __init__(self) -> None:

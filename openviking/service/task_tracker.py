@@ -1283,39 +1283,21 @@ class TaskTracker:
     ) -> int:
         if not account_id:
             raise ValueError("Task deletion requires a non-empty account_id")
-        tasks = await self._store.list(account_id, user_id=user_id)
         allowed = set(allow_active_types)
-        active = [
-            task
-            for task in tasks
-            if task.status in ACTIVE_TASK_STATUSES and task.task_type not in allowed
-        ]
-        if active:
-            raise RuntimeError(
-                "Cannot delete active task records: "
-                + ", ".join(f"{task.task_id}({task.task_type})" for task in active)
-            )
-        for task in tasks:
-            if task.task_type in allowed:
-                continue
-            if await self.has_work(
-                task.task_id,
-                account_id=account_id,
-                user_id=task.user_id,
-            ):
-                raise RuntimeError(f"Cannot delete active task record: {task.task_id}")
-        deleted_task_ids = await self._store.delete_tasks(
+        delete_result = await self._store.delete_tasks(
             account_id=account_id,
             user_id=user_id,
             allow_active_types=allowed,
         )
-        for task in tasks:
+        if not delete_result.accepted:
+            raise RuntimeError(delete_result.result.message or delete_result.result.code.value)
+        for task in delete_result.deleted:
             self._work_index.forget_task(
                 task.task_id,
-                account_id=account_id,
+                account_id=task.account_id,
                 user_id=task.user_id,
             )
-        return len(deleted_task_ids)
+        return len(delete_result.deleted)
 
     def count(self) -> int:
         return sum(sum(statuses.values()) for statuses in self.snapshot_counts_by_type().values())

@@ -13,7 +13,7 @@ import time
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Collection
 from copy import deepcopy
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any, Dict, List, Optional, Protocol
 
@@ -68,10 +68,12 @@ class StoreOperationOutcome(str, Enum):
 class StoreOperationCode(str, Enum):
     OK = "ok"
     NOT_FOUND = "not_found"
+    ACTIVE_TASK = "active_task"
     ALREADY_TERMINAL = "already_terminal"
     ALREADY_CANCELLED = "already_cancelled"
     INVALID_STATE = "invalid_state"
     NOT_CANCELLABLE = "not_cancellable"
+    OPEN_WORK = "open_work"
     WORK_NOT_OPEN = "work_not_open"
     DUPLICATE = "duplicate"
 
@@ -109,6 +111,27 @@ class StoreOperationResult:
         message: Optional[str] = None,
     ) -> "StoreOperationResult":
         return cls(StoreOperationOutcome.REJECTED, code, message)
+
+
+@dataclass(frozen=True)
+class TaskDeletionBlocker:
+    task_id: str
+    account_id: str
+    user_id: str
+    task_type: str
+    code: StoreOperationCode
+    message: str
+
+
+@dataclass(frozen=True)
+class DeleteTasksResult:
+    deleted: tuple[DeletedTask, ...] = ()
+    result: StoreOperationResult = field(default_factory=StoreOperationResult.applied)
+    blockers: tuple[TaskDeletionBlocker, ...] = ()
+
+    @property
+    def accepted(self) -> bool:
+        return self.result.accepted
 
 
 class TaskAlreadyActive(RuntimeError):
@@ -159,7 +182,7 @@ class TaskWorkStore(Protocol):
         account_id: str,
         user_id: Optional[str] = None,
         allow_active_types: Collection[str] = (),
-    ) -> List[str]: ...
+    ) -> DeleteTasksResult: ...
 
     async def delete_expired(
         self, policy: TaskRetentionPolicy, *, now: float, limit: int
@@ -1102,7 +1125,7 @@ class PersistentTaskStore(TaskWorkStore):
         account_id: str,
         user_id: Optional[str] = None,
         allow_active_types: Collection[str] = (),
-    ) -> List[str]:
+    ) -> DeleteTasksResult:
         """Delete one Task or all Tasks in an owner scope."""
         if task_id is not None:
             if not user_id:
@@ -1111,11 +1134,18 @@ class PersistentTaskStore(TaskWorkStore):
             async with self._record_locks.acquire(owner):
                 task = await self._load_task(task_id, account_id, user_id)
                 if task is not None:
-                    self._validate_deletable_task(
+                    blocker = self._deletion_blocker(
                         task, self._work_sets.get(owner), allow_active_types
                     )
+                    if blocker is not None:
+                        return self._delete_tasks_rejected((blocker,))
                 deleted = await self._delete_task_unlocked(owner, task is not None)
-                return [task_id] if deleted else []
+                return DeleteTasksResult(
+                    (DeletedTask(task_id, account_id, user_id),) if deleted else (),
+                    StoreOperationResult.applied()
+                    if deleted
+                    else StoreOperationResult.noop(StoreOperationCode.NOT_FOUND),
+                )
 
         return await self._delete_owner_tasks(
             account_id,
@@ -1129,41 +1159,95 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         user_id: Optional[str],
         allow_active_types: Collection[str],
-    ) -> List[str]:
+    ) -> DeleteTasksResult:
         tasks = await self.list(account_id, user_id=user_id, limit=None)
-        deleted: list[str] = []
+        blockers = tuple(
+            blocker
+            for task in tasks
+            if task.user_id
+            for blocker in (
+                self._deletion_blocker(
+                    task,
+                    self._work_sets.get((task.account_id, task.user_id, task.task_id)),
+                    allow_active_types,
+                ),
+            )
+            if blocker is not None
+        )
+        if blockers:
+            return self._delete_tasks_rejected(blockers)
+        deleted: list[DeletedTask] = []
         for task in tasks:
             if task.user_id:
-                deleted.extend(
-                    await self.delete_tasks(
-                        task.task_id,
-                        account_id=account_id,
-                        user_id=task.user_id,
-                        allow_active_types=allow_active_types,
-                    )
+                result = await self.delete_tasks(
+                    task.task_id,
+                    account_id=account_id,
+                    user_id=task.user_id,
+                    allow_active_types=allow_active_types,
                 )
+                if not result.accepted:
+                    return result
+                deleted.extend(result.deleted)
         self._ensured_task_dirs = {
             owner
             for owner in self._ensured_task_dirs
             if owner[0] != account_id or (user_id is not None and owner[1] != user_id)
         }
-        return sorted(deleted)
+        return DeleteTasksResult(
+            tuple(sorted(deleted, key=lambda item: (item.account_id, item.user_id, item.task_id)))
+        )
 
     @staticmethod
-    def _validate_deletable_task(
+    def _deletion_blocker(
         task: TaskRecord,
         work_set: Optional[_WorkSet],
         allow_active_types: Collection[str],
-    ) -> None:
+    ) -> Optional[TaskDeletionBlocker]:
         allowed = set(allow_active_types)
         if task.status in ACTIVE_TASK_STATUSES and task.task_type not in allowed:
-            raise RuntimeError(
-                f"Cannot delete active task record: {task.task_id}({task.task_type})"
+            return TaskDeletionBlocker(
+                task.task_id,
+                task.account_id or "",
+                task.user_id or "",
+                task.task_type,
+                StoreOperationCode.ACTIVE_TASK,
+                f"Cannot delete active task record: {task.task_id}({task.task_type})",
             )
         if task.task_type in allowed:
-            return
+            return None
         if work_set is not None and work_set.open_count:
-            raise RuntimeError(f"Cannot delete active task record: {task.task_id}")
+            return TaskDeletionBlocker(
+                task.task_id,
+                task.account_id or "",
+                task.user_id or "",
+                task.task_type,
+                StoreOperationCode.OPEN_WORK,
+                f"Cannot delete active task record: {task.task_id}",
+            )
+        return None
+
+    @staticmethod
+    def _delete_tasks_rejected(blockers: Collection[TaskDeletionBlocker]) -> DeleteTasksResult:
+        ordered = tuple(blockers)
+        active = [item for item in ordered if item.code is StoreOperationCode.ACTIVE_TASK]
+        if active:
+            message = "Cannot delete active task records: " + ", ".join(
+                f"{item.task_id}({item.task_type})" for item in active
+            )
+            code = StoreOperationCode.ACTIVE_TASK
+        elif len(ordered) == 1:
+            message = ordered[0].message
+            code = ordered[0].code
+        else:
+            message = "Cannot delete active task records: " + ", ".join(
+                item.task_id for item in ordered
+            )
+            code = StoreOperationCode.OPEN_WORK
+        return DeleteTasksResult(
+            (),
+            StoreOperationResult.rejected(code, message),
+            ordered,
+        )
 
     async def _delete_task_unlocked(
         self,

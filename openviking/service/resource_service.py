@@ -2463,13 +2463,18 @@ class ResourceService:
             await task_tracker.start(
                 task.task_id, account_id=ctx.account_id, user_id=ctx.user.user_id
             )
-            await task_tracker.register_running_task(
+            running_work_id = await task_tracker.register_running_task(
                 task.task_id,
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )
             try:
-                with bind_task_context(task.task_id, ctx.account_id, ctx.user.user_id):
+                with bind_task_context(
+                    task.task_id,
+                    ctx.account_id,
+                    ctx.user.user_id,
+                    work_id=running_work_id,
+                ):
                     if isinstance(data, SkillProcessingPreparation):
                         result = await self._skill_processor.process_prepared_skill(
                             data,

@@ -22,6 +22,7 @@ from openviking.pyagfs.exceptions import (
 )
 from openviking.server.identity import RequestContext, Role
 from openviking.service.task_store import PersistentTaskStore
+from openviking.service.task_work_index import get_task_context
 from openviking.storage.viking_fs import VikingFS
 from openviking_cli.exceptions import NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
@@ -856,6 +857,9 @@ async def test_restore_returns_pollable_task_id(vfs, monkeypatch):
     reindexed = []
 
     async def run_reindex(_executor, **kwargs):
+        context = get_task_context()
+        assert context is not None
+        assert context.work_id is not None
         reindexed.append(kwargs["uri"])
         return {
             "status": "completed",

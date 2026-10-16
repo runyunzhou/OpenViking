@@ -192,7 +192,7 @@ class MemoryCompileRunner:
         ctx: RequestContext,
     ) -> None:
         tracker = get_task_tracker()
-        await tracker.register_running_task(
+        running_work_id = await tracker.register_running_task(
             task_id,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
@@ -217,7 +217,12 @@ class MemoryCompileRunner:
                     user_id=ctx.user.user_id,
                     stage="consolidating",
                 )
-                with bind_task_context(task_id, ctx.account_id, ctx.user.user_id):
+                with bind_task_context(
+                    task_id,
+                    ctx.account_id,
+                    ctx.user.user_id,
+                    work_id=running_work_id,
+                ):
                     result = await self._consolidate(
                         target=target,
                         memory_type=memory_type,
