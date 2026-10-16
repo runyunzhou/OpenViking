@@ -749,6 +749,69 @@ async def test_memory_write_wait_skips_semantic_queue_and_releases_write_lock(mo
     assert result["queue_status"] is None
 
 
+@pytest.mark.asyncio
+async def test_top_level_wait_is_deferred_until_inline_work_closes(monkeypatch):
+    coordinator = ContentWriteCoordinator(viking_fs=object())
+    waits = []
+
+    async def fake_write(**kwargs):
+        waits.append(kwargs["wait_for_queues"])
+        return {"vector_status": "queued", "queue_status": None}
+
+    async def fake_run_tracked_operation(_task_type, *, operation, **kwargs):
+        assert kwargs["return_terminal_result"] is True
+        with bind_task_context(
+            "test-task",
+            "default",
+            "test-user",
+            enqueued_work=[],
+            work_id="inline-work",
+        ):
+            await operation()
+        return {"vector_status": "complete", "queue_status": {}}, "test-task"
+
+    monkeypatch.setattr(coordinator, "_write", fake_write)
+    monkeypatch.setattr(
+        "openviking.storage.content_write.run_tracked_operation",
+        fake_run_tracked_operation,
+    )
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    result = await coordinator.write(
+        uri="viking://resources/wiki/page.md",
+        content="updated",
+        ctx=ctx,
+        wait=True,
+    )
+
+    assert waits == [False]
+    assert result["vector_status"] == "complete"
+
+
+@pytest.mark.asyncio
+async def test_nested_wait_remains_inside_existing_task_context(monkeypatch):
+    coordinator = ContentWriteCoordinator(viking_fs=object())
+    waits = []
+
+    async def fake_write(**kwargs):
+        waits.append(kwargs["wait_for_queues"])
+        return {"vector_status": "complete", "queue_status": {}}
+
+    monkeypatch.setattr(coordinator, "_write", fake_write)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    with bind_task_context("outer-task", "default", "test-user", enqueued_work=[]):
+        result = await coordinator.write(
+            uri="viking://resources/wiki/page.md",
+            content="updated",
+            ctx=ctx,
+            wait=True,
+        )
+
+    assert waits == [True]
+    assert result["vector_status"] == "complete"
+
+
 # Create-mode test helpers
 
 

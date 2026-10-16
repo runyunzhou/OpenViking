@@ -123,7 +123,7 @@ class TaskWorkStore(Protocol):
         stage: Optional[str],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def update_stage(
         self,
@@ -133,7 +133,7 @@ class TaskWorkStore(Protocol):
         meta: Optional[Dict[str, Any]],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def update_auth(
         self,
@@ -142,7 +142,7 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def merge_meta(
         self,
@@ -151,7 +151,7 @@ class TaskWorkStore(Protocol):
         *,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def record_event(
         self,
@@ -161,7 +161,7 @@ class TaskWorkStore(Protocol):
         operation: Optional[str],
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def record_outcome(
         self,
@@ -173,7 +173,7 @@ class TaskWorkStore(Protocol):
         cancelled: bool,
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def request_cancellation(
         self,
@@ -181,9 +181,9 @@ class TaskWorkStore(Protocol):
         *,
         cancellable_types: Collection[str],
         allow_terminal: bool,
-        account_id: Optional[str],
-        user_id: Optional[str],
-    ) -> Optional[TaskRecord]: ...
+        account_id: str,
+        user_id: str,
+    ) -> bool: ...
 
     async def mark_enqueue_complete(
         self,
@@ -213,7 +213,7 @@ class TaskWorkStore(Protocol):
 
     async def discard_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def get_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
@@ -243,7 +243,7 @@ class TaskWorkStore(Protocol):
         context_count_delta: int,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def requeue_work(
         self,
@@ -267,7 +267,7 @@ class TaskWorkStore(Protocol):
 
     async def settle_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> Optional[TaskRecord]: ...
+    ) -> None: ...
 
     async def has_open_work(
         self,
@@ -295,13 +295,13 @@ class TaskWorkStore(Protocol):
         user_id: str,
     ) -> set[str]: ...
 
-    async def is_cancellation_requested(
+    async def get_task_status(
         self,
         task_id: str,
         *,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-    ) -> bool: ...
+        account_id: str,
+        user_id: str,
+    ) -> Optional[TaskStatus]: ...
 
 
 # Compatibility name for integrations that only annotate the constructor.
@@ -398,7 +398,7 @@ class PersistentTaskStore(TaskWorkStore):
         stage: Optional[str],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
             if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
                 return False
@@ -407,7 +407,7 @@ class PersistentTaskStore(TaskWorkStore):
                 task.stage = stage
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def update_stage(
         self,
@@ -417,7 +417,7 @@ class PersistentTaskStore(TaskWorkStore):
         meta: Optional[Dict[str, Any]],
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
             if task.status not in ACTIVE_TASK_STATUSES:
                 return False
@@ -426,7 +426,7 @@ class PersistentTaskStore(TaskWorkStore):
                 _deep_merge(task.meta, deepcopy(meta))
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def update_auth(
         self,
@@ -435,14 +435,14 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
             if task.status not in ACTIVE_TASK_STATUSES:
                 return False
             _deep_merge(task.auth, deepcopy(values))
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def merge_meta(
         self,
@@ -451,14 +451,14 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
             if task.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
                 raise ValueError("Task is no longer active")
             _deep_merge(task.meta, deepcopy(values))
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def record_event(
         self,
@@ -468,7 +468,7 @@ class PersistentTaskStore(TaskWorkStore):
         operation: Optional[str],
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, _work_set: _WorkSet) -> bool:
             if task.status not in ACTIVE_TASK_STATUSES:
                 return False
@@ -481,7 +481,7 @@ class PersistentTaskStore(TaskWorkStore):
             )
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def record_outcome(
         self,
@@ -493,7 +493,7 @@ class PersistentTaskStore(TaskWorkStore):
         cancelled: bool,
         account_id: Optional[str],
         user_id: Optional[str],
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(task: TaskRecord, work_set: _WorkSet) -> bool:
             if task.status not in ACTIVE_TASK_STATUSES:
                 return False
@@ -512,7 +512,7 @@ class PersistentTaskStore(TaskWorkStore):
             self._try_finalize(task, work_set)
             return True
 
-        return await self._mutate_task(task_id, account_id, user_id, mutate)
+        await self._mutate_task(task_id, account_id, user_id, mutate)
 
     async def request_cancellation(
         self,
@@ -520,9 +520,9 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         cancellable_types: Collection[str],
         allow_terminal: bool,
-        account_id: Optional[str],
-        user_id: Optional[str],
-    ) -> Optional[TaskRecord]:
+        account_id: str,
+        user_id: str,
+    ) -> bool:
         def mutate(task: TaskRecord, work_set: _WorkSet) -> bool:
             if task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED):
                 return False
@@ -581,7 +581,7 @@ class PersistentTaskStore(TaskWorkStore):
                 return _WorkMutationResult(False, existing)
             return _WorkMutationResult(True, deepcopy(work))
 
-        found, _ = await self._mutate_work(
+        found = await self._mutate_work(
             work.task_id,
             work.work_id,
             account_id,
@@ -613,11 +613,11 @@ class PersistentTaskStore(TaskWorkStore):
 
     async def discard_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(_task: TaskRecord, existing: Optional[WorkRecord]) -> _WorkMutationResult:
             return _WorkMutationResult(existing is not None, None)
 
-        _, task = await self._mutate_work(
+        await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -625,7 +625,6 @@ class PersistentTaskStore(TaskWorkStore):
             mutate,
             try_finalize=True,
         )
-        return task
 
     async def get_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
@@ -684,7 +683,7 @@ class PersistentTaskStore(TaskWorkStore):
         context_count_delta: int,
         account_id: str,
         user_id: str,
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         if state not in (WorkState.DONE, WorkState.FAILED):
             raise ValueError(f"Non-terminal Work state: {state}")
 
@@ -704,7 +703,7 @@ class PersistentTaskStore(TaskWorkStore):
                 work.context_count += context_count_delta
             return _WorkMutationResult(True, work)
 
-        _, task = await self._mutate_work(
+        await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -712,7 +711,6 @@ class PersistentTaskStore(TaskWorkStore):
             mutate,
             try_finalize=True,
         )
-        return task
 
     async def requeue_work(
         self,
@@ -755,7 +753,7 @@ class PersistentTaskStore(TaskWorkStore):
 
     async def settle_work(
         self, task_id: str, work_id: str, *, account_id: str, user_id: str
-    ) -> Optional[TaskRecord]:
+    ) -> None:
         def mutate(_task: TaskRecord, work: Optional[WorkRecord]) -> _WorkMutationResult:
             if work is None:
                 return _WorkMutationResult(False, None)
@@ -767,7 +765,7 @@ class PersistentTaskStore(TaskWorkStore):
                 changed = True
             return _WorkMutationResult(changed, work)
 
-        _, task = await self._mutate_work(
+        await self._mutate_work(
             task_id,
             work_id,
             account_id,
@@ -776,7 +774,6 @@ class PersistentTaskStore(TaskWorkStore):
             try_finalize=True,
             finalize_when_unchanged=True,
         )
-        return task
 
     async def has_open_work(
         self,
@@ -818,23 +815,27 @@ class PersistentTaskStore(TaskWorkStore):
     ) -> set[str]:
         requested = set()
         for task_id in set(task_ids):
-            task = await self.get_task(task_id, account_id=account_id, user_id=user_id)
-            if task is not None and task.status in (
+            status = await self.get_task_status(task_id, account_id=account_id, user_id=user_id)
+            if status in (
                 TaskStatus.CANCELLING,
                 TaskStatus.CANCELLED,
             ):
                 requested.add(task_id)
         return requested
 
-    async def is_cancellation_requested(
+    async def get_task_status(
         self,
         task_id: str,
         *,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
-    ) -> bool:
-        task = await self.get_task(task_id, account_id=account_id, user_id=user_id)
-        return bool(task and task.status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED))
+        account_id: str,
+        user_id: str,
+    ) -> Optional[TaskStatus]:
+        task = await self._load_task(task_id, account_id, user_id)
+        if task is None:
+            return None
+        with self._lock:
+            live = self._task_cache.get((account_id, user_id, task_id))
+            return live.status if live is not None else None
 
     async def list(
         self,
@@ -1131,17 +1132,17 @@ class PersistentTaskStore(TaskWorkStore):
         account_id: Optional[str],
         user_id: Optional[str],
         mutate: Callable[[TaskRecord, _WorkSet], bool],
-    ) -> Optional[TaskRecord]:
+    ) -> bool:
         task = await self._load_task(task_id, account_id, user_id)
         if task is None or not task.account_id or not task.user_id:
-            return None
+            return False
         owner = (task.account_id, task.user_id, task_id)
         async with self._record_locks.acquire(owner):
             await self._load_task(task_id, owner[0], owner[1])
             with self._lock:
                 live_task = self._task_cache.get(owner)
                 if live_task is None:
-                    return None
+                    return False
                 work_set = self._work_sets.setdefault(owner, _WorkSet({}))
                 candidate = deepcopy(live_task)
                 previous = deepcopy(live_task)
@@ -1149,13 +1150,12 @@ class PersistentTaskStore(TaskWorkStore):
                 if inspect.isawaitable(mutation):
                     raise TypeError("File store mutations must be synchronous")
                 if not mutation:
-                    return self._copy_task(live_task, work_set)
+                    return True
                 candidate.updated_at = TaskRecord.next_updated_at(candidate.updated_at)
                 self._append_events(candidate, previous)
                 snapshot = deepcopy(candidate)
             await self._write_task_and_publish(snapshot, owner, candidate)
-            with self._lock:
-                return self._copy_task(candidate, self._work_sets.get(owner))
+            return True
 
     async def _mutate_work(
         self,
@@ -1167,17 +1167,17 @@ class PersistentTaskStore(TaskWorkStore):
         *,
         try_finalize: bool = False,
         finalize_when_unchanged: bool = False,
-    ) -> tuple[bool, Optional[TaskRecord]]:
+    ) -> bool:
         task = await self._load_task(task_id, account_id, user_id)
         if task is None or not task.account_id or not task.user_id:
-            return False, None
+            return False
         owner = (task.account_id, task.user_id, task_id)
         async with self._record_locks.acquire(owner):
             await self._load_task(task_id, owner[0], owner[1])
             with self._lock:
                 live_task = self._task_cache.get(owner)
                 if live_task is None:
-                    return False, None
+                    return False
                 work_set = self._work_sets.setdefault(owner, _WorkSet({}))
                 existing = work_set.works.get(work_id)
                 mutation = mutate(live_task, deepcopy(existing) if existing is not None else None)
@@ -1223,12 +1223,11 @@ class PersistentTaskStore(TaskWorkStore):
                         else:
                             work_set.works[work_id] = mutation.work
                         work_set.open_count = open_count
-                    return True, None
+                    return True
             assert candidate_task is not None
             assert candidate_work_set is not None
             await self._write_task_and_publish(snapshot, owner, candidate_task, candidate_work_set)
-            with self._lock:
-                return True, deepcopy(candidate_task)
+            return True
 
     async def _write_task_and_publish(
         self,

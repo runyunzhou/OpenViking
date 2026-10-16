@@ -182,6 +182,48 @@ async def test_batch_accepts_more_than_256_operations(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_top_level_batch_wait_defers_inline_wait_and_preserves_queue_error(monkeypatch):
+    coordinator = ContentWriteCoordinator(viking_fs=object())
+    waits = []
+
+    async def fake_batch_write(**kwargs):
+        waits.append(kwargs["wait_for_queues"])
+        return {"semantic_status": "queued", "queue_status": None}
+
+    async def fake_run_tracked_operation(_task_type, *, operation, **kwargs):
+        assert kwargs["return_terminal_result"] is True
+        with bind_task_context(
+            "test-task",
+            "default",
+            "default",
+            enqueued_work=[],
+            work_id="inline-work",
+        ):
+            await operation()
+        terminal_result = {
+            "semantic_status": "failed",
+            "queue_status": {"Semantic": {"error_count": 1}},
+        }
+        assert kwargs["accept_failed_result"](terminal_result) is True
+        return terminal_result, "test-task"
+
+    monkeypatch.setattr(coordinator, "_batch_write", fake_batch_write)
+    monkeypatch.setattr(content_write_module, "run_tracked_operation", fake_run_tracked_operation)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+
+    with pytest.raises(OpenVikingError) as error:
+        await coordinator.batch_write(
+            root_uri="viking://resources/wiki",
+            operations=[],
+            ctx=ctx,
+            wait=True,
+        )
+
+    assert waits == [False]
+    assert error.value.code == "INTERNAL"
+
+
+@pytest.mark.asyncio
 async def test_batch_create_replace_and_upsert_overwrite_or_create(monkeypatch):
     root = "viking://resources/wiki"
     existing = f"{root}/existing.md"

@@ -684,6 +684,51 @@ async def test_inline_operation_can_wait_for_task_work_without_waiting_for_itsel
     assert (await tracker.get(task_id, **_owner_kwargs())).status is TaskStatus.COMPLETED
 
 
+async def test_wait_can_return_terminal_projected_result(tracker):
+    set_task_tracker(tracker)
+    workers = []
+
+    async def operation():
+        context = get_task_context()
+        await tracker.register_work(
+            context.task_id,
+            "embedding-work",
+            "Embedding",
+            account_id=context.account_id,
+            user_id=context.user_id,
+        )
+
+        async def complete_work():
+            await asyncio.sleep(0)
+            await tracker.mark_work_done(
+                context.task_id,
+                "embedding-work",
+                account_id=context.account_id,
+                user_id=context.user_id,
+            )
+
+        workers.append(asyncio.create_task(complete_work()))
+        return {
+            "status": "success",
+            "vector_status": "queued",
+            "queue_status": None,
+        }
+
+    result, task_id = await run_tracked_operation(
+        "content_write",
+        **_owner_kwargs(),
+        operation=operation,
+        wait=True,
+        return_terminal_result=True,
+    )
+
+    assert "task_id" not in result
+    assert result["vector_status"] == "complete"
+    assert result["queue_status"]["Embedding"]["processed"] == 1
+    assert (await tracker.get(task_id, **_owner_kwargs())).status is TaskStatus.COMPLETED
+    await asyncio.gather(*workers)
+
+
 async def test_accept_failed_result_returns_structured_partial_result(tracker):
     set_task_tracker(tracker)
     workers = []

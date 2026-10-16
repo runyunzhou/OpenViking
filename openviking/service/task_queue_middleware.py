@@ -5,6 +5,7 @@
 import asyncio
 from typing import TYPE_CHECKING
 
+from openviking.service.task_domain import TERMINAL_TASK_STATUSES
 from openviking.service.task_store import WorkRegistration
 from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool, run_to_completion
 from openviking.service.task_work_index import (
@@ -203,12 +204,12 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
             user_id=metadata.user_id,
         )
         if state is None:
-            task = await self._tracker.get(
+            status = await self._tracker.get_task_status(
                 metadata.task_id,
                 account_id=metadata.account_id,
                 user_id=metadata.user_id,
             )
-            if task is not None and task.is_terminal():
+            if status in TERMINAL_TASK_STATUSES:
                 return ProcessResult.success()
             await self._tracker.reconcile_delivery(
                 metadata.task_id,

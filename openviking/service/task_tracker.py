@@ -22,6 +22,7 @@ from typing import (
     List,
     Optional,
     TypeVar,
+    cast,
 )
 from uuid import uuid4
 
@@ -145,11 +146,14 @@ async def run_tracked_operation(
     resource_id: Optional[str] = None,
     existing_task: Optional[TaskRecord] = None,
     accept_failed_result: Callable[[_OperationResult], bool] | None = None,
+    return_terminal_result: bool = False,
 ) -> tuple[_OperationResult, str]:
     """Run a top-level operation under a Task, reusing an existing Task context.
 
     ``accept_failed_result`` is reserved for operations whose result explicitly
     reports record-level failures while the Task retains its failed status.
+    ``return_terminal_result`` returns the Task's final projected result after
+    waiting instead of the operation's pre-Work result.
     """
     from openviking.service.task_work_index import bind_task_context, get_task_context
 
@@ -244,6 +248,10 @@ async def run_tracked_operation(
                     user_id=user_id,
                     timeout=timeout,
                 )
+                if return_terminal_result and terminal.result is not None:
+                    result = cast(_OperationResult, deepcopy(terminal.result))
+                    if isinstance(result, dict):
+                        result.pop("task_id", None)
                 if terminal.status == TaskStatus.FAILED and not (
                     accept_failed_result is not None and accept_failed_result(result)
                 ):
@@ -551,20 +559,21 @@ class TaskTracker:
     async def cancel(
         self,
         task_id: str,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        *,
+        account_id: str,
+        user_id: str,
     ) -> Optional[TaskRecord]:
-        task = await self._request_cancellation(
+        self._validate_owner(account_id, user_id)
+        found = await self._request_cancellation(
             task_id,
             account_id=account_id,
             user_id=user_id,
             allow_terminal=False,
         )
-        if task is not None:
-            self._work_index.cancel_active(
-                task_id, account_id=task.account_id, user_id=task.user_id
-            )
-        return task
+        if not found:
+            return None
+        self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
+        return await self.get(task_id, account_id=account_id, user_id=user_id)
 
     async def cancel_skill_update_for_rollback(
         self, task_id: str, *, account_id: str, user_id: str
@@ -572,25 +581,26 @@ class TaskTracker:
         task = await self.get(task_id, account_id=account_id, user_id=user_id)
         if task is not None and task.task_type != "add_skill":
             raise ValueError("Only Skill processing can be cancelled for package rollback")
-        cancelled = await self._request_cancellation(
+        found = await self._request_cancellation(
             task_id,
             account_id=account_id,
             user_id=user_id,
             allow_terminal=True,
         )
-        if cancelled is not None:
-            self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
-        return cancelled
+        if not found:
+            return None
+        self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
+        return await self.get(task_id, account_id=account_id, user_id=user_id)
 
     async def _request_cancellation(
         self,
         task_id: str,
         *,
-        account_id: Optional[str],
-        user_id: Optional[str],
+        account_id: str,
+        user_id: str,
         allow_terminal: bool,
-    ) -> Optional[TaskRecord]:
-        task = await run_to_completion(
+    ) -> bool:
+        return await run_to_completion(
             lambda: self._store.request_cancellation(
                 task_id,
                 cancellable_types=_CANCELLABLE_TASK_TYPES,
@@ -599,24 +609,20 @@ class TaskTracker:
                 user_id=user_id,
             )
         )
-        return self._public(task) if task is not None else None
 
     async def register_running_task(
         self,
         task_id: str,
         *,
         work_id: Optional[str] = None,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        account_id: str,
+        user_id: str,
     ) -> str:
+        self._validate_owner(account_id, user_id)
         active_task = asyncio.current_task()
-        task = await self._store.get_task(task_id, account_id=account_id, user_id=user_id)
-        if active_task is None or task is None or task.is_terminal():
+        status = await self._store.get_task_status(task_id, account_id=account_id, user_id=user_id)
+        if active_task is None or status is None or status in TERMINAL_TASK_STATUSES:
             raise TaskWorkRejected(f"Task {task_id} is unavailable")
-        if not task.account_id or not task.user_id:
-            raise TaskWorkRejected(f"Task {task_id} has no owner")
-        owner_account_id = task.account_id
-        owner_user_id = task.user_id
         inline = work_id is None
         running_work_id = work_id or f"inline:{uuid4()}"
         if inline:
@@ -624,8 +630,8 @@ class TaskTracker:
                 task_id,
                 running_work_id,
                 "Inline",
-                account_id=owner_account_id,
-                user_id=owner_user_id,
+                account_id=account_id,
+                user_id=user_id,
             )
             if registration is WorkRegistration.REJECTED:
                 raise TaskWorkRejected(f"Task {task_id} rejects inline work")
@@ -633,8 +639,8 @@ class TaskTracker:
                 await self.start_work(
                     task_id,
                     running_work_id,
-                    account_id=owner_account_id,
-                    user_id=owner_user_id,
+                    account_id=account_id,
+                    user_id=user_id,
                 )
             except BaseException:
                 if registration is WorkRegistration.CREATED:
@@ -642,21 +648,19 @@ class TaskTracker:
                         lambda: self.discard_work(
                             task_id,
                             running_work_id,
-                            account_id=owner_account_id,
-                            user_id=owner_user_id,
+                            account_id=account_id,
+                            user_id=user_id,
                         )
                     )
                 raise
         self._work_index.register_active(
             task_id,
             active_task,
-            account_id=owner_account_id,
-            user_id=owner_user_id,
+            account_id=account_id,
+            user_id=user_id,
         )
-        self._running.set((running_work_id, owner_account_id, owner_user_id, inline))
-        if await self.is_cancellation_requested(
-            task_id, account_id=owner_account_id, user_id=owner_user_id
-        ):
+        self._running.set((running_work_id, account_id, user_id, inline))
+        if await self.is_cancellation_requested(task_id, account_id=account_id, user_id=user_id):
             active_task.cancel()
         return running_work_id
 
@@ -691,6 +695,12 @@ class TaskTracker:
     ) -> Optional[TaskRecord]:
         task = await self._store.get_task(task_id, account_id=account_id, user_id=user_id)
         return self._public(task) if task is not None else None
+
+    async def get_task_status(
+        self, task_id: str, *, account_id: str, user_id: str
+    ) -> Optional[TaskStatus]:
+        self._validate_owner(account_id, user_id)
+        return await self._store.get_task_status(task_id, account_id=account_id, user_id=user_id)
 
     async def get_task_auth(self, task_id: str, *, account_id: str, user_id: str) -> Dict[str, Any]:
         self._validate_owner(account_id, user_id)
@@ -1008,8 +1018,9 @@ class TaskTracker:
     async def is_cancelling(
         self,
         task_id: str,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        *,
+        account_id: str,
+        user_id: str,
     ) -> bool:
         return await self.is_cancellation_requested(task_id, account_id=account_id, user_id=user_id)
 
@@ -1017,12 +1028,11 @@ class TaskTracker:
         self,
         task_id: str,
         *,
-        account_id: Optional[str] = None,
-        user_id: Optional[str] = None,
+        account_id: str,
+        user_id: str,
     ) -> bool:
-        return await self._store.is_cancellation_requested(
-            task_id, account_id=account_id, user_id=user_id
-        )
+        status = await self.get_task_status(task_id, account_id=account_id, user_id=user_id)
+        return status in (TaskStatus.CANCELLING, TaskStatus.CANCELLED)
 
     async def wait_for_work(
         self,

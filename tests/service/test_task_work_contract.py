@@ -39,7 +39,8 @@ async def create_running_task(
 ) -> TaskRecord:
     task = TaskRecord(task_id=task_id, task_type=task_type, **OWNER)
     await store.create(task)
-    started = await store.start_task(task_id, stage=None, **OWNER)
+    await store.start_task(task_id, stage=None, **OWNER)
+    started = await store.get_task(task_id, **OWNER)
     assert started is not None
     return started
 
@@ -116,6 +117,33 @@ async def test_work_registration_is_idempotent_and_rejects_terminal_task(store):
             WorkRecord(work_id="later", task_id="task", queue_name="Semantic"),
             **OWNER,
         )
+
+
+@pytest.mark.asyncio
+async def test_cancellation_reports_whether_the_owned_task_exists(store):
+    assert (
+        await store.request_cancellation(
+            "missing",
+            cancellable_types={"content_write"},
+            allow_terminal=False,
+            **OWNER,
+        )
+        is False
+    )
+    await create_running_task(store)
+    assert await store.get_task_status("task", **OWNER) is TaskStatus.RUNNING
+    assert await store.get_task_status("task", account_id="account", user_id="other") is None
+    for _ in range(2):
+        assert (
+            await store.request_cancellation(
+                "task",
+                cancellable_types={"content_write"},
+                allow_terminal=False,
+                **OWNER,
+            )
+            is True
+        )
+    assert await store.get_task_status("task", **OWNER) is TaskStatus.CANCELLED
 
 
 @pytest.mark.asyncio

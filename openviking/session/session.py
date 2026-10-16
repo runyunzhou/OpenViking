@@ -2516,7 +2516,11 @@ class Session:
             telemetry.set_error("session.commit.phase2", "CANCELLED", "session commit cancelled")
             snapshot = telemetry.finish("cancelled")
             _publish_telemetry_summary_best_effort(snapshot)
-            if await tracker.is_cancellation_requested(task_id):
+            if await tracker.is_cancellation_requested(
+                task_id,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+            ):
                 await self._write_failed_marker(
                     archive_uri,
                     stage="cancelled",
