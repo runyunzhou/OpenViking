@@ -1741,24 +1741,24 @@ class Session:
         # published Phase 1. Task must exist before middleware registers Queue Work.
         tracker = get_task_tracker()
         try:
-            await tracker.create(
-                "session_commit",
-                resource_id=self.session_id,
-                account_id=self.ctx.account_id,
-                user_id=self.ctx.user.user_id,
-                task_id=task_id,
-            )
-        except Exception as exc:
-            error = map_exception(exc) or InternalError(str(exc))
-            error.details.update(
-                task_id=task_id,
-                archive_uri=archive_uri,
-                archived=True,
-                stage="task_tracker_create",
-            )
-            raise error
+            try:
+                await tracker.create(
+                    "session_commit",
+                    resource_id=self.session_id,
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                    task_id=task_id,
+                )
+            except Exception as exc:
+                error = map_exception(exc) or InternalError(str(exc))
+                error.details.update(
+                    task_id=task_id,
+                    archive_uri=archive_uri,
+                    archived=True,
+                    stage="task_tracker_create",
+                )
+                raise error
 
-        try:
             try:
                 with bind_task_context(
                     task_id,

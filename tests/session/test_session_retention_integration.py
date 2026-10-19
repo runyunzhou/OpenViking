@@ -1958,7 +1958,14 @@ async def test_phase1_publishes_and_unlocks_before_task_registration(tmp_path, m
     await session.ensure_exists()
     await session.add_message_async("user", [TextPart("archive me")])
 
+    original_create = tracker._store.create
+    create_attempts = 0
+
     async def create_task(task, *, reject_if_active=False):
+        nonlocal create_attempts
+        create_attempts += 1
+        if create_attempts > 1:
+            return await original_create(task, reject_if_active=reject_if_active)
         lease = await fs._async_agfs.pathlock_acquire_tree(
             fs._uri_to_path(session.uri, ctx=session.ctx)
         )
@@ -1966,7 +1973,13 @@ async def test_phase1_publishes_and_unlocks_before_task_registration(tmp_path, m
         raise AGFSIoError("task store unavailable")
 
     monkeypatch.setattr(tracker._store, "create", create_task)
-    enqueue = AsyncMock()
+
+    enqueued: list[dict] = []
+
+    async def enqueue(_queue_name, data):
+        enqueued.append(data)
+        return data["task_id"]
+
     monkeypatch.setattr(
         "openviking.storage.queuefs.get_queue_manager",
         lambda: SimpleNamespace(enqueue=enqueue),
@@ -1974,11 +1987,32 @@ async def test_phase1_publishes_and_unlocks_before_task_registration(tmp_path, m
     with pytest.raises(UnavailableError, match="task store unavailable") as error:
         await session.commit_async()
     archive_uri = error.value.details["archive_uri"]
+    archive_path = fs._uri_to_path(archive_uri, ctx=session.ctx)
+    publication_lease = await fs._async_agfs.pathlock_acquire_exact(
+        archive_path,
+        timeout_secs=0.0,
+    )
+    await fs._async_agfs.pathlock_release(publication_lease)
+
     assert error.value.details["archived"] is True
     assert (await session._read_phase1_meta(archive_uri))["status"] == "ready"
     assert await session._read_live_messages_strict() == []
     assert not await fs.exists(f"{archive_uri}/.failed.json", ctx=session.ctx)
-    enqueue.assert_not_awaited()
+    assert enqueued == []
+
+    await session.add_message_async("user", [TextPart("follow-up archive")])
+    result = await session.commit_async()
+
+    assert result["status"] == "accepted"
+    assert result["archived"] is True
+    assert result["archive_uri"].endswith("/archive_002")
+    assert len(enqueued) == 1
+
+    observer = Session(viking_fs=fs, session_id=session.session_id)
+    await observer.load()
+    assert await observer._can_run_archive(2)
+    failed = json.loads(await fs.read_file(f"{archive_uri}/.failed.json", ctx=session.ctx))
+    assert failed["stage"] == "queue_missing"
 
 
 async def test_commit_publication_lease_uses_native_marker_file_locks(
