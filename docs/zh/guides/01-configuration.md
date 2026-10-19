@@ -1273,6 +1273,7 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 | `skip_process_lock` | bool | 是否跳过本地向量后端（`local`、`cuvs`）对 `storage.workspace` 的 `.openviking.lock` 独占文件锁。其他后端不会获取此锁。跳过检查不代表本地向量存储支持多进程共享。 | `false` |
 | `agfs` | object | RAGFS（Rust 实现的 AGFS）配置 | {} |
 | `vectordb` | object | 向量库存储配置 | {} |
+| `task_store` | object | 持久化 Task/Work 后端配置 | `{"provider":"file"}` |
 
 
 ```json
@@ -1289,6 +1290,39 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
   }
 }
 ```
+
+#### task_store
+
+Task 记录默认使用本地 FileStore。需要多个 OpenViking 进程共享
+Task/Work 状态时，先在 MySQL 中执行
+`openviking/service/sql/task_store_init.sql`，再选择关系型后端：
+
+```json
+{
+  "storage": {
+    "task_store": {
+      "provider": "mysql",
+      "params": {
+        "user": "openviking",
+        "password": "change-me",
+        "database": "openviking",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "table": "ov_tasks"
+      }
+    }
+  }
+}
+```
+
+`params.table` 是表前缀，必须以 ASCII 字母开头，只能包含 ASCII 字母、数字和
+下划线，最多 38 个字符，确保派生的表名、索引名和约束名不超过 MySQL 的 64 字符上限。
+使用自定义前缀时，需要在建表 SQL 中统一替换 `ov_tasks`。
+
+MySQL 后端需要安装 `openviking[mysql]` extra。Task mutation、Task
+最终化和 execution event 更新在同一个数据库事务中提交。`task_id`
+是全局唯一身份；`account_id` 和 `user_id` 用于鉴权和查询范围。同一部署
+不要同时让 FileStore 和 MySQL 表作为写入端。
 
 #### agfs (RAGFS)
 

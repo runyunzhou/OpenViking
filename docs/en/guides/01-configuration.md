@@ -1283,6 +1283,7 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 | `skip_process_lock` | bool | Skip the exclusive `.openviking.lock` file lock on `storage.workspace` for embedded vector backends (`local`, `cuvs`). Other backends do not acquire this lock. Skipping it does not make embedded vector storage safe for multiple processes. | `false` |
 | `agfs` | object | RAGFS (Rust-based AGFS) configuration | {} |
 | `vectordb` | object | Vector database storage configuration | {} |
+| `task_store` | object | Durable Task/Work backend configuration | `{"provider":"file"}` |
 
 
 ```json
@@ -1299,6 +1300,41 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
   }
 }
 ```
+
+#### task_store
+
+Task records use the local FileStore by default. To share Task/Work state across
+OpenViking processes, provision `openviking/service/sql/task_store_init.sql` in
+MySQL and select the relational backend:
+
+```json
+{
+  "storage": {
+    "task_store": {
+      "provider": "mysql",
+      "params": {
+        "user": "openviking",
+        "password": "change-me",
+        "database": "openviking",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "table": "ov_tasks"
+      }
+    }
+  }
+}
+```
+
+`params.table` is the table prefix. It must start with an ASCII letter, contain
+only ASCII letters, digits, or underscores, and be at most 38 characters so
+derived table, index, and constraint names fit MySQL's 64-character limit.
+Replace `ov_tasks` consistently in the provisioning SQL when using a custom prefix.
+
+The MySQL backend requires the `openviking[mysql]` extra. Its mutations,
+Task finalization, and execution-event updates commit in one database
+transaction. `task_id` is globally unique; `account_id` and `user_id` scope
+authorization and queries. Do not use the FileStore tables and MySQL tables as
+active writers for the same deployment.
 
 #### agfs (RAGFS)
 

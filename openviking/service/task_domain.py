@@ -194,6 +194,8 @@ class WorkRecord:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     updated_at: float = field(default_factory=time.time)
+    account_id: Optional[str] = None
+    user_id: Optional[str] = None
 
     def is_open(self) -> bool:
         return self.state not in TERMINAL_WORK_STATES

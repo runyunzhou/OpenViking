@@ -23,6 +23,7 @@ from openviking.message.part import TextPart, ToolPart
 from openviking.server.config import ToolOutputExternalizationConfig
 from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_work_index import bind_task_context
 from openviking.session import working_memory as wm
 from openviking.session.archive_store import (
     ArchiveStore,
@@ -1648,12 +1649,6 @@ class Session:
                         },
                     )
 
-                phase1_stage = "queue_enqueue"
-                await get_queue_manager().enqueue(
-                    QueueManager.SESSION_COMMIT,
-                    queue_msg.to_dict(),
-                )
-
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages
                 await self._write_to_agfs_async(messages=self._messages)
@@ -1715,15 +1710,17 @@ class Session:
                 await self._append_context_reset_archive()
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
-        # Lock released; Phase 1 intent, queue item, retained root, metadata and
-        # ready metadata are all durable.
+        # Lock released; Phase 1 intent, retained root, metadata and ready
+        # metadata are durable before Task-store or QueueFS latency.
 
         self._compression.original_count += len(messages_to_archive)
         logger.info(f"Archived: {len(messages_to_archive)} messages → {archive_uri}/")
 
-        # Registration must not hold the session lock or roll back published Phase 1.
+        # Registration and enqueue must not hold the session lock or roll back
+        # published Phase 1. Task must exist before middleware registers Queue Work.
+        tracker = get_task_tracker()
         try:
-            await get_task_tracker().create(
+            await tracker.create(
                 "session_commit",
                 resource_id=self.session_id,
                 account_id=self.ctx.account_id,
@@ -1737,6 +1734,35 @@ class Session:
                 archive_uri=archive_uri,
                 archived=True,
                 stage="task_tracker_create",
+            )
+            raise error
+
+        try:
+            with bind_task_context(
+                task_id,
+                self.ctx.account_id,
+                self.ctx.user.user_id,
+            ):
+                await get_queue_manager().enqueue(
+                    QueueManager.SESSION_COMMIT,
+                    queue_msg.to_dict(),
+                )
+        except Exception as exc:
+            try:
+                await tracker.fail(
+                    task_id,
+                    str(exc),
+                    account_id=self.ctx.account_id,
+                    user_id=self.ctx.user.user_id,
+                )
+            except Exception:
+                logger.exception("Failed to persist Task failure: %s", task_id)
+            error = map_exception(exc) or InternalError(str(exc))
+            error.details.update(
+                task_id=task_id,
+                archive_uri=archive_uri,
+                archived=True,
+                stage="queue_enqueue",
             )
             raise error
 

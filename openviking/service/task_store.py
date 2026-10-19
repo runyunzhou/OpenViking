@@ -161,6 +161,14 @@ class TaskWorkStore(Protocol):
         user_id: Optional[str] = None,
     ) -> Optional[TaskRecord]: ...
 
+    async def get_task_with_events(
+        self,
+        task_id: str,
+        *,
+        account_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Optional[TaskRecord]: ...
+
     async def list(
         self,
         account_id: Optional[str] = None,
@@ -451,6 +459,24 @@ class PersistentTaskStore(TaskWorkStore):
                 return deepcopy(stored)
 
     async def get_task(
+        self,
+        task_id: str,
+        *,
+        account_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> Optional[TaskRecord]:
+        task = await self._load_task(task_id, account_id, user_id)
+        if task is None:
+            return None
+        with self._lock:
+            owner = self._find_cached_owner(task_id, account_id, user_id)
+            if owner is None:
+                return None
+            task = self._copy_task(self._task_cache[owner], self._work_sets.get(owner))
+            task.execution_events = None
+            return task
+
+    async def get_task_with_events(
         self,
         task_id: str,
         *,
@@ -1040,13 +1066,15 @@ class PersistentTaskStore(TaskWorkStore):
                     except (ValueError, TypeError, KeyError):
                         continue
         with self._lock:
-            tasks = [
-                self._copy_task(task, self._work_sets.get(owner))
-                for owner, task in self._task_cache.items()
-                for account, user, _ in (owner,)
-                if (account_id is None or account == account_id)
-                and (user_id is None or user == user_id)
-            ]
+            tasks = []
+            for owner, task in self._task_cache.items():
+                account, user, _ = owner
+                if (account_id is None or account == account_id) and (
+                    user_id is None or user == user_id
+                ):
+                    copied = self._copy_task(task, self._work_sets.get(owner))
+                    copied.execution_events = None
+                    tasks.append(copied)
         tasks = [
             task
             for task in tasks
@@ -1099,6 +1127,7 @@ class PersistentTaskStore(TaskWorkStore):
                 cached = self._task_cache.get(owner)
                 if cached is not None:
                     record = self._copy_task(cached, self._work_sets.get(owner))
+            record.execution_events = None
             key = (record.created_at, record.task_id)
             if before is not None and key >= before:
                 continue

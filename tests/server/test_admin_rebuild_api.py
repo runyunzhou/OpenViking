@@ -1,5 +1,6 @@
 """Tests for reindex admin endpoint and executor behavior."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -610,6 +611,180 @@ async def test_reindex_wait_false_marks_task_failed_when_submit_preparation_fail
         account_id="test",
         user_id="alice",
     )
+
+
+@pytest.fixture
+async def reindex_queue(tmp_path, monkeypatch):
+    import ragfs_python
+
+    from openviking.service.task_store import PersistentTaskStore
+    from openviking.service.task_tracker import TaskTracker, set_task_tracker
+    from openviking.storage.queuefs.queue_manager import QueueManager
+    from openviking.storage.queuefs.reindex_processor import ReindexProcessor
+    from openviking.storage.viking_fs import VikingFS
+
+    agfs = ragfs_python.RAGFSBindingClient()
+    (tmp_path / "fs").mkdir()
+    agfs.mount("localfs", "/local", {"local_dir": str(tmp_path / "fs")})
+    agfs.mount("queuefs", "/queue", {"backend": "sqlite", "db_path": str(tmp_path / "queue.db")})
+    fs = VikingFS(agfs=agfs)
+    tracker = TaskTracker(PersistentTaskStore(agfs))
+    manager = QueueManager(agfs=agfs)
+    queue = manager.get_queue("Reindex", ReindexProcessor(fs), allow_create=True)
+    ctx = RequestContext(user=UserIdentifier("reindex-test", "alice"), role=Role.ADMIN)
+    await fs.write_file("viking://resources/demo.md", "source", ctx=ctx)
+    service = SimpleNamespace(
+        viking_fs=fs,
+        vikingdb_manager=SimpleNamespace(has_queue_manager=True),
+        _vlm_resolver=None,
+        _vector_config_resolver=None,
+    )
+    monkeypatch.setattr("openviking.service.reindex_executor.get_service", lambda: service)
+    monkeypatch.setattr("openviking.server.dependencies.get_service", lambda: service)
+    monkeypatch.setattr("openviking.storage.queuefs.get_queue_manager", lambda: manager)
+    set_task_tracker(tracker)
+    try:
+        yield manager, queue, tracker, ctx
+    finally:
+        set_task_tracker(None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wait", "outcome"),
+    [
+        (False, "success"),
+        (True, "success"),
+        (True, "failed"),
+        (True, "typed_error"),
+        (True, "partial"),
+        (True, "cancelled"),
+        (False, "restarted"),
+        (True, "restarted"),
+    ],
+)
+async def test_reindex_request_uses_durable_work_and_preserves_terminal_result(
+    reindex_queue, monkeypatch, wait, outcome
+):
+    import asyncio
+
+    from openviking.service.reindex_executor import ReindexExecutor
+    from openviking.service.task_store import PersistentTaskStore
+    from openviking.service.task_tracker import TaskStatus, TaskTracker, set_task_tracker
+    from openviking.service.task_work_index import get_task_context
+    from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+    from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+    from openviking_cli.exceptions import NotFoundError
+
+    manager, queue, tracker, ctx = reindex_queue
+    owner = {"account_id": ctx.account_id, "user_id": ctx.user.user_id}
+    child_started, release_child = asyncio.Event(), asyncio.Event()
+
+    class EmbeddingHandler(DequeueHandlerBase):
+        async def on_dequeue(self, data):
+            child_started.set()
+            await release_child.wait()
+            if outcome == "partial":
+                return ProcessResult.failed("embedding failed")
+            return ProcessResult.success({"vector_written": True})
+
+    embedding = manager.get_queue("Embedding", EmbeddingHandler(), allow_create=True)
+
+    async def rebuild(_self, *, uri, mode, run):
+        context = get_task_context()
+        assert context.work_id and not context.work_id.startswith("inline:")
+        if outcome == "failed":
+            raise RuntimeError("rebuild failed")
+        if outcome == "typed_error":
+            raise NotFoundError(uri, "resource")
+        await embedding.enqueue(
+            EmbeddingMsg(message="source", context_data={"uri": uri, "account_id": ctx.account_id})
+        )
+        run.counters.scanned_records = 1
+        run.counters.rebuilt_records = 1
+
+    monkeypatch.setattr(ReindexExecutor, "_reindex_resource", rebuild)
+    request = asyncio.create_task(
+        ReindexExecutor().execute(
+            uri="viking://resources/demo.md", mode="vectors_only", wait=wait, ctx=ctx
+        )
+    )
+    processing = child = None
+    try:
+        async with asyncio.timeout(2):
+            while not (messages := await queue.snapshot()):
+                if request.done():
+                    request.result()
+                await asyncio.sleep(0.001)
+        payload = json.loads(messages[0]["data"])
+        task_id = payload["task_id"]
+        if wait:
+            assert not request.done()
+        else:
+            accepted = await request
+            assert accepted["status"] == "accepted"
+            assert accepted["task_id"] == task_id
+
+        if outcome == "restarted":
+            if wait:
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+            tracker = TaskTracker(PersistentTaskStore(queue._agfs))
+            set_task_tracker(tracker)
+            await manager.prepare_task_tracking(tracker)
+
+        processing = asyncio.create_task(queue.dequeue())
+        if outcome in {"success", "partial", "cancelled", "restarted"}:
+            async with asyncio.timeout(2):
+                while await embedding.size() == 0:
+                    if processing.done():
+                        await processing
+                        pytest.fail(str(await tracker.get(task_id, **owner)))
+                    await asyncio.sleep(0.001)
+            child = asyncio.create_task(embedding.dequeue())
+            await asyncio.wait_for(child_started.wait(), 2)
+            assert (await tracker.get(task_id, **owner)).status is TaskStatus.RUNNING
+            if wait and outcome != "restarted":
+                assert not request.done()
+            if outcome == "cancelled":
+                await tracker.cancel(task_id, **owner)
+            release_child.set()
+            await asyncio.wait_for(child, 2)
+        await asyncio.wait_for(processing, 2)
+        terminal = await tracker.wait(task_id, **owner, timeout=2)
+
+        expected = {
+            "cancelled": TaskStatus.CANCELLED,
+            "success": TaskStatus.COMPLETED,
+            "restarted": TaskStatus.COMPLETED,
+        }.get(outcome, TaskStatus.FAILED)
+        assert terminal.status is expected
+        if wait and outcome != "restarted":
+            if outcome in {"failed", "typed_error", "cancelled"}:
+                with pytest.raises(OpenVikingError) as error:
+                    await request
+                assert error.value.code == (
+                    "NOT_FOUND" if outcome == "typed_error" else "PROCESSING_ERROR"
+                )
+                assert error.value.details["task_id"] == task_id
+                if outcome == "typed_error":
+                    assert error.value.details["resource"] == "viking://resources/demo.md"
+                if outcome == "cancelled":
+                    assert error.value.details["status"] == "cancelled"
+            else:
+                result = await request
+                assert result["status"] == "completed"
+                assert result["failed_records"] == int(outcome == "partial")
+                assert "task_id" not in result
+        assert await queue.snapshot() == []
+    finally:
+        release_child.set()
+        pending = [task for task in (request, processing, child) if task is not None]
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
