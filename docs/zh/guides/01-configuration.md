@@ -1441,8 +1441,7 @@ Redis 命名空间。
 - Redis Sentinel 模式的 endpoints 是 Sentinel 节点，并且必须配置非空 `master_name`；master 发现和故障切换后的重连由 Fred RedisProvider 处理。
 - `username` 和 `password` 用于 Redis 数据节点；`sentinel_username` 和 `sentinel_password` 仅用于 Sentinel 节点。
 - Cache backend 使用 `{service_name}:ov:*` key；连接同一 Redis 集群的不同部署必须配置不同的 `service_name`。
-- Cache backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。
-- Cache backend 会在独立的 startup recovery 任务中按实例心跳状态执行三次有界 `recover_stale` 扫描，时间点分别为启动后立即、30 秒和 60 秒，用于覆盖容器异常退出后旧实例心跳尚未过期的恢复窗口；正常关闭会先删除 heartbeat，使新实例可以立即恢复 processing 消息。
+- Cache backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。同一 QueueFS cache namespace 中只有一个存活实例持有经 token 校验的 30 秒 leader lease，并每 10 秒扫描过期的 `processing` 消息；该实例停止后，其他实例会在 lease 到期后接管。正常关闭会删除 heartbeat，因此恢复可以立即开始。
 - 所有 Redis 读命令都发送到主节点，不提供副本读配置。
 - `tls_insecure_skip_verify=true` 时 endpoint 必须使用 `rediss://`。
 - 如果同时设置了 `storage.agfs.queuefs.db_path` 和旧字段 `storage.agfs.queue_db_path`，以前者为准。

@@ -1454,7 +1454,7 @@ Notes:
 - All Redis reads go to the primary. Replica reads are not configurable.
 - `tls_insecure_skip_verify=true` requires `rediss://` endpoints.
 - QueueFS cache keys use `{service_name}:ov:*`; use different service names for deployments sharing one Redis cluster.
-- Redis backend runs three bounded `recover_stale` sweeps in a dedicated startup recovery thread at startup, 30 seconds, and 60 seconds to cover the heartbeat-expiry window after a container restart; it does not run long-lived periodic recovery.
+- Cache instances renew a 30-second heartbeat every 10 seconds. One live instance per QueueFS cache namespace holds a token-checked 30-second leader lease and scans for stale `processing` messages every 10 seconds. If that instance stops, another instance takes over after the lease expires; a normal shutdown removes its heartbeat so recovery can begin immediately.
 - If both `storage.agfs.queuefs.db_path` and legacy `storage.agfs.queue_db_path` are set, `storage.agfs.queuefs.db_path` wins.
 - If QueueFS backend is `memory`, any `db_path` or legacy `queue_db_path` is ignored.
 
