@@ -11,6 +11,7 @@ import pytest
 
 from openviking.message import Message, TextPart, ToolPart
 from openviking.models.vlm.base import ToolCall, VLMResponse
+from openviking.pyagfs import get_binding_client
 from openviking.pyagfs.exceptions import AGFSIoError
 from openviking.service.task_domain import TaskStatus
 from openviking.service.task_store import PersistentTaskStore
@@ -25,7 +26,9 @@ from openviking.session.checkpoints import (
 from openviking.session.memory.constants import AGENT_EVOLUTION_MEMORY_TYPES
 from openviking.session.session import Session, _ArchiveSummaryResult
 from openviking.storage.viking_fs import VikingFS
+from openviking.utils.agfs_utils import RagfsBindingConfig, mount_agfs_backend
 from openviking_cli.exceptions import InternalError, UnavailableError
+from openviking_cli.utils.config.agfs_config import AGFSConfig
 from tests.utils.mock_agfs import MockLocalAGFS
 
 
@@ -73,6 +76,16 @@ async def _write_archive(
 
 def _text_message(message_id: str, role: str, text: str) -> Message:
     return Message(id=message_id, role=role, parts=[TextPart(text)])
+
+
+def _native_viking_fs(tmp_path) -> VikingFS:
+    client_type, _ = get_binding_client()
+    if client_type is None:
+        pytest.skip("RAGFS native extension is unavailable")
+    config = RagfsBindingConfig(agfs=AGFSConfig(path=str(tmp_path), backend="local"))
+    client = client_type(None, config=config.to_binding_dict())
+    mount_agfs_backend(client, config)
+    return VikingFS(agfs=client)
 
 
 def test_checkpoint_record_respects_remaining_retained_budget():
@@ -1966,6 +1979,87 @@ async def test_phase1_publishes_and_unlocks_before_task_registration(tmp_path, m
     assert await session._read_live_messages_strict() == []
     assert not await fs.exists(f"{archive_uri}/.failed.json", ctx=session.ctx)
     enqueue.assert_not_awaited()
+
+
+async def test_commit_publication_lease_uses_native_marker_file_locks(
+    tmp_path,
+    monkeypatch,
+):
+    fs = _native_viking_fs(tmp_path)
+    tracker = TaskTracker(PersistentTaskStore(fs.agfs))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
+    enqueued: list[dict] = []
+
+    class CapturingQueueManager:
+        async def enqueue(self, _queue_name, data):
+            enqueued.append(data)
+            return None
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: CapturingQueueManager(),
+    )
+
+    session = Session(
+        viking_fs=fs,
+        session_id=f"native_publication_lease_{uuid4().hex}",
+    )
+    await session.ensure_exists()
+    await session.add_message_async("user", [TextPart("archive me")])
+
+    result = await session.commit_async(
+        memory_policy={
+            "working_memory": {"enabled": False},
+            "self": {"enabled": False},
+            "peer": {"enabled": False},
+        },
+    )
+
+    archive_uri = result["archive_uri"]
+    assert result["status"] == "accepted"
+    assert result["archived"] is True
+    assert len(enqueued) == 1
+    assert (await session._read_phase1_meta(archive_uri))["status"] == "ready"
+    assert not await fs.exists(f"{archive_uri}/.failed.json", ctx=session.ctx)
+
+
+async def test_publication_lease_error_writes_failed_marker_with_native_pathlock(
+    tmp_path,
+    monkeypatch,
+):
+    fs = _native_viking_fs(tmp_path)
+    tracker = TaskTracker(PersistentTaskStore(fs.agfs))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
+
+    session = Session(
+        viking_fs=fs,
+        session_id=f"native_publication_failure_{uuid4().hex}",
+    )
+    await session.ensure_exists()
+    await session.add_message_async("user", [TextPart("archive me")])
+
+    async def fail_ready_marker(_archive_uri):
+        raise RuntimeError("ready marker unavailable")
+
+    monkeypatch.setattr(session, "_write_phase1_ready_marker", fail_ready_marker)
+
+    with pytest.raises(RuntimeError, match="ready marker unavailable"):
+        await session.commit_async(
+            memory_policy={
+                "working_memory": {"enabled": False},
+                "self": {"enabled": False},
+                "peer": {"enabled": False},
+            },
+        )
+
+    states = await session._archives.scan_states()
+    failed = json.loads(
+        await fs.read_file(f"{states[0].archive_uri}/.failed.json", ctx=session.ctx)
+    )
+    assert states[0].state == "failed"
+    assert failed["stage"] == "publication_lease"
 
 
 async def test_interrupted_phase1_recovers_when_root_rewrite_is_durable(

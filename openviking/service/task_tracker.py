@@ -331,16 +331,6 @@ class TaskTracker:
                 restored.append(task)
         return restored
 
-    async def recover_abandoned_inline_work(self) -> int:
-        """Close Inline Work left by an executor that no longer exists."""
-        recover = getattr(self._store, "recover_abandoned_inline_work", None)
-        if recover is None:
-            return 0
-        result = recover()
-        if inspect.isawaitable(result):
-            result = await result
-        return int(result or 0)
-
     def start_cleanup_loop(self) -> None:
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())

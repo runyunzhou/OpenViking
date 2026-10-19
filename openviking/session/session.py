@@ -1144,9 +1144,8 @@ class Session:
     async def _write_phase1_ready_marker(
         self,
         archive_uri: str,
-        lease_ref: Optional[Any] = None,
     ) -> None:
-        """Persist that Phase 1 is ready using an optional held PathLock lease."""
+        """Persist that Phase 1 is ready under the marker file's own lock."""
         phase1 = await self._read_phase1_meta(archive_uri)
         phase1.update(
             {
@@ -1154,7 +1153,7 @@ class Session:
                 "ready_at": get_current_timestamp(),
             }
         )
-        await self._merge_archive_meta(archive_uri, {"phase1": phase1}, lease_ref=lease_ref)
+        await self._merge_archive_meta(archive_uri, {"phase1": phase1})
 
     async def _archive_file_exists(self, archive_uri: str, file_name: str) -> bool:
         try:
@@ -1685,10 +1684,7 @@ class Session:
                         timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
                     )
                 )
-                await self._write_phase1_ready_marker(
-                    archive_uri,
-                    lease_ref=publication_lease,
-                )
+                await self._write_phase1_ready_marker(archive_uri)
                 if record_idle_commit_success:
                     previous_accepted_at = self._meta.last_idle_commit_accepted_at
                     previous_updated_at = self._meta.updated_at
@@ -1715,7 +1711,6 @@ class Session:
                         archive_uri,
                         stage=phase1_stage,
                         error=str(e),
-                        lease_ref=publication_lease,
                     )
                 except Exception:
                     logger.exception(
@@ -2661,9 +2656,8 @@ class Session:
         blocked_by: str = "",
         skipped: bool = True,
         completed_memory_steps: Optional[Dict[str, List[str]]] = None,
-        lease_ref: Optional[Any] = None,
     ) -> None:
-        """Persist a terminal failure marker for the archive."""
+        """Persist a terminal failure marker under the marker file's own lock."""
         if not self._viking_fs:
             return
         payload = {
@@ -2679,7 +2673,6 @@ class Session:
             uri=f"{archive_uri}/.failed.json",
             content=json.dumps(payload, ensure_ascii=False),
             ctx=self.ctx,
-            lease_ref=lease_ref,
         )
 
     async def get_session_context(self, token_budget: int = 128_000) -> Dict[str, Any]:
@@ -2945,7 +2938,6 @@ class Session:
                 predecessor_uri,
                 stage="queue_missing",
                 error=error,
-                lease_ref=publication_lease,
             )
             await tracker.fail(
                 str(task_id),
