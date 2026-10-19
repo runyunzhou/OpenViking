@@ -21,11 +21,9 @@ from openviking.pyagfs import AsyncAGFSClient
 from openviking.pyagfs.exceptions import AGFSAlreadyExistsError, AGFSNotFoundError
 from openviking.service.task_domain import (
     ACTIVE_TASK_STATUSES,
-    MAX_QUEUE_ERROR_DETAILS,
     TERMINAL_TASK_STATUSES,
     DeletedTask,
     DeleteExpiredResult,
-    QueueWorkSummary,
     TaskRecord,
     TaskRetentionPolicy,
     TaskStatus,
@@ -33,7 +31,8 @@ from openviking.service.task_domain import (
     WorkRecoveryMode,
     WorkState,
     WorkSummary,
-    first_work_error,
+    append_task_events,
+    finalize_task,
     processing_seconds,
     sanitize_error,
     summarize_works,
@@ -451,7 +450,7 @@ class PersistentTaskStore(TaskWorkStore):
                 if existing is not None:
                     return self._copy_task(existing, self._work_sets.get(owner))
                 stored = deepcopy(task)
-                self._append_events(stored, None)
+                append_task_events(stored, None)
                 await self._write_task(stored)
                 with self._lock:
                     self._task_cache[owner] = stored
@@ -616,7 +615,7 @@ class PersistentTaskStore(TaskWorkStore):
             task.auth = (
                 {"enqueue_complete_work_ids": deepcopy(enqueue_markers)} if enqueue_markers else {}
             )
-            self._try_finalize(task, work_set)
+            finalize_task(task, work_set.works.values())
             return StoreOperationResult.applied()
 
         return await self._mutate_task(task_id, account_id, user_id, mutate)
@@ -647,7 +646,7 @@ class PersistentTaskStore(TaskWorkStore):
                     f"Task is already {task.status.value}",
                 )
             task.status = TaskStatus.CANCELLING
-            self._try_finalize(task, work_set)
+            finalize_task(task, work_set.works.values())
             return StoreOperationResult.applied()
 
         return await self._mutate_task(task_id, account_id, user_id, mutate)
@@ -1402,7 +1401,7 @@ class PersistentTaskStore(TaskWorkStore):
                 if not mutation.is_applied:
                     return mutation
                 candidate.updated_at = TaskRecord.next_updated_at(candidate.updated_at)
-                self._append_events(candidate, previous)
+                append_task_events(candidate, previous)
                 snapshot = deepcopy(candidate)
             await self._write_task_and_publish(snapshot, owner, candidate)
             return mutation
@@ -1456,7 +1455,7 @@ class PersistentTaskStore(TaskWorkStore):
                         else:
                             works[work_id] = mutation.work
                     candidate_work_set = _WorkSet(works, open_count)
-                    finalized = self._try_finalize(candidate_task, candidate_work_set)
+                    finalized = finalize_task(candidate_task, candidate_work_set.works.values())
 
                 if finalized:
                     assert candidate_task is not None
@@ -1464,7 +1463,7 @@ class PersistentTaskStore(TaskWorkStore):
                     candidate_task.updated_at = TaskRecord.next_updated_at(
                         candidate_task.updated_at
                     )
-                    self._append_events(candidate_task, previous)
+                    append_task_events(candidate_task, previous)
                     snapshot = deepcopy(candidate_task)
                 else:
                     if mutation.changed:
@@ -1505,51 +1504,6 @@ class PersistentTaskStore(TaskWorkStore):
                 raise cancellation
         finally:
             del write_task, cancellation
-
-    def _try_finalize(self, task: TaskRecord, work_set: _WorkSet) -> bool:
-        if task.status not in ACTIVE_TASK_STATUSES or work_set.open_count:
-            return False
-        if task.status == TaskStatus.CANCELLING:
-            task.status = TaskStatus.CANCELLED
-        else:
-            work_error = first_work_error(work_set.works.values())
-            if work_error and task.error is None:
-                task.error = sanitize_error(work_error)
-            if task.error is not None:
-                task.status = TaskStatus.FAILED
-            elif task.result is not None:
-                task.status = TaskStatus.COMPLETED
-            else:
-                task.error = "Task operation interrupted before its result was persisted"
-                task.status = TaskStatus.FAILED
-        if isinstance(task.result, dict):
-            # QueueFS reconstructs only unacknowledged Work after restart. For this
-            # file backend, terminal Work history and its errors may therefore be
-            # absent from the final projection until Work itself becomes durable.
-            summary = summarize_works(work_set.works.values())
-            projected = {
-                queue_name: _queue_result(summary.queues.get(queue_name))
-                for queue_name in ("Semantic", "Embedding")
-            }
-            has_projected_work = any(
-                work.queue_name in projected for work in work_set.works.values()
-            )
-            if has_projected_work:
-                task.result["queue_status"] = projected
-            for queue_name, field_name in (
-                ("Semantic", "semantic_status"),
-                ("Embedding", "vector_status"),
-            ):
-                if task.result.get(field_name) == "queued":
-                    task.result[field_name] = (
-                        "failed"
-                        if projected.get(queue_name, {}).get("error_count", 0)
-                        else "complete"
-                    )
-        task.stage = task.status.value
-        task.auth = {}
-        task.processing_seconds = processing_seconds(work_set.works.values())
-        return True
 
     def _copy_task(self, task: TaskRecord, work_set: Optional[_WorkSet]) -> TaskRecord:
         copied = deepcopy(task)
@@ -1603,43 +1557,6 @@ class PersistentTaskStore(TaskWorkStore):
         with self._lock:
             self._task_cache.setdefault(owner, task)
             self._work_sets.setdefault(owner, _WorkSet({}))
-
-    @staticmethod
-    def _append_events(task: TaskRecord, previous: Optional[TaskRecord]) -> None:
-        from datetime import datetime, timezone
-
-        recorded_at = datetime.now(timezone.utc).isoformat()
-        if previous is None:
-            kinds = ["created"]
-        else:
-            kinds = []
-            if task.error is not None and previous.error is None:
-                kinds.append("error_recorded")
-            if task.status == TaskStatus.CANCELLED and previous.status != TaskStatus.CANCELLING:
-                task.execution_events = append_task_event(
-                    task.execution_events,
-                    kind="status_changed",
-                    status=TaskStatus.CANCELLING.value,
-                    stage=sanitize_error(previous.stage) if previous.stage else None,
-                    recorded_at=recorded_at,
-                )
-            if task.status != previous.status:
-                kinds.append("status_changed")
-            if task.stage != previous.stage and task.status not in TERMINAL_TASK_STATUSES:
-                kinds.append("stage_changed")
-
-        stage = previous.stage if previous and task.status in TERMINAL_TASK_STATUSES else task.stage
-        for kind in kinds:
-            task.execution_events = append_task_event(
-                task.execution_events,
-                kind=kind,
-                status=task.status.value,
-                stage=sanitize_error(stage) if stage else None,
-                error=sanitize_error(task.error)
-                if kind == "error_recorded" and task.error
-                else None,
-                recorded_at=recorded_at,
-            )
 
     async def _read(self, path: str) -> Any:
         return await self._io.run("read", lambda: run_to_completion(lambda: self._agfs.read(path)))
@@ -1806,16 +1723,6 @@ def _inactive_task_result(task: TaskRecord, message: str) -> StoreOperationResul
         StoreOperationCode.INVALID_STATE,
         f"{message}: task is {task.status.value}",
     )
-
-
-def _queue_result(summary: Optional[QueueWorkSummary]) -> Dict[str, Any]:
-    summary = summary or QueueWorkSummary()
-    return {
-        "processed": summary.processed,
-        "requeue_count": summary.requeue_count,
-        "error_count": summary.error_count,
-        "errors": [{"message": error} for error in summary.errors[:MAX_QUEUE_ERROR_DETAILS]],
-    }
 
 
 def _task_to_payload(task: TaskRecord) -> Dict[str, Any]:

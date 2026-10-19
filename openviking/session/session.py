@@ -1169,9 +1169,9 @@ class Session:
     async def _ensure_phase1_ready(self, archive_uri: str) -> bool:
         """Verify or recover a queued Phase 1 before Phase 2 consumes it.
 
-        New commits enqueue while holding the session lock and before rewriting
-        root messages. A consumer therefore acquires the same lock, then either
-        observes ``phase1.status=ready`` in archive metadata or
+        New commits persist the archive intent and rewrite root messages while
+        holding the Session lock. A consumer therefore acquires the same lock,
+        then either observes ``phase1.status=ready`` in archive metadata or
         deterministically reconciles a process crash from the persisted intent.
         """
         marker = await self._read_phase1_meta(archive_uri)
@@ -1326,9 +1326,10 @@ class Session:
 
         Phase 1 (Archive prep, path-lock protected): Split messages into
         archive/retain parts, persist a recoverable intent and archive raw,
-        enqueue Phase 2, then publish the retained root state with
-        ``phase1.status=ready``. Uses a distributed filesystem lock across
-        workers and processes.
+        then publish the retained root state with ``phase1.status=ready``.
+        Task registration and QueueFS publication happen after the Session
+        lock under a short archive publication lease. Uses a distributed
+        filesystem lock across workers and processes.
         Phase 2 (Memory extraction): Runs through the persistent QueueFS queue.
 
         Args:
@@ -1432,6 +1433,7 @@ class Session:
         lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
             session_path, timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS
         )
+        publication_lease: Optional[Any] = None
         try:
             self._messages = await self._read_live_messages_strict()
             try:
@@ -1672,7 +1674,21 @@ class Session:
                     # never see a stale state.
                     self._meta.last_auto_commit_at = get_current_timestamp()
                 await self._save_meta()
-                await self._write_phase1_ready_marker(archive_uri)
+                # Keep a separate archive lease while Task/Work publication runs
+                # outside the Session lock. A later archive must not interpret
+                # this intentional registration window as an orphan.
+                phase1_stage = "publication_lease"
+                archive_path = self._viking_fs._uri_to_path(archive_uri, ctx=self.ctx)
+                publication_lease = (
+                    await self._viking_fs._async_agfs.pathlock_acquire_exact(
+                        archive_path,
+                        timeout_secs=_SESSION_PHASE1_LOCK_TIMEOUT_SECONDS,
+                    )
+                )
+                await self._write_phase1_ready_marker(
+                    archive_uri,
+                    lease_ref=publication_lease,
+                )
                 if record_idle_commit_success:
                     previous_accepted_at = self._meta.last_idle_commit_accepted_at
                     previous_updated_at = self._meta.updated_at
@@ -1687,6 +1703,8 @@ class Session:
                             self.session_id,
                             exc_info=True,
                         )
+                if reset_context:
+                    await self._append_context_reset_archive()
             except Exception as e:
                 logger.error(f"[commit] Failed during {phase1_stage}: {e}")
                 # Whether the queue write failed or a queued Phase 1 stopped
@@ -1697,6 +1715,7 @@ class Session:
                         archive_uri,
                         stage=phase1_stage,
                         error=str(e),
+                        lease_ref=publication_lease,
                     )
                 except Exception:
                     logger.exception(
@@ -1705,9 +1724,16 @@ class Session:
                     )
                 self._messages = original_messages
                 self._compression.compression_index -= 1
+                if publication_lease is not None:
+                    try:
+                        await self._viking_fs._async_agfs.pathlock_release(publication_lease)
+                    except Exception:
+                        logger.exception(
+                            "Failed to release archive publication lease: %s",
+                            archive_uri,
+                        )
+                    publication_lease = None
                 raise
-            if reset_context:
-                await self._append_context_reset_archive()
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)
         # Lock released; Phase 1 intent, retained root, metadata and ready
@@ -1738,33 +1764,44 @@ class Session:
             raise error
 
         try:
-            with bind_task_context(
-                task_id,
-                self.ctx.account_id,
-                self.ctx.user.user_id,
-            ):
-                await get_queue_manager().enqueue(
-                    QueueManager.SESSION_COMMIT,
-                    queue_msg.to_dict(),
-                )
-        except Exception as exc:
             try:
-                await tracker.fail(
+                with bind_task_context(
                     task_id,
-                    str(exc),
-                    account_id=self.ctx.account_id,
-                    user_id=self.ctx.user.user_id,
+                    self.ctx.account_id,
+                    self.ctx.user.user_id,
+                ):
+                    await get_queue_manager().enqueue(
+                        QueueManager.SESSION_COMMIT,
+                        queue_msg.to_dict(),
+                    )
+            except Exception as exc:
+                try:
+                    await tracker.fail(
+                        task_id,
+                        str(exc),
+                        account_id=self.ctx.account_id,
+                        user_id=self.ctx.user.user_id,
+                    )
+                except Exception:
+                    logger.exception("Failed to persist Task failure: %s", task_id)
+                error = map_exception(exc) or InternalError(str(exc))
+                error.details.update(
+                    task_id=task_id,
+                    archive_uri=archive_uri,
+                    archived=True,
+                    stage="queue_enqueue",
                 )
-            except Exception:
-                logger.exception("Failed to persist Task failure: %s", task_id)
-            error = map_exception(exc) or InternalError(str(exc))
-            error.details.update(
-                task_id=task_id,
-                archive_uri=archive_uri,
-                archived=True,
-                stage="queue_enqueue",
-            )
-            raise error
+                raise error
+        finally:
+            if publication_lease is not None:
+                try:
+                    await self._viking_fs._async_agfs.pathlock_release(publication_lease)
+                except Exception:
+                    logger.exception(
+                        "Failed to release archive publication lease: %s",
+                        archive_uri,
+                    )
+                publication_lease = None
 
         return {
             "session_id": self.session_id,
@@ -2881,23 +2918,48 @@ class Session:
         if await tracker.has_work(str(task_id)):
             return False
 
-        error = "Session commit queue work is missing"
-        await self._write_failed_marker(
-            predecessor_uri,
-            stage="queue_missing",
-            error=error,
-        )
-        await tracker.fail(
-            str(task_id),
-            error,
-            account_id=self.ctx.account_id,
-            user_id=self.ctx.user.user_id,
-        )
-        logger.warning(
-            "Skipped orphaned Session archive without QueueFS work: %s",
-            predecessor_uri,
-        )
-        return True
+        # A ready archive can still be between Task creation and QueueFS
+        # publication. The producer holds this lease until that publication
+        # attempt has settled; defer rather than declaring an orphan.
+        predecessor_path = self._viking_fs._uri_to_path(predecessor_uri, ctx=self.ctx)
+        publication_lease = None
+        try:
+            publication_lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(
+                predecessor_path,
+                timeout_secs=0.0,
+            )
+        except Exception:
+            logger.debug(
+                "Predecessor archive is still being published; requeueing: %s",
+                predecessor_uri,
+                exc_info=True,
+            )
+            return False
+
+        try:
+            if await tracker.has_work(str(task_id)):
+                return False
+
+            error = "Session commit queue work is missing"
+            await self._write_failed_marker(
+                predecessor_uri,
+                stage="queue_missing",
+                error=error,
+                lease_ref=publication_lease,
+            )
+            await tracker.fail(
+                str(task_id),
+                error,
+                account_id=self.ctx.account_id,
+                user_id=self.ctx.user.user_id,
+            )
+            logger.warning(
+                "Skipped orphaned Session archive without QueueFS work: %s",
+                predecessor_uri,
+            )
+            return True
+        finally:
+            await self._viking_fs._async_agfs.pathlock_release(publication_lease)
 
     async def _prepare_phase2_archive_messages(
         self,

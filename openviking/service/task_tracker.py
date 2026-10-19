@@ -331,6 +331,16 @@ class TaskTracker:
                 restored.append(task)
         return restored
 
+    async def recover_abandoned_inline_work(self) -> int:
+        """Close Inline Work left by an executor that no longer exists."""
+        recover = getattr(self._store, "recover_abandoned_inline_work", None)
+        if recover is None:
+            return 0
+        result = recover()
+        if inspect.isawaitable(result):
+            result = await result
+        return int(result or 0)
+
     def start_cleanup_loop(self) -> None:
         if self._cleanup_task is None or self._cleanup_task.done():
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
@@ -752,11 +762,29 @@ class TaskTracker:
         with _consume_wait_budget(task_id, timeout) as remaining:
             deadline = None if remaining is None else time.monotonic() + remaining
             while True:
-                task = await self.get(task_id, account_id=account_id, user_id=user_id)
-                if task is None:
-                    raise KeyError(f"Task not found: {task_id}")
-                if task.status in TERMINAL_TASK_STATUSES:
-                    return task
+                if account_id is not None and user_id is not None:
+                    status = await self.get_task_status(
+                        task_id,
+                        account_id=account_id,
+                        user_id=user_id,
+                    )
+                    if status is None:
+                        raise KeyError(f"Task not found: {task_id}")
+                    if status in TERMINAL_TASK_STATUSES:
+                        task = await self.get(
+                            task_id,
+                            account_id=account_id,
+                            user_id=user_id,
+                        )
+                        if task is None:
+                            raise KeyError(f"Task not found: {task_id}")
+                        return task
+                else:
+                    task = await self.get(task_id, account_id=account_id, user_id=user_id)
+                    if task is None:
+                        raise KeyError(f"Task not found: {task_id}")
+                    if task.status in TERMINAL_TASK_STATUSES:
+                        return task
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"Timed out waiting for Task {task_id}")

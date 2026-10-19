@@ -268,6 +268,50 @@ async def test_mysql_task_work_store_contract(mysql_stores):
 
 
 @pytest.mark.asyncio
+async def test_mysql_recovers_abandoned_inline_work(mysql_stores):
+    store, _ = mysql_stores
+    owner = {"account_id": f"recover-{uuid4().hex}", "user_id": "alice"}
+
+    completed = TaskRecord(task_id="recover-completed", task_type="content_write", **owner)
+    await store.create(completed)
+    await store.start_task(completed.task_id, stage="running", **owner)
+    await store.add_work(
+        WorkRecord(work_id="inline", task_id=completed.task_id, queue_name="Inline"),
+        **owner,
+    )
+    await store.record_outcome(
+        completed.task_id,
+        result={"written": True},
+        error=None,
+        resource_id=None,
+        cancelled=False,
+        **owner,
+    )
+
+    interrupted = TaskRecord(task_id="recover-interrupted", task_type="content_write", **owner)
+    await store.create(interrupted)
+    await store.start_task(interrupted.task_id, stage="running", **owner)
+    await store.add_work(
+        WorkRecord(work_id="inline", task_id=interrupted.task_id, queue_name="Inline"),
+        **owner,
+    )
+
+    assert await store.recover_abandoned_inline_work() == 2
+
+    completed_task = await store.get_task(completed.task_id, **owner)
+    completed_work = await store.get_work(completed.task_id, "inline", **owner)
+    assert completed_task is not None and completed_task.status is TaskStatus.COMPLETED
+    assert completed_work is not None and completed_work.state is WorkState.DONE
+    assert completed_work.error is None
+
+    interrupted_task = await store.get_task(interrupted.task_id, **owner)
+    interrupted_work = await store.get_work(interrupted.task_id, "inline", **owner)
+    assert interrupted_task is not None and interrupted_task.status is TaskStatus.FAILED
+    assert interrupted_work is not None and interrupted_work.state is WorkState.FAILED
+    assert interrupted_work.error == "Inline operation interrupted by process restart"
+
+
+@pytest.mark.asyncio
 async def test_mysql_task_field_mutations_do_not_overwrite_each_other(mysql_stores):
     first, second = mysql_stores
     owner = {"account_id": f"account-{uuid4().hex}", "user_id": "alice"}

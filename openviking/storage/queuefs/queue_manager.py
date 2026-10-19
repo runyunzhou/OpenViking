@@ -165,11 +165,16 @@ class QueueManager:
         logger.info(f"[QueueManager] mount_point={self.mount_point} Started")
 
     async def prepare_task_tracking(self, tracker: Any) -> list[Any]:
-        """Bootstrap Work only for stores that reconstruct it from QueueFS."""
+        """Recover abandoned Inline Work and rebuild queue-backed Work when needed."""
         from openviking.service.task_domain import WorkRecoveryMode
         from openviking.service.task_work_index import extract_task_metadata
 
         if tracker.work_recovery_mode is WorkRecoveryMode.DURABLE_STORE:
+            recover = getattr(tracker, "recover_abandoned_inline_work", None)
+            if recover is not None:
+                recovered = await recover()
+                if recovered:
+                    logger.info("Recovered %s abandoned Inline Task Work item(s)", recovered)
             return []
 
         snapshots = {name: await queue.snapshot() for name, queue in self._queues.items()}

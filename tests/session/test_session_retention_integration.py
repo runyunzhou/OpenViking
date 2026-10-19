@@ -348,6 +348,119 @@ async def test_phase2_defers_live_predecessor_and_skips_missing_queue_work(
     assert not await session._viking_fs.exists(f"{session.uri}/history/archive_001/.failed.json")
 
 
+async def test_phase2_defers_predecessor_while_publication_lease_is_held(
+    client,
+    monkeypatch,
+):
+    session = client(session_id="phase2_publication_lease_test")
+    await session.ensure_exists()
+    predecessor_uri = await _write_archive(
+        session,
+        1,
+        [_text_message("u1", "user", "pending one")],
+        meta={
+            "phase1": {
+                "status": "ready",
+                "queue_message": {"task_id": "task-1"},
+            }
+        },
+    )
+    await _write_archive(
+        session,
+        2,
+        [_text_message("u2", "user", "pending two")],
+        meta={
+            "phase1": {
+                "status": "ready",
+                "queue_message": {"task_id": "task-2"},
+            }
+        },
+    )
+    tracker = get_task_tracker()
+    monkeypatch.setattr(tracker, "has_work", AsyncMock(return_value=False))
+
+    original_acquire = session._viking_fs._async_agfs.pathlock_acquire_exact
+    predecessor_path = session._viking_fs._uri_to_path(predecessor_uri, ctx=session.ctx)
+
+    async def acquire(path, timeout_secs=0.0, *args, **kwargs):
+        if path == predecessor_path:
+            raise TimeoutError("publication lease is held")
+        return await original_acquire(path, timeout_secs, *args, **kwargs)
+
+    monkeypatch.setattr(session._viking_fs._async_agfs, "pathlock_acquire_exact", acquire)
+
+    assert not await session._can_run_archive(2)
+    assert not await session._viking_fs.exists(
+        f"{predecessor_uri}/.failed.json",
+        ctx=session.ctx,
+    )
+
+
+async def test_concurrent_commits_do_not_mark_predecessor_during_publication(
+    tmp_path,
+    monkeypatch,
+):
+    fs = VikingFS(agfs=MockLocalAGFS(root_path=tmp_path))
+    tracker = TaskTracker(PersistentTaskStore(fs.agfs))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.session.session._enabled_memory_types", lambda: set())
+
+    session_id = "concurrent_commit_publication_lease_test"
+    first = Session(viking_fs=fs, session_id=session_id)
+    await first.ensure_exists()
+    await first.add_message_async("user", [TextPart("first archive")])
+
+    first_create_entered = asyncio.Event()
+    second_create_entered = asyncio.Event()
+    release_creates = asyncio.Event()
+    original_create = tracker.create
+    create_count = 0
+
+    async def delayed_create(*args, **kwargs):
+        nonlocal create_count
+        create_count += 1
+        if create_count == 1:
+            first_create_entered.set()
+        elif create_count == 2:
+            second_create_entered.set()
+        if create_count <= 2:
+            await release_creates.wait()
+        return await original_create(*args, **kwargs)
+
+    monkeypatch.setattr(tracker, "create", delayed_create)
+
+    class CapturingQueueManager:
+        async def enqueue(self, _queue_name, data):
+            return data
+
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.get_queue_manager",
+        lambda: CapturingQueueManager(),
+    )
+
+    first_commit = asyncio.create_task(first.commit_async())
+    await first_create_entered.wait()
+
+    second = Session(viking_fs=fs, session_id=session_id)
+    await second.load()
+    await second.add_message_async("user", [TextPart("second archive")])
+    second_commit = asyncio.create_task(second.commit_async())
+    await second_create_entered.wait()
+
+    observer = Session(viking_fs=fs, session_id=session_id)
+    await observer.load()
+    assert not await observer._can_run_archive(2)
+    assert not await fs.exists(
+        f"{first.uri}/history/archive_001/.failed.json",
+        ctx=observer.ctx,
+    )
+
+    release_creates.set()
+    first_result, second_result = await asyncio.gather(first_commit, second_commit)
+    assert first_result["archived"] is True
+    assert second_result["archived"] is True
+
+
 async def test_missing_previous_archive_directory_allows_phase2(
     client,
 ):
@@ -1742,6 +1855,12 @@ async def test_queue_enqueue_failure_keeps_published_archive_and_fails_task(
             await session._viking_fs._async_agfs.pathlock_release(lease)
             assert await session._read_live_messages_strict() == []
             assert (await session._read_phase1_meta(data["archive_uri"]))["status"] == "ready"
+            archive_path = session._viking_fs._uri_to_path(data["archive_uri"], ctx=session.ctx)
+            with pytest.raises(TimeoutError, match="timed out acquiring test path lock"):
+                await session._viking_fs._async_agfs.pathlock_acquire_exact(
+                    archive_path,
+                    timeout_secs=0.0,
+                )
             task = await get_task_tracker().get(
                 data["task_id"],
                 account_id=session.ctx.account_id,

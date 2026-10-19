@@ -35,7 +35,8 @@ from openviking.service.task_domain import (
     WorkRecoveryMode,
     WorkState,
     WorkSummary,
-    first_work_error,
+    append_task_events,
+    finalize_task,
     processing_seconds,
     sanitize_error,
     summarize_works,
@@ -50,7 +51,6 @@ from openviking.service.task_store import (
     TaskStatsSnapshot,
     TaskWorkStore,
     _deep_merge,
-    _queue_result,
 )
 from openviking.service.task_store_mysql_schema import (
     TaskStoreModels,
@@ -185,6 +185,77 @@ class MySQLTaskWorkStore(TaskWorkStore):
     @property
     def work_recovery_mode(self) -> WorkRecoveryMode:
         return WorkRecoveryMode.DURABLE_STORE
+
+    async def recover_abandoned_inline_work(self) -> int:
+        """Close Inline Work left behind by the previous process instance."""
+        Work = self._models.Work
+        open_states = [WorkState.PENDING.value, WorkState.RUNNING.value]
+        recovered = 0
+        task_keys: set[tuple[str, str, str]] = set()
+
+        async with self._transaction() as session:
+            targets = (
+                await session.execute(
+                    select(
+                        Work.task_id,
+                        Work.work_id,
+                        Work.account_id,
+                        Work.user_id,
+                    ).where(
+                        Work.queue_name == "Inline",
+                        Work.state.in_(open_states),
+                    )
+                )
+            ).all()
+
+            for task_id, work_id, account_id, user_id in targets:
+                task = await self._load_task(
+                    session,
+                    task_id,
+                    account_id=account_id,
+                    user_id=user_id,
+                    lock=True,
+                )
+                if task is None:
+                    continue
+
+                state = await session.scalar(
+                    select(Work.state)
+                    .where(*self._work_query(Work, task_id, work_id, account_id, user_id))
+                    .with_for_update()
+                )
+                if state not in open_states:
+                    continue
+
+                has_result = task.result is not None
+                error = None if has_result else "Inline operation interrupted by process restart"
+                now = time.time()
+                values: dict[str, Any] = {
+                    "state": (
+                        WorkState.DONE.value if has_result else WorkState.FAILED.value
+                    ),
+                    "finished_at": now,
+                    "updated_at": now,
+                    "error": error,
+                    "errors": [] if error is None else [error],
+                }
+                await session.execute(
+                    update(Work)
+                    .where(*self._work_query(Work, task_id, work_id, account_id, user_id))
+                    .values(**values)
+                )
+                recovered += 1
+                task_keys.add((task_id, account_id, user_id))
+
+            for task_id, account_id, user_id in task_keys:
+                await self._finalize_if_closed(
+                    session,
+                    task_id,
+                    account_id=account_id,
+                    user_id=user_id,
+                )
+
+        return recovered
 
     async def load(self) -> None:
         """Connect and verify that the manually provisioned schema is usable."""
@@ -489,82 +560,6 @@ class MySQLTaskWorkStore(TaskWorkStore):
             select(Work).where(Work.task_id == task_id, Work.work_id == work_id).with_for_update()
         )
 
-    @staticmethod
-    def _append_events(task: TaskRecord, previous: Optional[TaskRecord]) -> None:
-        kinds: list[str]
-        if previous is None:
-            kinds = ["created"]
-        else:
-            kinds = []
-            if task.error is not None and previous.error is None:
-                kinds.append("error_recorded")
-            if task.status == TaskStatus.CANCELLED and previous.status != TaskStatus.CANCELLING:
-                task.execution_events = append_task_event(
-                    task.execution_events,
-                    kind="status_changed",
-                    status=TaskStatus.CANCELLING.value,
-                    stage=sanitize_error(previous.stage) if previous.stage else None,
-                    recorded_at=_utc_iso(),
-                )
-            if task.status != previous.status:
-                kinds.append("status_changed")
-            if task.stage != previous.stage and task.status not in TERMINAL_TASK_STATUSES:
-                kinds.append("stage_changed")
-
-        stage = previous.stage if previous and task.status in TERMINAL_TASK_STATUSES else task.stage
-        for kind in kinds:
-            task.execution_events = append_task_event(
-                task.execution_events,
-                kind=kind,
-                status=task.status.value,
-                stage=sanitize_error(stage) if stage else None,
-                error=(
-                    sanitize_error(task.error) if kind == "error_recorded" and task.error else None
-                ),
-                recorded_at=_utc_iso(),
-            )
-
-    @staticmethod
-    def _try_finalize(task: TaskRecord, works: Iterable[WorkRecord]) -> bool:
-        works = list(works)
-        if task.status not in ACTIVE_TASK_STATUSES or any(work.is_open() for work in works):
-            return False
-        if task.status == TaskStatus.CANCELLING:
-            task.status = TaskStatus.CANCELLED
-        else:
-            work_error = first_work_error(works)
-            if work_error and task.error is None:
-                task.error = sanitize_error(work_error)
-            if task.error is not None:
-                task.status = TaskStatus.FAILED
-            elif task.result is not None:
-                task.status = TaskStatus.COMPLETED
-            else:
-                task.error = "Task operation interrupted before its result was persisted"
-                task.status = TaskStatus.FAILED
-        if isinstance(task.result, dict):
-            summary = summarize_works(works)
-            projected = {
-                queue_name: _queue_result(summary.queues.get(queue_name))
-                for queue_name in ("Semantic", "Embedding")
-            }
-            if any(work.queue_name in projected for work in works):
-                task.result["queue_status"] = projected
-            for queue_name, field_name in (
-                ("Semantic", "semantic_status"),
-                ("Embedding", "vector_status"),
-            ):
-                if task.result.get(field_name) == "queued":
-                    task.result[field_name] = (
-                        "failed"
-                        if projected.get(queue_name, {}).get("error_count", 0)
-                        else "complete"
-                    )
-        task.stage = task.status.value
-        task.auth = {}
-        task.processing_seconds = processing_seconds(works)
-        return True
-
     @asynccontextmanager
     async def _transaction(self) -> AsyncGenerator[AsyncSession, None]:
         async with self._session_factory() as session:
@@ -583,7 +578,7 @@ class MySQLTaskWorkStore(TaskWorkStore):
         stored.account_id = account_id
         stored.user_id = user_id
         stored._extra_fields = {}
-        self._append_events(stored, None)
+        append_task_events(stored, None)
         row = Task(
             task_id=stored.task_id,
             task_type=stored.task_type,
@@ -1000,11 +995,11 @@ class MySQLTaskWorkStore(TaskWorkStore):
             execution_events=await self._event_history(session, task_id),
         )
         task = deepcopy(previous)
-        if not self._try_finalize(task, works):
+        if not finalize_task(task, works):
             return previous
 
         task.updated_at = TaskRecord.next_updated_at(previous.updated_at)
-        self._append_events(task, previous)
+        append_task_events(task, previous)
         Task = self._models.Task
         await session.execute(
             update(Task)
@@ -1055,7 +1050,7 @@ class MySQLTaskWorkStore(TaskWorkStore):
             task.status = TaskStatus.RUNNING
             if stage is not None:
                 task.stage = stage
-            self._append_events(task, previous)
+            append_task_events(task, previous)
             await session.execute(
                 update(Task)
                 .where(*self._task_query(Task, task_id, account_id, user_id))
@@ -1107,7 +1102,7 @@ class MySQLTaskWorkStore(TaskWorkStore):
             task.stage = stage
             if meta:
                 _deep_merge(task.meta, deepcopy(meta))
-            self._append_events(task, previous)
+            append_task_events(task, previous)
             await session.execute(
                 update(Task)
                 .where(*self._task_query(Task, task_id, account_id, user_id))
@@ -1303,7 +1298,7 @@ class MySQLTaskWorkStore(TaskWorkStore):
                 task = deepcopy(previous)
                 task.status = next_status
                 task.error = next_error
-                self._append_events(task, previous)
+                append_task_events(task, previous)
                 if cancelled:
                     values["status"] = task.status.value
                 events = task.execution_events
@@ -1392,7 +1387,7 @@ class MySQLTaskWorkStore(TaskWorkStore):
             )
             task = deepcopy(previous)
             task.status = TaskStatus.CANCELLING
-            self._append_events(task, previous)
+            append_task_events(task, previous)
             values: dict[str, Any] = {
                 "status": task.status.value,
             }
