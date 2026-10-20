@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 from types import SimpleNamespace
@@ -56,6 +57,11 @@ class _PathLockClient:
         assert self.held is True
         self.held = False
         self.handoffs += 1
+
+    async def pathlock_adopt(self, handoff):
+        assert handoff["owner_id"] == "lock-1"
+        self.held = True
+        return {"lease_ref": "lock-1"}
 
     async def pathlock_release(self, lease):
         assert lease == {"lease_ref": "lock-1"}
@@ -791,6 +797,46 @@ async def test_batch_retries_after_root_enqueue_failure(
 
     assert result["updated"] == [target]
     assert vfs.files[target] == "B"
+
+
+@pytest.mark.asyncio
+async def test_batch_cancellation_waits_for_root_enqueue_settlement(
+    _coordinator_queue_for_unit_tests,
+):
+    root = "viking://resources/wiki"
+    target = f"{root}/a.md"
+    vfs = _VFS(root)
+    coordinator = ContentWriteCoordinator(vfs)
+    ctx = RequestContext(user=UserIdentifier.the_default_user(), role=Role.USER)
+    enqueue_started = asyncio.Event()
+    finish_enqueue = asyncio.Event()
+
+    async def enqueue(_payload):
+        enqueue_started.set()
+        await finish_enqueue.wait()
+        return EnqueueReceipt("queued", "content-write-work-1")
+
+    _coordinator_queue_for_unit_tests.content_write.enqueue.side_effect = enqueue
+    request = asyncio.create_task(
+        coordinator.batch_write(
+            root_uri=root,
+            operations=[{"uri": target, "content": "A", "mode": "upsert"}],
+            ctx=ctx,
+            wait=False,
+        )
+    )
+    await enqueue_started.wait()
+    request.cancel()
+    await asyncio.sleep(0)
+    assert not request.done()
+
+    finish_enqueue.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert vfs._async_agfs.handoffs == 1
+    assert vfs._async_agfs.releases == 0
+    assert vfs._async_agfs.held is False
 
 
 @pytest.mark.asyncio

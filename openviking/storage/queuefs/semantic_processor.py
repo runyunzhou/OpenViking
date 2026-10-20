@@ -51,6 +51,7 @@ from openviking.storage.abstract_overview import (
 )
 from openviking.storage.errors import LockAcquisitionError
 from openviking.storage.index_action import FieldPatch
+from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
 from openviking.storage.queuefs.semantic_executor import SemanticTreeExecutor, SemanticTreeStats
@@ -322,19 +323,29 @@ class SemanticProcessor(DequeueHandlerBase):
         which conflicts with an update request still waiting under its outer lease.
         """
         agfs = get_viking_fs()._async_agfs
-        handoff = await agfs.pathlock_to_handoff(scope.lock)
-        handed_off = False
-        try:
-            await agfs.pathlock_handoff(scope.lock)
-            handed_off = True
+        lock_guard = PathLockGuard(agfs, scope.lock)
+        handoff = await lock_guard.to_handoff()
+        msg.lock_handoff = handoff
+
+        def accept(result: Any) -> bool:
+            if result == "deduplicated":
+                return False
+            scope.lock = None
             scope._owned = False
-            msg.lock_handoff = handoff
-            await queue.enqueue(msg)
-        except BaseException:
-            if handed_off:
-                scope.lock = await agfs.pathlock_adopt(handoff)
+            return True
+
+        try:
+            enqueue_id = await lock_guard.handoff_and_dispatch(
+                handoff,
+                lambda: queue.enqueue(msg, deduplicate_memory=False),
+                accepted=accept,
+            )
+            if enqueue_id == "deduplicated":
+                raise RuntimeError("Semantic retry was unexpectedly deduplicated")
+        finally:
+            if lock_guard.lease is not None:
+                scope.lock = lock_guard.lease
                 scope._owned = True
-            raise
 
     async def _enqueue_skill_retry(self, queue, msg: SemanticMsg, scope: SemanticLockScope) -> None:
         """Compatibility wrapper for existing skill retry callers."""
@@ -879,12 +890,13 @@ class SemanticProcessor(DequeueHandlerBase):
 
     async def _release_cancelled_semantic_lock(self, msg: SemanticMsg) -> None:
         if msg.lock_handoff is not None:
+            lock_guard = PathLockGuard(get_viking_fs()._async_agfs)
             try:
-                viking_fs = get_viking_fs()
-                lock = await viking_fs._async_agfs.pathlock_adopt(msg.lock_handoff)
-                await viking_fs._async_agfs.pathlock_release(lock)
+                await lock_guard.adopt(msg.lock_handoff)
             except Exception as exc:
                 logger.warning("Failed to release cancelled semantic lock: %s", exc)
+            finally:
+                await lock_guard.close()
 
     async def _resolve_skill_semantic_lock(
         self,

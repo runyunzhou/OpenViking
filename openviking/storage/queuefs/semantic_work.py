@@ -51,11 +51,14 @@ class SemanticMessageWork:
         return resolve_telemetry(self.msg.telemetry_id)
 
     async def acquire_lock(self, ctx: RequestContext) -> bool:
-        self.scope = await SemanticLockScope.resolve(
-            self.msg.lock_handoff,
-            caller_lock=self.caller_lock,
-            fallback_path_factory=lambda: get_viking_fs()._uri_to_path(self.msg.uri, ctx=ctx),
-        )
+        async def acquire() -> None:
+            self.scope = await SemanticLockScope.resolve(
+                self.msg.lock_handoff,
+                caller_lock=self.caller_lock,
+                fallback_path_factory=lambda: get_viking_fs()._uri_to_path(self.msg.uri, ctx=ctx),
+            )
+
+        await run_to_completion(acquire)
         return True
 
     async def run_write(self, factory: Callable[[], Awaitable[_Result]]) -> _Result:

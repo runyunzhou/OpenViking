@@ -798,12 +798,19 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
     enqueue = AsyncMock()
     handoff = AsyncMock()
     release = AsyncMock()
+    handoff_started = asyncio.Event()
+    finish_handoff = asyncio.Event()
     if cancel_stage == "submit":
         submit_url.side_effect = asyncio.CancelledError
     elif cancel_stage == "enqueue":
         enqueue.side_effect = asyncio.CancelledError
     else:
-        handoff.side_effect = asyncio.CancelledError
+
+        async def slow_handoff(_lease):
+            handoff_started.set()
+            await finish_handoff.wait()
+
+        handoff.side_effect = slow_handoff
 
     resource_processor = SimpleNamespace(
         should_use_understanding_directly=lambda _source, **_kwargs: True,
@@ -878,8 +885,8 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
         role=Role.USER,
     )
 
-    with pytest.raises(asyncio.CancelledError):
-        await service.add_resource(
+    request = asyncio.create_task(
+        service.add_resource(
             path=source,
             ctx=ctx,
             to=root_uri,
@@ -887,21 +894,33 @@ async def test_uat_producer_cancellation_respects_queue_ownership(
             allow_local_path_resolution=False,
             args={"feishu_access_token": "u-secret"},
         )
+    )
+    if cancel_stage == "handoff":
+        await handoff_started.wait()
+        request.cancel()
+        await asyncio.sleep(0)
+        assert not request.done()
+        finish_handoff.set()
+    with pytest.raises(asyncio.CancelledError):
+        await request
 
     if cancel_stage == "submit":
         release.assert_not_awaited()
         task_tracker.create.assert_not_awaited()
         task_tracker.fail.assert_not_awaited()
         enqueue.assert_not_awaited()
-    else:
+    elif cancel_stage == "enqueue":
         release.assert_awaited_once_with(lock_lease)
         task_tracker.create.assert_awaited_once()
         enqueue.assert_awaited_once()
         assert enqueue.await_args.args[0] == QueueManager.EXTERNAL_PARSE
-        if cancel_stage == "enqueue":
-            task_tracker.fail.assert_awaited_once()
-        else:
-            task_tracker.fail.assert_not_awaited()
+        task_tracker.fail.assert_awaited_once()
+    else:
+        release.assert_not_awaited()
+        task_tracker.create.assert_awaited_once()
+        enqueue.assert_awaited_once()
+        assert enqueue.await_args.args[0] == QueueManager.EXTERNAL_PARSE
+        task_tracker.fail.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

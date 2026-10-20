@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from copy import deepcopy
 from typing import Any, Dict, Optional
@@ -17,6 +18,7 @@ from openviking.service.task_work_index import (
 )
 from openviking.storage.context_update_execution import commit_and_enqueue_plan
 from openviking.storage.context_update_plan import ContextUpdatePlan
+from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs.content_write_msg import ContentWriteMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
 from openviking.storage.queuefs.process_result import ProcessResult
@@ -153,10 +155,13 @@ class ContentWriteProcessor(DequeueHandlerBase):
                 user_id=ctx.user.user_id,
             )
         )
-        lock = None
+        lock_guard = PathLockGuard(self._viking_fs._async_agfs)
         if not dispatch_complete:
             try:
-                lock = await self._load_lock(msg, ctx)
+                await lock_guard.acquire(lambda: self._load_lock(msg, ctx))
+            except asyncio.CancelledError:
+                await lock_guard.close()
+                raise
             except Exception as exc:
                 if await self._requeue_lock_handoff(msg, exc):
                     return ProcessResult.requeued()
@@ -177,11 +182,8 @@ class ContentWriteProcessor(DequeueHandlerBase):
                 deepcopy(task.result) if dispatch_complete and isinstance(task.result, dict) else None
             )
             if not dispatch_complete:
-                if lock is not None and msg.lock_scope == "semantic_handoff":
-                    semantic_lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(
-                        lock
-                    )
-                    await self._viking_fs._async_agfs.pathlock_handoff(lock)
+                if lock_guard.lease is not None and msg.lock_scope == "semantic_handoff":
+                    semantic_lock_handoff = await lock_guard.to_handoff()
 
                 async def execute_refresh() -> tuple[Dict[str, Any], bool]:
                     if semantic_lock_handoff is None:
@@ -192,40 +194,36 @@ class ContentWriteProcessor(DequeueHandlerBase):
                         semantic_lock_handoff=semantic_lock_handoff,
                     )
 
-                try:
+                async def dispatch_refresh() -> tuple[Dict[str, Any], bool]:
                     if telemetry is None:
-                        refresh_result = await execute_refresh()
-                    else:
-                        with bind_telemetry(telemetry):
-                            refresh_result = await execute_refresh()
-                except BaseException:
-                    if semantic_lock_handoff is not None:
-                        lock = await self._viking_fs._async_agfs.pathlock_adopt(
-                            semantic_lock_handoff
-                        )
-                    raise
+                        return await execute_refresh()
+                    with bind_telemetry(telemetry):
+                        return await execute_refresh()
+
+                if semantic_lock_handoff is None:
+                    refresh_result = await dispatch_refresh()
+                else:
+                    refresh_result = await lock_guard.handoff_and_dispatch(
+                        semantic_lock_handoff,
+                        dispatch_refresh,
+                        accepted=lambda value: (
+                            isinstance(value, tuple)
+                            and len(value) == 2
+                            and bool(value[1])
+                        ),
+                    )
                 if (
                     isinstance(refresh_result, tuple)
                     and len(refresh_result) == 2
                     and isinstance(refresh_result[0], dict)
                 ):
-                    result_updates, semantic_handoff_consumed = refresh_result
+                    result_updates, _ = refresh_result
                 else:
                     result_updates = refresh_result
-                    semantic_handoff_consumed = False
-                if semantic_lock_handoff is not None:
-                    if semantic_handoff_consumed:
-                        lock = None
-                    else:
-                        lock = await self._viking_fs._async_agfs.pathlock_adopt(
-                            semantic_lock_handoff
-                        )
                 checkpoint_result = deepcopy(msg.result)
                 checkpoint_result.update(result_updates)
-                if lock is not None:
-                    if msg.lock_scope == "dispatch":
-                        await self._viking_fs._async_agfs.pathlock_release(lock)
-                        lock = None
+                if lock_guard.lease is not None and msg.lock_scope == "dispatch":
+                    await lock_guard.close()
                 checkpoint = await tracker.patch_task(
                     msg.task_id,
                     TaskPatch(
@@ -305,8 +303,7 @@ class ContentWriteProcessor(DequeueHandlerBase):
             )
             return ProcessResult.failed(str(exc))
         finally:
-            if lock is not None:
-                await self._viking_fs._async_agfs.pathlock_release(lock)
+            await lock_guard.close()
             unregister_telemetry(telemetry_id)
 
     async def _execute_refresh(

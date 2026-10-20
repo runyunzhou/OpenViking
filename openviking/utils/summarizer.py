@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from openviking.core.namespace import context_type_for_uri
+from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs import SemanticMsg, get_queue_manager
 from openviking.storage.queuefs.semantic_msg import build_semantic_coalesce_key
 from openviking.storage.viking_fs import LS_ALL_NODES, get_viking_fs
@@ -238,7 +239,7 @@ class Summarizer:
         resource_uris: List[str],
         ctx: "RequestContext",
         skip_vectorization: bool = False,
-        lock: Optional[Dict[str, Any]] = None,
+        lock: Optional[Dict[str, Any] | PathLockGuard] = None,
         **kwargs,
     ) -> Dict[str, Any]:
         """
@@ -278,9 +279,15 @@ class Summarizer:
         enqueued_count = 0
 
         telemetry = get_current_telemetry()
+        agfs = get_viking_fs()._async_agfs
+        lock_guard = (
+            lock
+            if isinstance(lock, PathLockGuard)
+            else PathLockGuard(agfs, lock) if lock is not None else None
+        )
         lock_handoff: Optional[Dict[str, Any]] = None
-        if lock is not None:
-            lock_handoff = await get_viking_fs()._async_agfs.pathlock_to_handoff(lock)
+        if lock_guard is not None:
+            lock_handoff = await lock_guard.to_handoff()
 
         def is_resources_root(uri: str) -> bool:
             return (uri or "").rstrip("/") == "viking://resources"
@@ -341,23 +348,21 @@ class Summarizer:
                     file_abstracts=file_abstracts,
                     plan=semantic_plan,
                 )
-                handed_off = False
                 try:
-                    if lock is not None:
-                        await get_viking_fs()._async_agfs.pathlock_handoff(lock)
-                        handed_off = True
-                    enqueue_id = await semantic_queue.enqueue(msg)
+                    if lock_guard is None:
+                        enqueue_id = await semantic_queue.enqueue(msg)
+                    else:
+                        enqueue_id = await lock_guard.handoff_and_dispatch(
+                            lock_handoff,
+                            lambda msg=msg: semantic_queue.enqueue(msg),
+                            accepted=lambda result: result != "deduplicated",
+                        )
                 except BaseException:
-                    if handed_off:
-                        reclaimed = await get_viking_fs()._async_agfs.pathlock_adopt(lock_handoff)
+                    if isinstance(lock, dict) and lock_guard is not None and lock_guard.lease:
                         lock.clear()
-                        lock.update(reclaimed)
+                        lock.update(lock_guard.lease)
                     raise
                 if enqueue_id == "deduplicated":
-                    if handed_off:
-                        reclaimed = await get_viking_fs()._async_agfs.pathlock_adopt(lock_handoff)
-                        lock.clear()
-                        lock.update(reclaimed)
                     logger.info("Semantic generation already queued for: %s", target_uri)
                     continue
                 enqueued_count += 1
@@ -368,5 +373,5 @@ class Summarizer:
         return {
             "status": "success",
             "enqueued_count": enqueued_count,
-            "lock_handed_off": lock is not None and enqueued_count > 0,
+            "lock_handed_off": lock_guard is not None and lock_guard.transferred,
         }
