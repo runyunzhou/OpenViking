@@ -13,6 +13,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from typing import Any, Awaitable, Callable, Dict, Optional
+from uuid import uuid4
 
 from openviking.core.context import ContextLevel
 from openviking.core.namespace import (
@@ -297,15 +298,21 @@ class ContentWriteCoordinator:
         acl: AclSpec | Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         task = None
+        task_id = None
 
         async def create_root_task() -> Any:
-            nonlocal task
+            nonlocal task, task_id
             if task is None:
-                task = await self._create_content_write_task(
+                task_id = task_id or str(uuid4())
+                task = await get_task_tracker().create(
                     "content_write",
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
                     resource_id=uri,
-                    ctx=ctx,
+                    task_id=task_id,
                 )
+            if task is None:
+                raise RuntimeError("Content write Task was not created")
             return task
 
         try:
@@ -323,8 +330,10 @@ class ContentWriteCoordinator:
                 root_task_factory=create_root_task,
             )
         except BaseException as exc:
-            if task is not None and not _root_owns_failure(exc):
-                await self._fail_content_write_task(task.task_id, exc, ctx=ctx)
+            if task_id is not None and not _root_owns_failure(exc):
+                await self._fail_content_write_task(
+                    task.task_id if task is not None else task_id, exc, ctx=ctx
+                )
             raise
         if task is None:
             raise RuntimeError("Content write completed without creating a root Task")
@@ -334,24 +343,6 @@ class ContentWriteCoordinator:
             ctx=ctx,
             wait=wait,
         )
-
-    async def _create_content_write_task(
-        self,
-        task_type: str,
-        *,
-        resource_id: str,
-        ctx: RequestContext,
-    ) -> Any:
-        tracker = get_task_tracker()
-        task = await run_to_completion(
-            lambda: tracker.create(
-                task_type,
-                account_id=ctx.account_id,
-                user_id=ctx.user.user_id,
-                resource_id=resource_id,
-            )
-        )
-        return task
 
     async def _fail_content_write_task(
         self,
@@ -572,15 +563,21 @@ class ContentWriteCoordinator:
         processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE,
     ) -> Dict[str, Any]:
         task = None
+        task_id = None
 
         async def create_root_task() -> Any:
-            nonlocal task
+            nonlocal task, task_id
             if task is None:
-                task = await self._create_content_write_task(
+                task_id = task_id or str(uuid4())
+                task = await get_task_tracker().create(
                     "content_batch_write",
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
                     resource_id=root_uri,
-                    ctx=ctx,
+                    task_id=task_id,
                 )
+            if task is None:
+                raise RuntimeError("Content batch write Task was not created")
             return task
 
         try:
@@ -595,12 +592,16 @@ class ContentWriteCoordinator:
                 root_task_factory=create_root_task,
             )
         except BaseException as exc:
-            if task is not None:
+            if task_id is not None:
                 if _root_owns_failure(exc):
-                    if wait:
+                    if wait and task is not None:
                         await self._wait_for_content_write_terminal(task.task_id, ctx=ctx)
                 else:
-                    await self._fail_content_write_task(task.task_id, exc, ctx=ctx)
+                    await self._fail_content_write_task(
+                        task.task_id if task is not None else task_id,
+                        exc,
+                        ctx=ctx,
+                    )
             raise
         if task is None:
             raise RuntimeError("Content batch write completed without creating a root Task")
@@ -816,12 +817,21 @@ class ContentWriteCoordinator:
                     result["semantic_status"] = "queued"
                     result["vector_status"] = "queued"
                     lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(lease)
+                    legacy_refresh_uris = set(refresh_kinds)
                     refresh = {
                         "kind": "batch",
                         "force_refresh": wait,
                         "refresh_kinds": dict(refresh_kinds),
-                        "file_md5s": dict(file_md5s),
-                        "file_abstracts": dict(file_abstracts),
+                        "file_md5s": {
+                            uri: value
+                            for uri, value in file_md5s.items()
+                            if uri in legacy_refresh_uris
+                        },
+                        "file_abstracts": {
+                            uri: value
+                            for uri, value in file_abstracts.items()
+                            if uri in legacy_refresh_uris
+                        },
                         "sidecar_directories": {
                             uri: options.to_dict()
                             for uri, options in sorted(sidecar_directories.items())
@@ -829,6 +839,7 @@ class ContentWriteCoordinator:
                         "file_ingest_options": {
                             operation["uri"]: operation["ingest_options"].to_dict()
                             for operation, _, _ in pending
+                            if operation["uri"] in legacy_refresh_uris
                         },
                         "resource_plans": [
                             {
@@ -843,26 +854,47 @@ class ContentWriteCoordinator:
                 else:
                     lock_handoff = None
                     refresh = {"kind": "none"}
-                await self._enqueue_content_write_root(
-                    operation=root_operation,
-                    resource_id=normalized_root,
-                    result=result,
-                    refresh=refresh,
-                    ctx=ctx,
-                    telemetry_id=telemetry_id,
-                    lock_handoff=lock_handoff,
-                    failure=_failure_payload(write_error) if write_error is not None else None,
-                    root_task_factory=root_task_factory,
-                )
                 handoff_pending = lock_handoff is not None
                 if handoff_pending:
+                    handed_off = False
                     try:
                         await self._viking_fs._async_agfs.pathlock_handoff(lease)
+                        handed_off = True
+                        await self._enqueue_content_write_root(
+                            operation=root_operation,
+                            resource_id=normalized_root,
+                            result=result,
+                            refresh=refresh,
+                            ctx=ctx,
+                            telemetry_id=telemetry_id,
+                            lock_handoff=lock_handoff,
+                            failure=_failure_payload(write_error)
+                            if write_error is not None
+                            else None,
+                            root_task_factory=root_task_factory,
+                        )
                     except BaseException:
-                        await self._viking_fs._async_agfs.pathlock_release(lease)
-                        lock_settled = True
+                        if handed_off:
+                            adopt = getattr(
+                                self._viking_fs._async_agfs,
+                                "pathlock_adopt",
+                                None,
+                            )
+                            if callable(adopt):
+                                lease = await adopt(lock_handoff)
                         raise
                 else:
+                    await self._enqueue_content_write_root(
+                        operation=root_operation,
+                        resource_id=normalized_root,
+                        result=result,
+                        refresh=refresh,
+                        ctx=ctx,
+                        telemetry_id=telemetry_id,
+                        lock_handoff=None,
+                        failure=_failure_payload(write_error) if write_error is not None else None,
+                        root_task_factory=root_task_factory,
+                    )
                     await self._viking_fs._async_agfs.pathlock_release(lease)
                 lock_settled = True
                 if write_error is not None:
@@ -1860,26 +1892,45 @@ class ContentWriteCoordinator:
                     lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(lease)
                 else:
                     lock_handoff = None
-                await self._enqueue_content_write_root(
-                    operation=root_operation,
-                    resource_id=uri,
-                    result=result,
-                    refresh=refresh,
-                    ctx=ctx,
-                    telemetry_id=telemetry_id,
-                    lock_handoff=lock_handoff,
-                    lock_scope=lock_scope,
-                    root_task_factory=root_task_factory,
-                )
                 handoff_pending = lock_handoff is not None
                 if handoff_pending:
+                    handed_off = False
                     try:
                         await self._viking_fs._async_agfs.pathlock_handoff(lease)
+                        handed_off = True
+                        await self._enqueue_content_write_root(
+                            operation=root_operation,
+                            resource_id=uri,
+                            result=result,
+                            refresh=refresh,
+                            ctx=ctx,
+                            telemetry_id=telemetry_id,
+                            lock_handoff=lock_handoff,
+                            lock_scope=lock_scope,
+                            root_task_factory=root_task_factory,
+                        )
                     except BaseException:
-                        await self._viking_fs._async_agfs.pathlock_release(lease)
-                        lock_settled = True
+                        if handed_off:
+                            adopt = getattr(
+                                self._viking_fs._async_agfs,
+                                "pathlock_adopt",
+                                None,
+                            )
+                            if callable(adopt):
+                                lease = await adopt(lock_handoff)
                         raise
                 else:
+                    await self._enqueue_content_write_root(
+                        operation=root_operation,
+                        resource_id=uri,
+                        result=result,
+                        refresh=refresh,
+                        ctx=ctx,
+                        telemetry_id=telemetry_id,
+                        lock_handoff=None,
+                        lock_scope=lock_scope,
+                        root_task_factory=root_task_factory,
+                    )
                     await self._viking_fs._async_agfs.pathlock_release(lease)
                 lock_settled = True
                 return result

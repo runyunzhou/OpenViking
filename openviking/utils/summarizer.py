@@ -273,6 +273,8 @@ class Summarizer:
                 "status": "error",
                 "message": "temp_uris length must match resource_uris length",
             }
+        if lock is not None and len(resource_uris) != 1:
+            raise ValueError("one semantic lock handoff requires exactly one resource")
         enqueued_count = 0
 
         telemetry = get_current_telemetry()
@@ -339,8 +341,23 @@ class Summarizer:
                     file_abstracts=file_abstracts,
                     plan=semantic_plan,
                 )
-                enqueue_id = await semantic_queue.enqueue(msg)
+                handed_off = False
+                try:
+                    if lock is not None:
+                        await get_viking_fs()._async_agfs.pathlock_handoff(lock)
+                        handed_off = True
+                    enqueue_id = await semantic_queue.enqueue(msg)
+                except BaseException:
+                    if handed_off:
+                        reclaimed = await get_viking_fs()._async_agfs.pathlock_adopt(lock_handoff)
+                        lock.clear()
+                        lock.update(reclaimed)
+                    raise
                 if enqueue_id == "deduplicated":
+                    if handed_off:
+                        reclaimed = await get_viking_fs()._async_agfs.pathlock_adopt(lock_handoff)
+                        lock.clear()
+                        lock.update(reclaimed)
                     logger.info("Semantic generation already queued for: %s", target_uri)
                     continue
                 enqueued_count += 1
@@ -348,4 +365,8 @@ class Summarizer:
                     f"Enqueued semantic generation for: {target_uri} (skip_vectorization={skip_vectorization})"
                 )
 
-        return {"status": "success", "enqueued_count": enqueued_count}
+        return {
+            "status": "success",
+            "enqueued_count": enqueued_count,
+            "lock_handed_off": lock is not None and enqueued_count > 0,
+        }

@@ -51,7 +51,7 @@ from openviking.service.task_store import (
     TaskDeletionBlocker,
     TaskStatsSnapshot,
     TaskWorkStore,
-    _apply_task_patch,
+    _deep_merge,
 )
 from openviking.service.task_store_mysql_schema import (
     TaskStoreModels,
@@ -1003,15 +1003,18 @@ class MySQLTaskWorkStore(TaskWorkStore):
     ) -> StoreOperationResult:
         Task = self._models.Task
         async with self._transaction() as session:
+            selected = [Task.status, Task.updated_at]
+            if "stage" in patch.clear_fields or patch.stage is not None:
+                selected.append(Task.stage)
+            if "meta" not in patch.clear_fields and patch.meta is not None:
+                selected.append(Task.meta)
+            if (
+                "auth" not in patch.clear_fields
+                and (patch.auth is not None or patch.add_enqueue_complete_work_ids)
+            ):
+                selected.append(Task.auth)
             result = await session.execute(
-                select(
-                    Task.status,
-                    Task.stage,
-                    Task.result,
-                    Task.meta,
-                    Task.auth,
-                    Task.updated_at,
-                )
+                select(*selected)
                 .where(*self._task_query(Task, task_id, account_id, user_id))
                 .with_for_update()
             )
@@ -1023,44 +1026,53 @@ class MySQLTaskWorkStore(TaskWorkStore):
             if patch.is_empty():
                 return StoreOperationResult.noop()
 
-            previous = TaskRecord(
-                task_id=task_id,
-                task_type="",
-                status=TaskStatus(row.status),
-                stage=row.stage,
-                result=_json_copy(row.result),
-                meta=_json_copy(row.meta) or {},
-                auth=_json_copy(row.auth) or {},
-                execution_events=await self._event_history(session, task_id),
-            )
-            task = deepcopy(previous)
-            _apply_task_patch(task, patch)
-            events = None
-            if task.stage != previous.stage:
-                append_task_events(task, previous)
-                events = task.execution_events
             values: dict[str, Any] = {
                 "updated_at": TaskRecord.next_updated_at(row.updated_at),
             }
             if "result" in patch.clear_fields or patch.result is not None:
-                values["result"] = _json_copy(task.result)
+                values["result"] = (
+                    None if "result" in patch.clear_fields else _json_copy(patch.result)
+                )
             if "stage" in patch.clear_fields or patch.stage is not None:
-                values["stage"] = task.stage
+                stage = None if "stage" in patch.clear_fields else patch.stage
+                values["stage"] = stage
+                if stage != row.stage:
+                    previous = TaskRecord(
+                        task_id=task_id,
+                        task_type="",
+                        status=TaskStatus(row.status),
+                        stage=row.stage,
+                        execution_events=await self._event_history(session, task_id),
+                    )
+                    task = deepcopy(previous)
+                    task.stage = stage
+                    append_task_events(task, previous)
+                    await self._store_event_history(session, task_id, task.execution_events)
             if "meta" in patch.clear_fields or patch.meta is not None:
-                values["meta"] = _json_copy(task.meta)
-                values["is_internal"] = bool(task.meta.get("internal"))
+                meta = {}
+                if "meta" not in patch.clear_fields:
+                    meta = _json_copy(row.meta) or {}
+                    _deep_merge(meta, _json_copy(patch.meta))
+                values["meta"] = meta
+                values["is_internal"] = bool(meta.get("internal"))
             if (
                 "auth" in patch.clear_fields
                 or patch.auth is not None
                 or patch.add_enqueue_complete_work_ids
             ):
-                values["auth"] = _json_copy(task.auth)
+                auth = {} if "auth" in patch.clear_fields else (_json_copy(row.auth) or {})
+                if patch.auth is not None:
+                    _deep_merge(auth, _json_copy(patch.auth))
+                if patch.add_enqueue_complete_work_ids:
+                    completed = set(auth.get("enqueue_complete_work_ids") or ())
+                    completed.update(patch.add_enqueue_complete_work_ids)
+                    auth["enqueue_complete_work_ids"] = sorted(completed)
+                values["auth"] = auth
             await session.execute(
                 update(Task)
                 .where(*self._task_query(Task, task_id, account_id, user_id))
                 .values(**values)
             )
-            await self._store_event_history(session, task_id, events)
             return StoreOperationResult.applied()
 
     async def record_event(

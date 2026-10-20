@@ -604,6 +604,17 @@ class ResourceService:
             if inspect.isawaitable(result):
                 await result
 
+    async def _adopt_lock_ref(self, handoff_ref: Any) -> Any:
+        """Recover ownership from a handoff after enqueue fails."""
+        async_agfs = getattr(self._viking_fs, "_async_agfs", None)
+        if async_agfs is not None:
+            return await async_agfs.pathlock_adopt(handoff_ref)
+        adopt = getattr(handoff_ref, "adopt", None)
+        if callable(adopt):
+            result = adopt()
+            return await result if inspect.isawaitable(result) else result
+        raise RuntimeError("Lock handoff cannot be adopted")
+
     async def _release_lock_ref(self, lock_ref: Any) -> None:
         """Release either a native pathlock ref or legacy lease."""
         if lock_ref is None:
@@ -707,6 +718,7 @@ class ResourceService:
         tracker = get_task_tracker()
         task = None
         enqueued = False
+        handed_off = False
         try:
             task = await tracker.create(
                 "add_resource",
@@ -721,14 +733,15 @@ class ResourceService:
             )
             task_account_id = getattr(task, "account_id", msg.account_id)
             task_user_id = getattr(task, "user_id", msg.user_id)
+            if resource_lock is not None:
+                await self._handoff_lock_ref(resource_lock)
+                handed_off = True
             with bind_task_context(task.task_id, task_account_id, task_user_id):
                 await get_queue_manager().enqueue(queue_name, msg.to_dict())
             enqueued = True
+            resource_lock = None
             if on_enqueued is not None:
                 on_enqueued()
-            if resource_lock is not None:
-                await self._handoff_lock_ref(resource_lock)
-                resource_lock = None
             await tracker.patch_task(
                 task.task_id,
                 TaskPatch(stage="queued"),
@@ -736,6 +749,8 @@ class ResourceService:
                 user_id=msg.user_id,
             )
         except BaseException:
+            if handed_off and not enqueued:
+                resource_lock = await self._adopt_lock_ref(msg.lock_handoff)
             if resource_lock is not None:
                 if on_failed_with_lock is not None:
                     await on_failed_with_lock(resource_lock)

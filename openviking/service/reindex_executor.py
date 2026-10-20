@@ -238,6 +238,7 @@ class ReindexExecutor:
         service = None
         lease = None
         enqueued = False
+        handed_off = False
         try:
             service = get_service()
             path = service.viking_fs._uri_to_path(uri, ctx=ctx)
@@ -268,10 +269,11 @@ class ReindexExecutor:
                 lock_handoff=handoff,
             )
             queue_manager = get_queue_manager()
+            await service.viking_fs._async_agfs.pathlock_handoff(lease)
+            handed_off = True
             with bind_task_context(task.task_id, ctx.account_id, ctx.user.user_id):
                 await queue_manager.enqueue(queue_manager.REINDEX, msg.to_dict())
             enqueued = True
-            await service.viking_fs._async_agfs.pathlock_handoff(lease)
             lease = None
             await tracker.patch_task(
                 task.task_id,
@@ -281,6 +283,8 @@ class ReindexExecutor:
             )
         except BaseException:
             if lease is not None and service is not None:
+                if handed_off and not enqueued:
+                    lease = await service.viking_fs._async_agfs.pathlock_adopt(handoff)
                 await service.viking_fs._async_agfs.pathlock_release(lease)
             if not enqueued:
                 await tracker.fail(

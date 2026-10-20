@@ -1321,7 +1321,8 @@ class ResourceProcessor:
                             and summary_result.get("status") == "success"
                             and summary_result.get("enqueued_count", 0) > 0
                         ):
-                            await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
+                            if not summary_result.get("lock_handed_off", False):
+                                await get_viking_fs()._async_agfs.pathlock_handoff(resource_lock)
                             resource_lock = None
                         if semantic_plan is not None and (
                             summary_result.get("status") == "success"

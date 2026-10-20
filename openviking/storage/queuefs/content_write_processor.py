@@ -178,11 +178,12 @@ class ContentWriteProcessor(DequeueHandlerBase):
             )
             if not dispatch_complete:
                 if lock is not None and msg.lock_scope == "semantic_handoff":
-                    semantic_lock_handoff = (
-                        await self._viking_fs._async_agfs.pathlock_to_handoff(lock)
+                    semantic_lock_handoff = await self._viking_fs._async_agfs.pathlock_to_handoff(
+                        lock
                     )
+                    await self._viking_fs._async_agfs.pathlock_handoff(lock)
 
-                async def execute_refresh() -> Dict[str, Any]:
+                async def execute_refresh() -> tuple[Dict[str, Any], bool]:
                     if semantic_lock_handoff is None:
                         return await self._execute_refresh(msg, ctx)
                     return await self._execute_refresh(
@@ -191,18 +192,38 @@ class ContentWriteProcessor(DequeueHandlerBase):
                         semantic_lock_handoff=semantic_lock_handoff,
                     )
 
-                if telemetry is None:
-                    result_updates = await execute_refresh()
+                try:
+                    if telemetry is None:
+                        refresh_result = await execute_refresh()
+                    else:
+                        with bind_telemetry(telemetry):
+                            refresh_result = await execute_refresh()
+                except BaseException:
+                    if semantic_lock_handoff is not None:
+                        lock = await self._viking_fs._async_agfs.pathlock_adopt(
+                            semantic_lock_handoff
+                        )
+                    raise
+                if (
+                    isinstance(refresh_result, tuple)
+                    and len(refresh_result) == 2
+                    and isinstance(refresh_result[0], dict)
+                ):
+                    result_updates, semantic_handoff_consumed = refresh_result
                 else:
-                    with bind_telemetry(telemetry):
-                        result_updates = await execute_refresh()
+                    result_updates = refresh_result
+                    semantic_handoff_consumed = False
+                if semantic_lock_handoff is not None:
+                    if semantic_handoff_consumed:
+                        lock = None
+                    else:
+                        lock = await self._viking_fs._async_agfs.pathlock_adopt(
+                            semantic_lock_handoff
+                        )
                 checkpoint_result = deepcopy(msg.result)
                 checkpoint_result.update(result_updates)
                 if lock is not None:
-                    if semantic_lock_handoff is not None:
-                        await self._viking_fs._async_agfs.pathlock_handoff(lock)
-                        lock = None
-                    elif msg.lock_scope == "dispatch":
+                    if msg.lock_scope == "dispatch":
                         await self._viking_fs._async_agfs.pathlock_release(lock)
                         lock = None
                 checkpoint = await tracker.patch_task(
@@ -294,11 +315,11 @@ class ContentWriteProcessor(DequeueHandlerBase):
         ctx: RequestContext,
         *,
         semantic_lock_handoff: Dict[str, Any] | None = None,
-    ) -> Dict[str, Any]:
+    ) -> tuple[Dict[str, Any], bool]:
         refresh = msg.refresh
         kind = str(refresh.get("kind") or "none")
         if kind == "none":
-            return {}
+            return {}, False
 
         from openviking.storage.content_write import ContentWriteCoordinator
 
@@ -319,21 +340,27 @@ class ContentWriteProcessor(DequeueHandlerBase):
                 wait=False,
                 queue_status=None,
             )
-            return {"semantic_status": semantic_status, "vector_status": vector_status}
+            return (
+                {"semantic_status": semantic_status, "vector_status": vector_status},
+                semantic_lock_handoff is not None and work.semantic_requested,
+            )
         if kind == "abstract_overview":
             vector_enqueued = await coordinator._vectorize_abstract_overview(
                 uri=str(refresh["uri"]),
                 ctx=ctx,
                 ingest_options=IngestOptions.from_value(refresh.get("ingest_options")),
             )
-            return {
-                "vector_status": coordinator._queue_work_status(
-                    requested=vector_enqueued,
-                    wait=False,
-                    queue_status=None,
-                    queue_name="Embedding",
-                )
-            }
+            return (
+                {
+                    "vector_status": coordinator._queue_work_status(
+                        requested=vector_enqueued,
+                        wait=False,
+                        queue_status=None,
+                        queue_name="Embedding",
+                    )
+                },
+                False,
+            )
         if kind == "memory":
             root_uri = str(refresh["root_uri"])
             uri = str(refresh["uri"])
@@ -343,17 +370,20 @@ class ContentWriteProcessor(DequeueHandlerBase):
                 ctx=ctx,
                 ingest_options=IngestOptions.from_value(refresh.get("ingest_options")),
             )
-            return {
-                "overview_status": "complete" if overview_refreshed else "skipped",
-                "vector_status": coordinator._queue_work_status(
-                    requested=embedding_requested,
-                    wait=False,
-                    queue_status=None,
-                    queue_name="Embedding",
-                ),
-            }
+            return (
+                {
+                    "overview_status": "complete" if overview_refreshed else "skipped",
+                    "vector_status": coordinator._queue_work_status(
+                        requested=embedding_requested,
+                        wait=False,
+                        queue_status=None,
+                        queue_name="Embedding",
+                    ),
+                },
+                False,
+            )
         if kind == "batch":
             outcome = await coordinator._execute_batch_refresh_payload(refresh, ctx=ctx)
             semantic_status, vector_status = outcome.statuses(wait=False)
-            return {"semantic_status": semantic_status, "vector_status": vector_status}
+            return {"semantic_status": semantic_status, "vector_status": vector_status}, False
         raise ValueError(f"Unsupported content-write refresh kind: {kind}")
