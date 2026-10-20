@@ -90,6 +90,18 @@ def _is_permanent_storage_error(error: BaseException) -> bool:
     return any(isinstance(item, _PERMANENT_STORAGE_ERRORS) for item in (error, error.__cause__))
 
 
+def _executor_lock(msg: SemanticMsg, lock: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Reuse content-write ownership only when it covers semantic sidecars."""
+    if msg.generation_trigger != "content_write" or msg.lock_handoff is None:
+        return lock
+    covered_paths = msg.lock_handoff.get("covered_paths")
+    if isinstance(covered_paths, list) and any(
+        isinstance(item, dict) and item.get("kind") == "tree" for item in covered_paths
+    ):
+        return lock
+    return None
+
+
 class RequestQueueStats:
     processed: int = 0
     requeue_count: int = 0
@@ -570,43 +582,14 @@ class SemanticProcessor(DequeueHandlerBase):
 
                     logger.debug("Processing semantic message id=%s uri=%s", msg.id, msg.uri)
 
-                    task_context = get_task_context()
-                    enqueue_complete = True
-                    if msg.wait_for_request_completion and task_context is not None:
-                        tracker = get_task_tracker()
-                        enqueue_complete = await tracker.is_enqueue_complete(
-                            task_context.task_id,
-                            task_context.work_id or "",
-                            account_id=task_context.account_id,
-                            user_id=task_context.user_id,
-                        )
-                        siblings_pending = await tracker.has_work(
-                            task_context.task_id,
-                            exclude_work_id=task_context.work_id,
-                            account_id=task_context.account_id,
-                            user_id=task_context.user_id,
-                        )
-                        if siblings_pending or (
-                            not enqueue_complete
-                            and tracker.has_active_producer(task_context.task_id)
-                        ):
-                            # Leave ownership with the producer until it finishes
-                            # submission and hands off, without occupying a worker.
-                            await asyncio.sleep(0.05)
-                            await work.reenqueue()
-                            execute_status = "requeued"
-                            return ProcessResult.requeued()
-
                     # Resolving a deleted root can recreate it for lock metadata.
                     # Settle queued ownership before acknowledging skipped work.
-                    if not msg.wait_for_request_completion and not await get_viking_fs().exists(
-                        msg.uri, ctx=current_ctx
-                    ):
+                    if not await get_viking_fs().exists(msg.uri, ctx=current_ctx):
                         logger.info("Skipping semantic message for missing root: uri=%s", msg.uri)
                         await work.skip()
                         return ProcessResult.success()
 
-                    if not msg.wait_for_request_completion and self._vlm_resolver is None:
+                    if self._vlm_resolver is None:
                         raise RuntimeError(
                             "SemanticProcessor requires a VLM resolver for account-owned work"
                         )
@@ -614,17 +597,10 @@ class SemanticProcessor(DequeueHandlerBase):
                         return ProcessResult.success()
                     semantic_lock = work.scope
                     assert semantic_lock is not None
-                    if not enqueue_complete:
-                        return ProcessResult.failed(
-                            "Content write producer ended before child Work enqueue completed"
-                        )
                     dag_stats = None
                     processing_succeeded = False
                     try:
-                        if msg.wait_for_request_completion:
-                            # The coordinator only releases the lease after sibling work settles.
-                            pass
-                        elif msg.plan is not None:
+                        if msg.plan is not None:
                             if msg.uri.rstrip("/") != msg.plan.root_uri:
                                 raise ValueError("semantic message URI must match plan root_uri")
                             if msg.context_type != msg.plan.context_type:
@@ -748,7 +724,7 @@ class SemanticProcessor(DequeueHandlerBase):
                                 incremental_update=is_incremental,
                                 target_uri=target_uri,
                                 recursive=msg.recursive,
-                                lock=semantic_lock.lock,
+                                lock=_executor_lock(msg, semantic_lock.lock),
                                 is_code_repo=msg.is_code_repo,
                                 changes=changes,
                                 skip_vectorization=msg.skip_vectorization,
@@ -792,9 +768,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     failure = work.failure_result(dag_stats)
                     if failure is not None:
                         return failure
-                    is_request_coordinator = msg.wait_for_request_completion
-                    if not is_request_coordinator:
-                        self._merge_request_stats(msg.telemetry_id, processed=1)
+                    self._merge_request_stats(msg.telemetry_id, processed=1)
                     logger.info(f"Completed semantic generation for: {msg.uri}")
                     breaker.record_success()
                     await self._cleanup_local_artifact(msg)

@@ -60,6 +60,7 @@ class Summarizer:
         *,
         file_uri: str,
         ctx: "RequestContext",
+        lock_handoff: Dict[str, Any] | None = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
         created: bool = False,
@@ -94,6 +95,7 @@ class Summarizer:
                 ),
             ),
             ctx=ctx,
+            lock_handoff=lock_handoff,
             skip_vectorization=skip_vectorization,
             ingest_options=ingest_options,
             generation_trigger=generation_trigger,
@@ -110,6 +112,7 @@ class Summarizer:
         *,
         changes: Sequence[FileRefreshRequest],
         ctx: "RequestContext",
+        lock_handoff: Dict[str, Any] | None = None,
         skip_vectorization: bool = False,
         ingest_options: IngestOptions | None = None,
         generation_trigger: str = "semantic_refresh",
@@ -135,6 +138,8 @@ class Summarizer:
 
         if not grouped:
             return {"status": "success", "enqueued_count": 0, "parent_actions": {}}
+        if lock_handoff is not None and len(grouped) != 1:
+            raise ValueError("one semantic lock handoff requires exactly one parent refresh")
 
         queue_manager = get_queue_manager()
         semantic_queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
@@ -178,6 +183,7 @@ class Summarizer:
                 user_id=ctx.user.user_id,
                 peer_id=ctx.user.user_id,
                 role=str(ctx.role),
+                lock_handoff=lock_handoff,
                 skip_vectorization=skip_vectorization,
                 telemetry_id=telemetry_id,
                 changes={
@@ -193,7 +199,7 @@ class Summarizer:
                         user_id=ctx.user.user_id,
                         peer_id=ctx.user.user_id,
                     )
-                    if aggregate_directory
+                    if aggregate_directory and lock_handoff is None
                     else ""
                 ),
                 generation_trigger=generation_trigger,

@@ -27,6 +27,7 @@ from openviking.core.namespace import (
 )
 from openviking.server.dependencies import get_service
 from openviking.server.identity import RequestContext
+from openviking.service.task_domain import TaskPatch
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.service.task_work_index import bind_task_context, get_task_context
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
@@ -272,8 +273,11 @@ class ReindexExecutor:
             enqueued = True
             await service.viking_fs._async_agfs.pathlock_handoff(lease)
             lease = None
-            await tracker.update_stage(
-                task.task_id, "queued", account_id=ctx.account_id, user_id=ctx.user.user_id
+            await tracker.patch_task(
+                task.task_id,
+                TaskPatch(stage="queued"),
+                account_id=ctx.account_id,
+                user_id=ctx.user.user_id,
             )
         except BaseException:
             if lease is not None and service is not None:

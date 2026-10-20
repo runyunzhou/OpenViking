@@ -526,7 +526,7 @@ async def test_reindex_executor_passes_tags_to_background_run(monkeypatch):
         async def create_if_no_running(self, *args, **kwargs):
             return FakeTask()
 
-        update_stage = AsyncMock()
+        patch_task = AsyncMock()
         fail = AsyncMock()
 
     class FakeAGFS:

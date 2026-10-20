@@ -66,6 +66,7 @@ from openviking.server.user_config import (
     effective_resource_add_target,
     effective_skill_add_target,
 )
+from openviking.service.task_domain import TaskPatch
 from openviking.storage.acl import AclAction, AclSpec
 from openviking.storage.queuefs import QueueManager, get_queue_manager
 from openviking.storage.queuefs.add_resource_msg import AddResourcePhase
@@ -728,9 +729,9 @@ class ResourceService:
             if resource_lock is not None:
                 await self._handoff_lock_ref(resource_lock)
                 resource_lock = None
-            await tracker.update_stage(
+            await tracker.patch_task(
                 task.task_id,
-                "queued",
+                TaskPatch(stage="queued"),
                 account_id=msg.account_id,
                 user_id=msg.user_id,
             )
@@ -809,8 +810,11 @@ class ResourceService:
                 saved = dict(task.meta.get("feishu_responses", {})) if task else {}
 
                 async def save_response(entry: str, response_id: str) -> None:
-                    await tracker.record_feishu_response(
-                        msg.task_id, entry, response_id, ctx.account_id, ctx.user.user_id
+                    await tracker.patch_task(
+                        msg.task_id,
+                        TaskPatch(meta={"feishu_responses": {entry: response_id}}),
+                        account_id=ctx.account_id,
+                        user_id=ctx.user.user_id,
                     )
                     saved[entry] = response_id
 

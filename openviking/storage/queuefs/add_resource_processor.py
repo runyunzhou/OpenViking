@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 from openviking.observability.context import bind_execution_context
 from openviking.server.identity import RequestContext, Role
+from openviking.service.task_domain import TaskPatch
 from openviking.service.task_tracker import TaskStatus, get_task_tracker
 from openviking.service.task_work_index import (
     bind_task_context_from_message,
@@ -222,9 +223,9 @@ class AddResourceProcessor(DequeueHandlerBase):
         async def _set_stage(stage: str) -> None:
             nonlocal current_stage
             current_stage = stage
-            await tracker.update_stage(
+            await tracker.patch_task(
                 msg.task_id,
-                stage,
+                TaskPatch(stage=stage),
                 account_id=ctx.account_id,
                 user_id=ctx.user.user_id,
             )

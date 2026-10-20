@@ -63,13 +63,7 @@ class SemanticMessageWork:
 
     async def finish_processing(self, succeeded: bool) -> None:
         assert self.scope is not None
-        context = get_task_context()
-        if self.msg.wait_for_request_completion and context is not None:
-            await get_task_tracker().wait_for_task_work(
-                context.task_id,
-                exclude_work_id=context.work_id,
-            )
-        elif self.msg.lock_handoff is not None:
+        if self.msg.lock_handoff is not None:
             await self._wait_for_embedding_work(
                 stop_waiting=getattr(self.processor, "_embedding_worker_stopped", None),
             )
