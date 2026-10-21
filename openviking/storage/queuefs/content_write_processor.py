@@ -115,6 +115,32 @@ class ContentWriteProcessor(DequeueHandlerBase):
         )
         return True
 
+    async def _release_orphaned_lock_handoff(self, msg: ContentWriteMsg) -> None:
+        if msg.lock_handoff is None:
+            return
+
+        lock_guard = PathLockGuard(self._viking_fs._async_agfs)
+        try:
+            await lock_guard.adopt(msg.lock_handoff)
+        except Exception as exc:
+            logger.warning("[ContentWrite] Failed to release orphaned lock handoff: %s", exc)
+        finally:
+            await lock_guard.close()
+
+    async def on_cancelled(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
+        """Release a queued content-write lock before cancelled work is ACKed."""
+        try:
+            payload = data.get("data", data) if isinstance(data, dict) else data
+            if isinstance(payload, str):
+                payload = json.loads(payload)
+            msg = ContentWriteMsg.from_dict(payload)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            return ProcessResult.failed(str(exc))
+
+        await self._release_orphaned_lock_handoff(msg)
+        unregister_telemetry(msg.telemetry_id or "")
+        return ProcessResult.cancelled()
+
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> ProcessResult:
         if not data:
             return ProcessResult.success()
@@ -138,6 +164,8 @@ class ContentWriteProcessor(DequeueHandlerBase):
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,
         }:
+            await self._release_orphaned_lock_handoff(msg)
+            unregister_telemetry(msg.telemetry_id or "")
             return ProcessResult.success()
         await tracker.start(
             msg.task_id,
