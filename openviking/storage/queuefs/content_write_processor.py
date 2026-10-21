@@ -156,7 +156,9 @@ class ContentWriteProcessor(DequeueHandlerBase):
             )
         )
         lock_guard = PathLockGuard(self._viking_fs._async_agfs)
-        if not dispatch_complete:
+        if not dispatch_complete or (
+            msg.lock_scope == "descendants" and msg.lock_handoff is not None
+        ):
             try:
                 await lock_guard.acquire(lambda: self._load_lock(msg, ctx))
             except asyncio.CancelledError:
