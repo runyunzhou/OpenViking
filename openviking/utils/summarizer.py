@@ -358,7 +358,12 @@ class Summarizer:
                             accepted=lambda result: result != "deduplicated",
                         )
                 except BaseException:
-                    if isinstance(lock, dict) and lock_guard is not None and lock_guard.lease:
+                    if (
+                        isinstance(lock, dict)
+                        and lock_guard is not None
+                        and lock_guard.lease is not None
+                        and lock_guard.lease is not lock
+                    ):
                         lock.clear()
                         lock.update(lock_guard.lease)
                     raise

@@ -768,7 +768,7 @@ class SkillProcessor:
             queue = queue_manager.get_queue(queue_manager.SEMANTIC, allow_create=True)
             await lock_guard.handoff_and_dispatch(msg.lock_handoff, lambda: queue.enqueue(msg))
         except BaseException:
-            if lock_guard.lease is not None:
+            if lock_guard.lease is not None and lock_guard.lease is not lease:
                 lease.clear()
                 lease.update(lock_guard.lease)
             raise

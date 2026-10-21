@@ -301,6 +301,13 @@ class ContentWriteProcessor(DequeueHandlerBase):
                 if isinstance(exc, OpenVikingError)
                 else None,
             )
+            if msg.lock_scope == "descendants" and lock_guard.lease is not None:
+                await tracker.wait_for_task_work(
+                    msg.task_id,
+                    exclude_work_id=metadata.work_id if metadata is not None else None,
+                    account_id=ctx.account_id,
+                    user_id=ctx.user.user_id,
+                )
             return ProcessResult.failed(str(exc))
         finally:
             await lock_guard.close()

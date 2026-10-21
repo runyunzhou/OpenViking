@@ -1996,15 +1996,20 @@ class ContentWriteCoordinator:
     ) -> Dict[str, Any]:
         """Re-embed a manually edited L0/L1 sidecar body without LLM regeneration."""
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
+        lock_guard = PathLockGuard(self._viking_fs._async_agfs)
         try:
-            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            lease = await lock_guard.acquire(
+                lambda: self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            )
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
             ) from exc
+        except BaseException:
+            await lock_guard.close()
+            raise
 
-        lock_released = False
         try:
             # Preserve the public invariant that generated sidecars cannot be
             # materialized, while keeping the state check inside the exact lock.
@@ -2024,30 +2029,41 @@ class ContentWriteCoordinator:
                 vector_status="queued",
             )
             if root_task_factory is not None:
-                await self._enqueue_content_write_root(
-                    operation=root_operation,
-                    resource_id=uri,
-                    result=result,
-                    refresh={
-                        "kind": "abstract_overview",
-                        "uri": uri,
-                        "ingest_options": ingest_options.to_dict()
-                        if ingest_options is not None
-                        else IngestOptions().to_dict(),
-                    },
-                    ctx=ctx,
-                    telemetry_id=telemetry_id,
-                    lock_scope="dispatch",
-                    root_task_factory=root_task_factory,
-                )
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-                lock_released = True
+                await root_task_factory()
+                root_dispatched = False
+
+                async def dispatch() -> str:
+                    nonlocal root_dispatched
+                    work_id = await self._enqueue_content_write_root(
+                        operation=root_operation,
+                        resource_id=uri,
+                        result=result,
+                        refresh={
+                            "kind": "abstract_overview",
+                            "uri": uri,
+                            "ingest_options": ingest_options.to_dict()
+                            if ingest_options is not None
+                            else IngestOptions().to_dict(),
+                        },
+                        ctx=ctx,
+                        telemetry_id=telemetry_id,
+                        lock_scope="dispatch",
+                        root_task_factory=root_task_factory,
+                    )
+                    root_dispatched = True
+                    return work_id
+
+                try:
+                    await lock_guard.dispatch_and_close(dispatch)
+                except BaseException as exc:
+                    if root_dispatched:
+                        _mark_root_owns_failure(exc)
+                    raise
                 return result
             raise RuntimeError("Content write root Task was not created")
-        except Exception:
-            if not lock_released:
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-            raise
+        finally:
+            if lock_guard.lease is not None:
+                await lock_guard.close()
 
     async def _vectorize_abstract_overview(
         self,
@@ -2386,15 +2402,20 @@ class ContentWriteCoordinator:
         root_task_factory: Callable[[], Awaitable[Any]] | None = None,
     ) -> Dict[str, Any]:
         lock_path = self._viking_fs._uri_to_path(uri, ctx=ctx)
+        lock_guard = PathLockGuard(self._viking_fs._async_agfs)
         try:
-            lease = await self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            lease = await lock_guard.acquire(
+                lambda: self._viking_fs._async_agfs.pathlock_acquire_exact(lock_path)
+            )
         except LockAcquisitionError as exc:
             raise ResourceBusyError(
                 f"resource is busy and cannot be written now: {uri}",
                 uri=uri,
             ) from exc
+        except BaseException:
+            await lock_guard.close()
+            raise
 
-        released = False
         try:
             target_state = await self._classify_locked_write_target(uri, ctx=ctx)
             is_new_file = target_state.is_new_file
@@ -2423,33 +2444,42 @@ class ContentWriteCoordinator:
                     vector_status="queued",
                     overview_status="queued",
                 )
-                await self._enqueue_content_write_root(
-                    operation=root_operation,
-                    resource_id=uri,
-                    result=result,
-                    refresh={
-                        "kind": "memory",
-                        "root_uri": root_uri,
-                        "uri": uri,
-                        "ingest_options": ingest_options.to_dict()
-                        if ingest_options is not None
-                        else IngestOptions().to_dict(),
-                    },
-                    ctx=ctx,
-                    telemetry_id=telemetry_id,
-                    lock_scope="dispatch",
-                    root_task_factory=root_task_factory,
-                )
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-                released = True
+                await root_task_factory()
+                root_dispatched = False
+
+                async def dispatch() -> str:
+                    nonlocal root_dispatched
+                    work_id = await self._enqueue_content_write_root(
+                        operation=root_operation,
+                        resource_id=uri,
+                        result=result,
+                        refresh={
+                            "kind": "memory",
+                            "root_uri": root_uri,
+                            "uri": uri,
+                            "ingest_options": ingest_options.to_dict()
+                            if ingest_options is not None
+                            else IngestOptions().to_dict(),
+                        },
+                        ctx=ctx,
+                        telemetry_id=telemetry_id,
+                        lock_scope="dispatch",
+                        root_task_factory=root_task_factory,
+                    )
+                    root_dispatched = True
+                    return work_id
+
+                try:
+                    await lock_guard.dispatch_and_close(dispatch)
+                except BaseException as exc:
+                    if root_dispatched:
+                        _mark_root_owns_failure(exc)
+                    raise
                 return result
             raise RuntimeError("Content write root Task was not created")
-        except Exception:
-            if not released:
-                await self._viking_fs._async_agfs.pathlock_release(lease)
-            raise
         finally:
-            pass
+            if lock_guard.lease is not None:
+                await lock_guard.close()
 
     def _vikingdb_has_queue(self) -> bool:
         if not self._vikingdb:
