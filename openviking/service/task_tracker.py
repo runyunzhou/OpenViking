@@ -309,18 +309,39 @@ class TaskTracker:
     def set_deletion_guard(self, guard: Optional[Callable[[str, str], Any]]) -> None:
         """Reject new Tasks for identities the guard reports as being deleted.
 
-        Identity cleanup cancels the Tasks it can list; a submission that was
-        already past authentication must not add one after that.
+        Identity cleanup records its fence and then lists the Tasks to cancel;
+        create inserts the Task and then reads the fence again. One of the two
+        reads observes the other's write, so a Task inserted concurrently with
+        a deletion is either listed by the cleanup or withdrawn here.
         """
         self._deletion_guard = guard
 
-    async def _ensure_owner_not_deleting(self, account_id: str, user_id: str) -> None:
+    async def _owner_deleting(self, account_id: str, user_id: str) -> bool:
         guard = self._deletion_guard
         if guard is None or account_id == SYSTEM_TASK_ACCOUNT_ID:
-            return
+            return False
         result = guard(account_id, user_id)
-        if await result if inspect.isawaitable(result) else result:
-            raise FailedPreconditionError("Identity deletion is in progress")
+        return bool(await result if inspect.isawaitable(result) else result)
+
+    async def _withdraw(self, task: TaskRecord) -> None:
+        deleted = await self._store.delete_tasks(
+            task.task_id,
+            account_id=task.account_id,
+            user_id=task.user_id,
+            allow_active_types={task.task_type},
+        )
+        if not deleted.accepted:
+            await self.fail(
+                task.task_id,
+                "Identity deletion is in progress",
+                account_id=task.account_id,
+                user_id=task.user_id,
+            )
+            return
+        for item in deleted.deleted:
+            self._work_index.forget_task(
+                item.task_id, account_id=item.account_id, user_id=item.user_id
+            )
 
     def attach_work_index(self, work_index: TaskWorkIndex) -> None:
         """Replace the process-local active-handle index."""
@@ -437,7 +458,8 @@ class TaskTracker:
             existing = await self.get(task_id, account_id=account_id, user_id=user_id)
             if existing is not None:
                 return existing
-        await self._ensure_owner_not_deleting(account_id, user_id)
+        if await self._owner_deleting(account_id, user_id):
+            raise FailedPreconditionError("Identity deletion is in progress")
         task = TaskRecord(
             task_id=task_id or str(uuid4()),
             task_type=task_type,
@@ -450,7 +472,11 @@ class TaskTracker:
         stored = await run_to_completion(
             lambda: self._store.create(task, reject_if_active=reject_if_active)
         )
-        return self._public(stored or task)
+        created = self._public(stored or task)
+        if await self._owner_deleting(account_id, user_id):
+            await run_to_completion(lambda: self._withdraw(created))
+            raise FailedPreconditionError("Identity deletion is in progress")
+        return created
 
     async def create_if_no_running(
         self,

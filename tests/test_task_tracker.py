@@ -196,6 +196,28 @@ async def test_deletion_guard_refuses_new_tasks_for_deleting_identities(tracker:
     assert await tracker.create("account_delete", account_id=SYSTEM_TASK_ACCOUNT_ID, user_id="root")
 
 
+async def test_deletion_fenced_during_insert_withdraws_the_task(tracker: TaskTracker):
+    deleting = set()
+    store_create = tracker._store.create
+
+    async def guard(account_id, user_id):
+        return (account_id, user_id) in deleting
+
+    async def create_after_cleanup(task, **kwargs):
+        # The check has passed; deletion fences the identity and finishes
+        # listing Tasks before this insert lands.
+        deleting.add((task.account_id, task.user_id))
+        assert await tracker.list_tasks(**_owner_kwargs(), limit=None) == []
+        return await store_create(task, **kwargs)
+
+    tracker.set_deletion_guard(guard)
+    tracker._store.create = create_after_cleanup
+
+    with pytest.raises(FailedPreconditionError):
+        await tracker.create("connector_import", task_id="late", **_owner_kwargs())
+    assert await tracker.get("late", **_owner_kwargs()) is None
+
+
 async def test_start_task(tracker: TaskTracker):
     task = await tracker.create("session_commit", **_owner_kwargs())
     await tracker.start(task.task_id)

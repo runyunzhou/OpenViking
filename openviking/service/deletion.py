@@ -417,9 +417,16 @@ class DeletionService:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError("Timed out waiting for tasks to stop")
-            await tracker.wait(
-                task.task_id, account_id=task.account_id, user_id=task.user_id, timeout=remaining
-            )
+            try:
+                await tracker.wait(
+                    task.task_id,
+                    account_id=task.account_id,
+                    user_id=task.user_id,
+                    timeout=remaining,
+                )
+            except KeyError:
+                # A Task created concurrently with this deletion withdraws itself.
+                continue
 
     async def _delete_uploads(self, ctx: RequestContext) -> None:
         viking_fs = self._service.viking_fs
