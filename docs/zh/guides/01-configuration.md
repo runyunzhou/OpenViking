@@ -1280,6 +1280,7 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 | `agfs` | object | RAGFS（Rust 实现的 AGFS）配置 | {} |
 | `vectordb` | object | 向量库存储配置 | {} |
 | `task_store` | object | 持久化 Task/Work 后端配置 | `{"provider":"file"}` |
+| `watch_store` | object | Watch 存储：`file`（单节点）或 `mysql`（多节点共享） | `{"provider":"file"}` |
 
 
 ```json
@@ -1329,6 +1330,52 @@ MySQL 后端需要安装 `openviking[mysql]` extra。Task mutation、Task
 最终化和 execution event 更新在同一个数据库事务中提交。`task_id`
 是全局唯一身份；`account_id` 和 `user_id` 用于鉴权和查询范围。同一部署
 不要同时让 FileStore 和 MySQL 表作为写入端。
+
+#### watch_store
+
+默认的 `file` provider 与旧版本一样，把 Watch 任务保存在内部控制文件
+`viking://resources/.watch_tasks.json` 中，只供单个 OpenViking 进程使用。多个节点
+共享数据时必须使用 `mysql`：安装 `openviking[mysql]`，执行
+`openviking/service/sql/001_watch_tasks.sql`，并同时使用 cache PathLock
+（`storage.agfs.pathlock.provider="cache"`）和 MySQL Task 存储。MySQL 的 `params` 与 `task_store` 使用相同的连接字段；`params.table`
+默认为 `ov_watch_tasks`，同时决定 `{table}_leader` 选主租约表名。必须配置
+`params.credential_encryption_key`：一个 base64 编码的 32 字节密钥，用于以 AES-GCM
+加密存储每个 Watch 的私有 `auth_state`（数据源 token）和 `connector_states`，密文与
+task ID 绑定。所有节点必须使用同一密钥，更换密钥会导致已有 Watch 凭证无法解密。
+`file` 模式下这些状态仍由 VikingFS 文件加密保护。
+
+```json
+{
+  "storage": {
+    "watch_store": {
+      "provider": "mysql",
+      "params": {
+        "user": "openviking",
+        "password": "change-me",
+        "database": "openviking",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "table": "ov_watch_tasks",
+        "credential_encryption_key": "base64-encoded-32-byte-key"
+      }
+    }
+  }
+}
+```
+
+所有节点都提供 Watch API。`enable_watch_scheduler=true` 的节点在存储中竞争
+leader 租约；leader 每 15 秒拉取到期的 Watch 并结算已结束的运行。一次运行就是
+对应的 ingestion Task：运行占用目标期间，Watch 行记录该 Task ID，且只有在持有
+目标 Tree PathLock 时才能开始运行。Task 超过 10 分钟仍不存在时按 error 结算；
+运行超过 3 小时会被取消并按 failed 结算。
+
+对与被占用 Watch 目标重叠的路径执行 `mv`、`cp`、`rm`、`mkdir` 时，最多等待
+10 秒，之后返回可重试的 busy 错误。
+
+从 `file` 迁移到 `mysql` 时，导出 `viking://resources/.watch_tasks.json` 并停止
+服务后，用选择 `mysql` 的配置执行
+`python scripts/maintenance/import_watch_tasks.py --input watch_tasks.json --config ov.conf`
+导入。
 
 #### agfs (RAGFS)
 

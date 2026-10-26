@@ -510,6 +510,7 @@ class ConnectorDelegate:
         on_complete: Optional[
             Callable[[str, Optional[str], Optional[str]], Awaitable[None]]
         ] = None,
+        task_id: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Route add_resource to the external Connector service."""
@@ -669,6 +670,7 @@ class ConnectorDelegate:
             resource_id=task_resource_id,
             account_id=ctx.account_id,
             user_id=ctx.user.user_id,
+            task_id=task_id,
         )
         try:
             submit_kwargs: Dict[str, Any] = {

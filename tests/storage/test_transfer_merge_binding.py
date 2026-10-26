@@ -10,7 +10,8 @@ import pytest
 import pytest_asyncio
 
 from openviking.pyagfs import get_binding_client
-from openviking.resource.watch_manager import WatchManager
+from openviking.resource.watch_store_file import FileWatchStore
+from openviking.resource.watch_types import WatchTask
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import AclAction, AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
@@ -625,6 +626,7 @@ async def test_acl_failure_restores_only_moved_vectors_after_directory_merge(
     await seed_vector(backend, f"{source}/file.txt", "new")
     await seed_vector(backend, f"{target}/only.txt", "keep")
     monkeypatch.setattr(fs, "_ensure_access", AsyncMock())
+
     async def acl_enabled(_account_id):
         return True
 
@@ -713,22 +715,24 @@ async def test_directory_transfer_holds_both_subtrees_through_vector_phase(bindi
 @pytest.mark.asyncio
 async def test_watch_persistence_overwrites_after_backup_removal_failure(binding_fs, monkeypatch):
     fs = binding_fs
-    manager = WatchManager(viking_fs=fs)
+    store = FileWatchStore(fs)
+    await store.initialize()
     ctx = root_ctx()
-    await manager._save_tasks()
-    await manager._save_tasks()
-    assert await fs.exists(manager.STORAGE_BAK_URI, ctx=ctx)
+    await store._save(store._rows)
+    await store._save(store._rows)
+    assert await fs.exists(store.STORAGE_BAK_URI, ctx=ctx)
     real_rm = fs.rm
 
     async def fail_backup_removal(uri, **kwargs):
-        if uri == manager.STORAGE_BAK_URI:
+        if uri == store.STORAGE_BAK_URI:
             raise RuntimeError("injected backup removal failure")
         return await real_rm(uri, **kwargs)
 
     monkeypatch.setattr(fs, "rm", fail_backup_removal)
-    task = await manager.create_task(path="https://example.com/doc", watch_interval=60)
-    stored = json.loads(await fs.read_file(manager.STORAGE_URI, ctx=ctx))
+    task = WatchTask(path="https://example.com/doc", to_uri="viking://resources/doc")
+    await store.create_task(task)
+    stored = json.loads(await fs.read_file(store.STORAGE_URI, ctx=ctx))
     assert [item["task_id"] for item in stored["tasks"]] == [task.task_id]
-    backup = json.loads(await fs.read_file(manager.STORAGE_BAK_URI, ctx=ctx))
+    backup = json.loads(await fs.read_file(store.STORAGE_BAK_URI, ctx=ctx))
     assert backup["tasks"] == []
-    assert not await fs.exists(manager.STORAGE_TMP_URI, ctx=ctx)
+    assert not await fs.exists(store.STORAGE_TMP_URI, ctx=ctx)

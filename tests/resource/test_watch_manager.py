@@ -1,81 +1,22 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Unit tests for WatchManager."""
+"""Unit tests for WatchTask and WatchManager over the SQLite Watch store."""
 
 import asyncio
-import json
 from datetime import datetime, timedelta
-from pathlib import Path
-from typing import AsyncGenerator
-from unittest.mock import AsyncMock
 
 import pytest
-import pytest_asyncio
 
-from openviking.resource.watch_manager import WatchManager, WatchTask
+from openviking.resource.watch_manager import PermissionDeniedError, WatchManager, WatchTask
+from openviking.resource.watch_store_file import FileWatchStore
+from openviking.resource.watch_types import WatchRunResult
+from openviking.storage.errors import ResourceBusyError
 from openviking_cli.exceptions import ConflictError
-from tests.utils.mock_agfs import MockLocalAGFS
 
 TEST_ACCOUNT_ID = "default"
 TEST_USER_ID = "default"
 TEST_ROLE = "ROOT"
-
-
-class MockVikingFS:
-    """Mock VikingFS for testing."""
-
-    def __init__(self, root_path: str):
-        self.agfs = MockLocalAGFS(root_path=root_path)
-        self._storage_data = {}
-
-    async def read_file(self, uri: str, ctx=None) -> str:
-        """Read file from storage."""
-        path = self._uri_to_path(uri)
-        content = self.agfs.read(path)
-        if isinstance(content, bytes):
-            return content.decode("utf-8")
-        return content
-
-    async def write_file(self, uri: str, content: str, ctx=None) -> None:
-        """Write file to storage."""
-        path = self._uri_to_path(uri)
-        self.agfs.write(path, content.encode("utf-8"))
-
-    def _uri_to_path(self, uri: str) -> str:
-        """Convert URI to path."""
-        if uri.startswith("viking://"):
-            return uri.replace("viking://", "/local/default/")
-        return uri
-
-
-@pytest_asyncio.fixture
-async def temp_storage(tmp_path: Path) -> AsyncGenerator[Path, None]:
-    """Create temporary storage directory."""
-    storage_dir = tmp_path / "watch_storage"
-    storage_dir.mkdir(parents=True, exist_ok=True)
-    yield storage_dir
-
-
-@pytest_asyncio.fixture
-async def mock_viking_fs(temp_storage: Path) -> MockVikingFS:
-    """Create mock VikingFS instance."""
-    return MockVikingFS(root_path=str(temp_storage))
-
-
-@pytest_asyncio.fixture
-async def watch_manager(mock_viking_fs: MockVikingFS) -> WatchManager:
-    """Create an initialized WatchManager with isolated storage."""
-    manager = WatchManager(viking_fs=mock_viking_fs)
-    await manager.initialize()
-    return manager
-
-
-@pytest_asyncio.fixture
-async def watch_manager_no_fs() -> WatchManager:
-    """Create an initialized in-memory WatchManager."""
-    manager = WatchManager(viking_fs=None)
-    await manager.initialize()
-    return manager
+_CONNECTOR_AUTH = {"provider": "connector_encrypted", "ciphertext": "unused"}
 
 
 class TestWatchTask:
@@ -228,203 +169,117 @@ class TestWatchTask:
         assert abs((next_time - expected).total_seconds()) < 1
 
 
-class TestWatchManager:
-    """Tests for WatchManager."""
+async def _create(manager: WatchManager, uri: str = "viking://resources/test", **kwargs):
+    kwargs.setdefault("path", "/test/path")
+    return await manager.create_task(to_uri=uri, **kwargs)
 
+
+class TestWatchManager:
     @pytest.mark.asyncio
     async def test_create_task(self, watch_manager: WatchManager):
-        """Test creating a task."""
-        task = await watch_manager.create_task(
-            path="/test/path",
-            to_uri="viking://resources/test",
-            reason="Test task",
-            watch_interval=30.0,
-        )
+        task = await _create(watch_manager, reason="Test task", watch_interval=30.0)
 
-        assert task.path == "/test/path"
         assert task.to_uri == "viking://resources/test"
-        assert task.reason == "Test task"
-        assert task.watch_interval == 30.0
         assert task.is_active is True
         assert task.next_execution_time is not None
+        stored = await watch_manager.get_task(task.task_id)
+        assert stored.reason == "Test task"
+        assert stored.watch_interval == 30.0
+        state = await watch_manager.store.get_state(task.task_id)
+        assert state.current_run_id is None
 
     @pytest.mark.asyncio
     async def test_create_inactive_task_has_no_next_execution(self, watch_manager: WatchManager):
-        task = await watch_manager.create_task(
-            path="/test/path",
-            to_uri="viking://resources/paused",
-            watch_interval=30.0,
-            is_active=False,
-        )
+        task = await _create(watch_manager, watch_interval=30.0, is_active=False)
 
-        assert task.is_active is False
         assert task.next_execution_time is None
-        assert task in await watch_manager.get_all_tasks(
-            TEST_ACCOUNT_ID,
-            TEST_USER_ID,
-            TEST_ROLE,
-        )
-        assert task not in await watch_manager.get_all_tasks(
-            TEST_ACCOUNT_ID,
-            TEST_USER_ID,
-            TEST_ROLE,
-            active_only=True,
-        )
-
-    @pytest.mark.asyncio
-    async def test_deactivate_tasks_under_uri_internal_matches_subtree(
-        self, watch_manager_no_fs: WatchManager
-    ):
-        root = await watch_manager_no_fs.create_task(
-            path="/test/root",
-            to_uri="viking://resources/codeask/wiki",
-            watch_interval=30.0,
-        )
-        child = await watch_manager_no_fs.create_task(
-            path="/test/child",
-            to_uri="viking://resources/codeask/wiki/page",
-            watch_interval=30.0,
-        )
-        sibling = await watch_manager_no_fs.create_task(
-            path="/test/sibling",
-            to_uri="viking://resources/codeask/wiki-renamed",
-            watch_interval=30.0,
-        )
-
-        deactivated = await watch_manager_no_fs.deactivate_tasks_under_uri_internal(
-            "viking://resources/codeask/wiki", TEST_ACCOUNT_ID
-        )
-
-        assert {task.task_id for task in deactivated} == {root.task_id, child.task_id}
-        assert (await watch_manager_no_fs.get_task(root.task_id)).is_active is False
-        assert (await watch_manager_no_fs.get_task(child.task_id)).is_active is False
-        assert (await watch_manager_no_fs.get_task(sibling.task_id)).is_active is True
-
-    @pytest.mark.asyncio
-    async def test_target_prefix_rewrite_rolls_back_task_state_on_save_failure(self):
-        manager = WatchManager()
-        root = await manager.create_task(
-            path="/test/root",
-            to_uri="viking://resources/codeask/wiki",
-            parent_uri=None,
-            watch_interval=30.0,
-        )
-        manager._save_tasks = AsyncMock(side_effect=RuntimeError("save failed"))
-
-        with pytest.raises(RuntimeError, match="save failed"):
-            await manager.rewrite_target_prefix_internal(
-                "viking://resources/codeask/wiki",
-                "viking://resources/codeask/wiki-renamed",
-                account_id=TEST_ACCOUNT_ID,
+        listed = await watch_manager.get_all_tasks(TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE)
+        assert [item.task_id for item in listed] == [task.task_id]
+        assert (
+            await watch_manager.get_all_tasks(
+                TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, active_only=True
             )
-
-        restored = await manager.get_task(root.task_id)
-        assert restored is not None
-        assert restored.to_uri == "viking://resources/codeask/wiki"
-        assert restored.parent_uri is None
+            == []
+        )
 
     @pytest.mark.asyncio
-    async def test_uri_index_move_and_deactivate_are_account_scoped(self):
-        manager = WatchManager()
-        uri = "viking://resources/shared"
-        task_a = await manager.create_task(path="/a", account_id="account-a", to_uri=uri)
-        task_b = await manager.create_task(path="/b", account_id="account-b", to_uri=uri)
-        with pytest.raises(ConflictError):
-            await manager.create_task(path="/duplicate", account_id="account-a", to_uri=uri)
-
-        await manager.validate_target_prefix_rewrite_internal(
-            uri,
-            f"{uri}-moved",
-            account_id="account-a",
-        )
-        await manager.rewrite_target_prefix_internal(
-            uri,
-            f"{uri}-moved",
-            account_id="account-a",
-        )
-        deactivated = await manager.deactivate_tasks_under_uri_internal(uri, "account-b")
-
-        assert task_a.to_uri == f"{uri}-moved"
-        assert task_a.is_active is True
-        assert task_b.to_uri == uri
-        assert task_b.is_active is False
-        assert deactivated == [task_b]
-        moved = await manager.get_task_by_uri(f"{uri}-moved", "account-a", "default", "root")
-        assert moved is task_a
-        assert await manager.get_task_by_uri(uri, "account-b", "default", "root") is task_b
+    @pytest.mark.parametrize(
+        ("kwargs", "message"),
+        [
+            ({"path": ""}, "Path is required"),
+            ({"to_uri": None}, "target URI"),
+            ({"watch_interval": 0}, "watch_interval must be > 0"),
+        ],
+    )
+    async def test_create_task_validation(self, watch_manager: WatchManager, kwargs, message):
+        values = {"path": "/test/path", "to_uri": "viking://resources/test", **kwargs}
+        with pytest.raises(ValueError, match=message):
+            await watch_manager.create_task(**values)
 
     @pytest.mark.asyncio
-    async def test_auth_state_persisted_and_hidden_from_public_dict(
-        self, mock_viking_fs: MockVikingFS
+    async def test_initial_run_occupies_watch_until_released(self, watch_manager: WatchManager):
+        task = await _create(watch_manager, initial_run_id="ingest-1")
+
+        state = await watch_manager.store.get_state(task.task_id)
+        assert state.current_run_id == "ingest-1"
+        assert await watch_manager.has_running_overlap(TEST_ACCOUNT_ID, ["viking://resources"])
+
+        await watch_manager.fail_initial_submission(task.task_id, "other-run", "ignored")
+        assert (await watch_manager.store.get_state(task.task_id)).current_run_id == "ingest-1"
+
+        await watch_manager.fail_initial_submission(task.task_id, "ingest-1", "submit failed")
+        released = await watch_manager.get_task(task.task_id)
+        assert (await watch_manager.store.get_state(task.task_id)).current_run_id is None
+        assert released.last_status == "failed"
+        assert released.last_error == "submit failed"
+
+    @pytest.mark.asyncio
+    async def test_create_requires_target_tree_lock(self, watch_manager: WatchManager, watch_vfs):
+        locks = watch_manager.locks
+        async with locks.tree(TEST_ACCOUNT_ID, "viking://resources") as lease:
+            with pytest.raises(ResourceBusyError):
+                await _create(watch_manager, "viking://resources/test")
+            task = await _create(watch_manager, "viking://resources/test", lease_ref=lease)
+        assert await watch_manager.get_task(task.task_id) is not None
+
+    @pytest.mark.asyncio
+    async def test_create_for_missing_target_locks_existing_ancestor(
+        self, watch_manager: WatchManager, watch_vfs, tmp_path
     ):
-        manager1 = WatchManager(viking_fs=mock_viking_fs)
-        await manager1.initialize()
-        task = await manager1.create_task(
-            path="https://example.feishu.cn/docx/doc_token",
-            to_uri="viking://resources/feishu",
-            watch_interval=30.0,
-            auth_state={
-                "provider": "feishu",
-                "access_token": "u-test",
-                "refresh_token": "r-test",
-                "expires_at": None,
-            },
-        )
+        await _create(watch_manager, "viking://resources/pending/doc.md")
 
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-        loaded = await manager2.get_task(task.task_id)
+        assert not await watch_vfs.exists("viking://resources/pending")
+        assert not list((tmp_path / "agfs").rglob("pending"))
 
-        assert loaded is not None
-        assert loaded.auth_state == task.auth_state
-        assert "auth_state" not in loaded.to_dict()
+        await watch_vfs.mkdir("viking://resources/held")
+        async with watch_manager.locks.tree(TEST_ACCOUNT_ID, "viking://resources/held"):
+            with pytest.raises(ResourceBusyError):
+                await _create(watch_manager, "viking://resources/held/new/doc.md")
 
     @pytest.mark.asyncio
-    async def test_connector_states_persisted_and_hidden_from_public_dict(
-        self, mock_viking_fs: MockVikingFS
-    ):
-        manager1 = WatchManager(viking_fs=mock_viking_fs)
-        await manager1.initialize()
-        states = {"documents": {"cursor": {"sync_checkpoint": "2026-09-01T00:00:00+00:00"}}}
-        task = await manager1.create_task(
-            path="tos://bucket/docs/",
-            source_type="tos",
-            to_uri="viking://resources/imports",
-            watch_interval=30.0,
-            auth_state={"provider": "connector_encrypted", "ciphertext": "encrypted"},
-            connector_states=states,
-        )
+    async def test_finish_run_records_sanitized_result(self, watch_vfs, watch_manager):
+        task = await _create(watch_manager, initial_run_id="ingest-task-1")
 
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-        loaded = await manager2.get_task(task.task_id)
-
-        assert loaded is not None
-        assert loaded.connector_states == states
-        assert "connector_states" not in loaded.to_dict()
-
-    @pytest.mark.asyncio
-    async def test_execution_result_is_persisted_and_public(self, mock_viking_fs: MockVikingFS):
-        manager1 = WatchManager(viking_fs=mock_viking_fs)
-        await manager1.initialize()
-        task = await manager1.create_task(
-            path="tos://bucket/docs/",
-            to_uri="viking://resources/imports",
-            watch_interval=30.0,
-        )
-
-        await manager1.record_execution(
+        applied = await watch_manager.finish_run(
             task.task_id,
-            status="failed",
-            execution_task_id="ingest-task-1",
-            error="pull failed with Bearer secret-token",
+            "ingest-task-1",
+            WatchRunResult(
+                status="failed",
+                execution_task_id="ingest-task-1",
+                error="pull failed with Bearer secret-token",
+            ),
         )
 
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-        loaded = await manager2.get_task(task.task_id)
-
-        assert loaded is not None
+        assert applied is True
+        assert not await watch_manager.finish_run(
+            task.task_id, "ingest-task-1", WatchRunResult(status="completed")
+        )
+        reopened = FileWatchStore(watch_vfs)
+        await reopened.initialize()
+        try:
+            loaded = await reopened.get_task(task.task_id)
+        finally:
+            await reopened.close()
         assert loaded.last_task_id == "ingest-task-1"
         assert loaded.last_status == "failed"
         assert loaded.last_error == "pull failed with Bearer [REDACTED]"
@@ -432,38 +287,46 @@ class TestWatchManager:
         assert loaded.to_dict()["last_error"] == loaded.last_error
 
     @pytest.mark.asyncio
-    async def test_create_task_without_path_raises(self, watch_manager: WatchManager):
-        """Test that creating a task without path raises error."""
-        with pytest.raises(ValueError, match="Path is required"):
-            await watch_manager.create_task(path="")
+    async def test_secret_state_persisted_and_hidden_from_public_dict(
+        self, watch_vfs, watch_manager
+    ):
+        states = {"documents": {"cursor": {"sync_checkpoint": "2026-09-01T00:00:00+00:00"}}}
+        task = await _create(
+            watch_manager,
+            path="tos://bucket/docs/",
+            auth_state=dict(_CONNECTOR_AUTH),
+            connector_states=states,
+        )
+
+        reopened = FileWatchStore(watch_vfs)
+        await reopened.initialize()
+        try:
+            loaded = await reopened.get_task(task.task_id)
+        finally:
+            await reopened.close()
+        assert loaded.auth_state == _CONNECTOR_AUTH
+        assert loaded.connector_states == states
+        public = loaded.to_dict()
+        assert "auth_state" not in public
+        assert "connector_states" not in public
 
     @pytest.mark.asyncio
     async def test_create_task_with_conflicting_uri(self, watch_manager: WatchManager):
-        """Test that creating a task with conflicting URI raises error."""
-        await watch_manager.create_task(
-            path="/test/path1",
-            to_uri="viking://resources/test",
-        )
+        await _create(watch_manager, path="/test/path1")
 
         with pytest.raises(ConflictError, match="already being monitored"):
-            await watch_manager.create_task(
-                path="/test/path2",
-                to_uri="viking://resources/test",
-            )
+            await _create(watch_manager, path="/test/path2")
+        await _create(watch_manager, path="/test/path3", account_id="other-account")
 
     @pytest.mark.asyncio
     async def test_update_task(self, watch_manager: WatchManager):
-        """Test updating a task."""
-        task = await watch_manager.create_task(
-            path="/test/path",
-            reason="Original reason",
-        )
+        task = await _create(watch_manager, reason="Original reason")
 
         updated = await watch_manager.update_task(
-            task_id=task.task_id,
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
+            task.task_id,
+            TEST_ACCOUNT_ID,
+            TEST_USER_ID,
+            TEST_ROLE,
             reason="Updated reason",
             watch_interval=45.0,
             is_active=False,
@@ -474,499 +337,226 @@ class TestWatchManager:
         assert updated.is_active is False
         assert updated.next_execution_time is None
 
+        resumed = await watch_manager.update_task(
+            task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, is_active=True
+        )
+        expected = resumed.created_at + timedelta(minutes=45)
+        assert abs((resumed.next_execution_time - expected).total_seconds()) < 1
+
     @pytest.mark.asyncio
-    async def test_update_task_not_found(self, watch_manager: WatchManager):
-        """Test updating a non-existent task."""
+    async def test_non_positive_interval_pauses(self, watch_manager: WatchManager):
+        task = await _create(watch_manager, watch_interval=30.0)
+
+        updated = await watch_manager.update_task(
+            task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, watch_interval=0
+        )
+
+        assert updated.is_active is False
+        assert updated.watch_interval == 30.0
+        with pytest.raises(ValueError, match="must be > 0 for active tasks"):
+            await watch_manager.update_task(
+                task.task_id,
+                TEST_ACCOUNT_ID,
+                TEST_USER_ID,
+                TEST_ROLE,
+                watch_interval=0,
+                is_active=True,
+            )
+
+    @pytest.mark.asyncio
+    async def test_update_task_not_found_and_unsupported_fields(self, watch_manager):
         with pytest.raises(ValueError, match="not found"):
             await watch_manager.update_task(
-                task_id="non-existent-id",
-                account_id=TEST_ACCOUNT_ID,
-                user_id=TEST_USER_ID,
-                role=TEST_ROLE,
-                reason="Updated",
+                "non-existent-id", TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, reason="Updated"
+            )
+        task = await _create(watch_manager)
+        with pytest.raises(ValueError, match="Unsupported Watch update fields"):
+            await watch_manager.update_task(
+                task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, to_uri="viking://x"
             )
 
     @pytest.mark.asyncio
-    async def test_update_task_with_conflicting_uri(self, watch_manager: WatchManager):
-        """Test updating a task with conflicting URI."""
-        await watch_manager.create_task(
-            path="/test/path1",
-            to_uri="viking://resources/test1",
-        )
-        task2 = await watch_manager.create_task(
-            path="/test/path2",
-            to_uri="viking://resources/test2",
-        )
+    async def test_other_user_cannot_update_or_delete(self, watch_manager: WatchManager):
+        task = await _create(watch_manager, user_id="alice")
 
-        with pytest.raises(ConflictError, match="already being monitored"):
+        with pytest.raises(PermissionDeniedError):
             await watch_manager.update_task(
-                task_id=task2.task_id,
-                account_id=TEST_ACCOUNT_ID,
-                user_id=TEST_USER_ID,
-                role=TEST_ROLE,
-                to_uri="viking://resources/test1",
+                task.task_id, TEST_ACCOUNT_ID, "bob", "user", reason="x"
             )
+        with pytest.raises(PermissionDeniedError):
+            await watch_manager.delete_task(task.task_id, TEST_ACCOUNT_ID, "bob", "admin")
+        assert await watch_manager.get_task(task.task_id, TEST_ACCOUNT_ID, "bob", "user") is None
+        assert await watch_manager.delete_task(task.task_id, TEST_ACCOUNT_ID, "root", "root")
 
     @pytest.mark.asyncio
     async def test_delete_task(self, watch_manager: WatchManager):
-        """Test deleting a task."""
-        task = await watch_manager.create_task(
-            path="/test/path",
-            to_uri="viking://resources/test",
+        task = await _create(watch_manager)
+
+        assert await watch_manager.delete_task(
+            task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
         )
-
-        result = await watch_manager.delete_task(
-            task_id=task.task_id,
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
+        assert await watch_manager.get_task(task.task_id) is None
+        assert (
+            await watch_manager.get_task_by_uri(
+                "viking://resources/test", TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
+            )
+            is None
         )
-
-        assert result is True
-
-        retrieved = await watch_manager.get_task(task.task_id)
-        assert retrieved is None
-
-        uri_task = await watch_manager.get_task_by_uri(
-            to_uri="viking://resources/test",
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
+        assert await watch_manager.store.get_state(task.task_id) is None
+        assert not await watch_manager.delete_task(
+            task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
         )
-        assert uri_task is None
+        await _create(watch_manager, path="/replacement")
 
     @pytest.mark.asyncio
-    async def test_delete_task_not_found(self, watch_manager: WatchManager):
-        """Test deleting a non-existent task."""
-        result = await watch_manager.delete_task(
-            task_id="non-existent-id",
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
+    async def test_delete_occupied_task_is_purged_when_run_settles(self, watch_manager):
+        task = await _create(watch_manager, initial_run_id="run-1")
+
+        assert await watch_manager.delete_task(
+            task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
         )
-        assert result is False
+        state = await watch_manager.store.get_state(task.task_id)
+        assert state.deleted and state.current_run_id == "run-1"
+        assert await watch_manager.get_task(task.task_id) is None
+        assert await watch_manager.has_running_overlap(TEST_ACCOUNT_ID, ["viking://resources"])
+
+        await watch_manager.finish_run(task.task_id, "run-1", WatchRunResult(status="completed"))
+        assert await watch_manager.store.get_state(task.task_id) is None
 
     @pytest.mark.asyncio
-    async def test_get_task(self, watch_manager: WatchManager):
-        """Test getting a task by ID."""
-        task = await watch_manager.create_task(path="/test/path")
-
-        retrieved = await watch_manager.get_task(task.task_id)
-
-        assert retrieved is not None
-        assert retrieved.task_id == task.task_id
-        assert retrieved.path == "/test/path"
-
-    @pytest.mark.asyncio
-    async def test_get_task_not_found(self, watch_manager: WatchManager):
-        """Test getting a non-existent task."""
-        retrieved = await watch_manager.get_task("non-existent-id")
-        assert retrieved is None
-
-    @pytest.mark.asyncio
-    async def test_get_all_tasks(self, watch_manager: WatchManager):
-        """Test getting all tasks."""
-        await watch_manager.create_task(path="/test/path1")
-        await watch_manager.create_task(path="/test/path2")
-        await watch_manager.create_task(path="/test/path3")
-
-        tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-
-        assert len(tasks) == 3
-        assert [task.path for task in tasks] == ["/test/path3", "/test/path2", "/test/path1"]
-
-    @pytest.mark.asyncio
-    async def test_get_all_tasks_active_only(self, watch_manager: WatchManager):
-        """Test getting only active tasks."""
-        task1 = await watch_manager.create_task(path="/test/path1")
-        await watch_manager.create_task(path="/test/path2")
-
+    async def test_get_all_tasks_keeps_file_order_across_updates(self, watch_manager: WatchManager):
+        tasks = [
+            await _create(watch_manager, f"viking://resources/t{index}", path=f"/test/path{index}")
+            for index in range(1, 4)
+        ]
         await watch_manager.update_task(
-            task_id=task1.task_id,
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-            is_active=False,
+            tasks[0].task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, path="/test/renamed"
         )
 
-        tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-            active_only=True,
-        )
+        listed = await watch_manager.get_all_tasks(TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE)
 
-        assert len(tasks) == 1
-        assert tasks[0].is_active is True
+        assert [task.task_id for task in listed] == [task.task_id for task in tasks]
 
     @pytest.mark.asyncio
-    async def test_get_all_tasks_admin_scoped_to_own_tasks(
-        self, watch_manager: WatchManager
-    ):
-        """ADMIN is scoped to its own tasks; ROOT still sees the whole account."""
-        await watch_manager.create_task(path="/test/alice1", user_id="alice")
-        await watch_manager.create_task(path="/test/bob1", user_id="bob")
-        await watch_manager.create_task(path="/test/alice2", user_id="alice")
+    async def test_visibility_by_role(self, watch_manager: WatchManager):
+        await _create(watch_manager, "viking://resources/a1", user_id="alice")
+        await _create(watch_manager, "viking://resources/b1", user_id="bob")
+        await _create(watch_manager, "viking://resources/a2", user_id="alice")
+        await _create(watch_manager, "viking://resources/o1", account_id="other", user_id="alice")
 
-        # ROOT keeps the system-wide view.
-        all_tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID, user_id="root", role="root"
-        )
-        assert len(all_tasks) == 3
+        root = await watch_manager.get_all_tasks(TEST_ACCOUNT_ID, "root", "root")
+        admin = await watch_manager.get_all_tasks(TEST_ACCOUNT_ID, "alice", "admin")
+        user = await watch_manager.get_all_tasks(TEST_ACCOUNT_ID, "bob", "user")
 
-        # ADMIN no longer sees the whole account — only its own tasks.
-        alice_tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID, user_id="alice", role="admin"
-        )
-        assert {task.user_id for task in alice_tasks} == {"alice"}
-        assert len(alice_tasks) == 2
-
-    @pytest.mark.asyncio
-    async def test_get_all_tasks_isolates_same_account_users(
-        self, watch_manager: WatchManager
-    ):
-        """Same account, different user_id → each caller sees only its own tasks."""
-        await watch_manager.create_task(path="/test/alice1", user_id="alice")
-        await watch_manager.create_task(path="/test/bob1", user_id="bob")
-
-        bob_tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID, user_id="bob", role="user"
-        )
-        assert {task.user_id for task in bob_tasks} == {"bob"}
+        assert len(root) == 4
+        assert {task.user_id for task in admin} == {"alice"} and len(admin) == 2
+        assert [task.user_id for task in user] == ["bob"]
 
     @pytest.mark.asyncio
     async def test_get_task_by_uri(self, watch_manager: WatchManager):
-        """Test getting a task by URI."""
-        task = await watch_manager.create_task(
-            path="/test/path",
-            to_uri="viking://resources/test",
+        task = await _create(watch_manager)
+
+        found = await watch_manager.get_task_by_uri(
+            "viking://resources/test", TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
         )
 
-        retrieved = await watch_manager.get_task_by_uri(
-            to_uri="viking://resources/test",
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-
-        assert retrieved is not None
-        assert retrieved.task_id == task.task_id
-
-    @pytest.mark.asyncio
-    async def test_get_task_by_uri_not_found(self, watch_manager: WatchManager):
-        """Test getting a task by non-existent URI."""
-        retrieved = await watch_manager.get_task_by_uri(
-            to_uri="viking://nonexistent",
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-        assert retrieved is None
-
-    @pytest.mark.asyncio
-    async def test_update_execution_time(self, watch_manager: WatchManager):
-        """Test updating execution time."""
-        task = await watch_manager.create_task(
-            path="/test/path",
-            watch_interval=30.0,
-        )
-
-        original_next_time = task.next_execution_time
-
-        await asyncio.sleep(0.1)
-        await watch_manager.update_execution_time(task.task_id)
-
-        updated = await watch_manager.get_task(task.task_id)
-        assert updated is not None
-        assert updated.last_execution_time is not None
-        assert updated.next_execution_time > original_next_time
-
-    @pytest.mark.asyncio
-    async def test_get_due_tasks(self, watch_manager: WatchManager):
-        """Test getting due tasks."""
-        task1 = await watch_manager.create_task(
-            path="/test/path1",
-            watch_interval=0.001,
-        )
-        await watch_manager.create_task(
-            path="/test/path2",
-            watch_interval=60.0,
-        )
-
-        await asyncio.sleep(0.1)
-
-        due_tasks = await watch_manager.get_due_tasks()
-
-        assert len(due_tasks) == 1
-        assert due_tasks[0].task_id == task1.task_id
-
-    @pytest.mark.asyncio
-    async def test_create_task_with_non_positive_interval_raises(self, watch_manager: WatchManager):
-        with pytest.raises(ValueError, match="watch_interval must be > 0"):
-            await watch_manager.create_task(path="/test/path", watch_interval=0)
-
-    @pytest.mark.asyncio
-    async def test_get_next_execution_time(self, watch_manager: WatchManager):
-        await watch_manager.create_task(path="/test/path1", watch_interval=60.0)
-        await watch_manager.create_task(path="/test/path2", watch_interval=0.001)
-        await asyncio.sleep(0.05)
-        next_time = await watch_manager.get_next_execution_time()
-        assert next_time is not None
-
-
-class TestWatchManagerPersistence:
-    """Tests for WatchManager persistence."""
-
-    @pytest.mark.asyncio
-    async def test_persistence_save_and_load(
-        self, mock_viking_fs: MockVikingFS, temp_storage: Path
-    ):
-        """Test that tasks are saved and loaded correctly."""
-        manager1 = WatchManager(viking_fs=mock_viking_fs)
-        await manager1.initialize()
-
-        task = await manager1.create_task(
-            path="/test/path",
-            source_type="local",
-            to_uri="viking://resources/test",
-            reason="Test task",
-            watch_interval=45.0,
-        )
-        task_id = task.task_id
-
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-
-        loaded_task = await manager2.get_task(task_id)
-
-        assert loaded_task is not None
-        assert loaded_task.path == "/test/path"
-        assert loaded_task.source_type == "local"
-        assert loaded_task.to_uri == "viking://resources/test"
-        assert loaded_task.reason == "Test task"
-        assert loaded_task.watch_interval == 45.0
-
-    @pytest.mark.asyncio
-    async def test_persistence_without_vikingfs(self, watch_manager_no_fs: WatchManager):
-        """Test that manager works without VikingFS (no persistence)."""
-        task = await watch_manager_no_fs.create_task(
-            path="/test/path",
-            reason="Test task",
-        )
-
-        retrieved = await watch_manager_no_fs.get_task(task.task_id)
-        assert retrieved is not None
-        assert retrieved.path == "/test/path"
-
-    @pytest.mark.asyncio
-    async def test_persistence_after_delete(self, mock_viking_fs: MockVikingFS):
-        """Test that deleted tasks are removed from persistence."""
-        manager = WatchManager(viking_fs=mock_viking_fs)
-        await manager.initialize()
-
-        task = await manager.create_task(
-            path="/test/path",
-            to_uri="viking://resources/test",
-        )
-
-        await manager.delete_task(
-            task_id=task.task_id,
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-
-        loaded_task = await manager2.get_task(task.task_id)
-        assert loaded_task is None
-
-        uri_task = await manager2.get_task_by_uri(
-            to_uri="viking://resources/test",
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-        assert uri_task is None
-
-    @pytest.mark.asyncio
-    async def test_persistence_backfill_next_execution_time(
-        self, mock_viking_fs: MockVikingFS, temp_storage: Path
-    ):
-        manager1 = WatchManager(viking_fs=mock_viking_fs)
-        await manager1.initialize()
-        task = await manager1.create_task(
-            path="/test/path",
-            to_uri="viking://resources/test_backfill",
-            watch_interval=30.0,
-        )
-
-        content = await mock_viking_fs.read_file(WatchManager.STORAGE_URI)
-        data = json.loads(content)
-        for t in data.get("tasks", []):
-            if t.get("task_id") == task.task_id:
-                t["next_execution_time"] = None
-                break
-        await mock_viking_fs.write_file(WatchManager.STORAGE_URI, json.dumps(data))
-
-        manager2 = WatchManager(viking_fs=mock_viking_fs)
-        await manager2.initialize()
-        loaded = await manager2.get_task(task.task_id)
-        assert loaded is not None
-        assert loaded.is_active is True
-        assert loaded.next_execution_time is not None
-
-    @pytest.mark.asyncio
-    async def test_persistence_empty_storage_file_is_ignored(self, mock_viking_fs: MockVikingFS):
-        path = mock_viking_fs._uri_to_path(WatchManager.STORAGE_URI)
-        mock_viking_fs.agfs.write(path, b"")
-
-        manager = WatchManager(viking_fs=mock_viking_fs)
-        await manager.initialize()
-
-        tasks = await manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-        assert tasks == []
-
-    @pytest.mark.asyncio
-    async def test_persistence_recovers_from_backup_on_corrupt_storage(
-        self, mock_viking_fs: MockVikingFS
-    ):
-        storage_path = mock_viking_fs._uri_to_path(WatchManager.STORAGE_URI)
-        bak_path = mock_viking_fs._uri_to_path(WatchManager.STORAGE_BAK_URI)
-
-        mock_viking_fs.agfs.write(storage_path, b"")
-
-        task_data = {
-            "task_id": "bak-task-id",
-            "path": "/test/bak",
-            "to_uri": "viking://resources/bak",
-            "reason": "Backup task",
-            "instruction": "",
-            "watch_interval": 60.0,
-            "created_at": datetime.now().isoformat(),
-            "last_execution_time": None,
-            "next_execution_time": None,
-            "is_active": True,
-        }
-        data = {"tasks": [task_data], "updated_at": datetime.now().isoformat()}
-        mock_viking_fs.agfs.write(bak_path, json.dumps(data).encode("utf-8"))
-
-        manager = WatchManager(viking_fs=mock_viking_fs)
-        await manager.initialize()
-
-        loaded = await manager.get_task("bak-task-id")
-        assert loaded is not None
-        assert loaded.to_uri == "viking://resources/bak"
-
-
-class TestWatchManagerConcurrency:
-    """Tests for WatchManager concurrent access."""
-
-    @pytest.mark.asyncio
-    async def test_concurrent_task_creation(self, watch_manager: WatchManager):
-        """Test concurrent task creation."""
-
-        async def create_task(index: int):
-            return await watch_manager.create_task(
-                path=f"/test/path{index}",
-                to_uri=f"viking://resources/test{index}",
+        assert found.task_id == task.task_id
+        assert (
+            await watch_manager.get_task_by_uri(
+                "viking://nonexistent", TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE
             )
-
-        tasks = await asyncio.gather(
-            *[asyncio.to_thread(lambda i=i: asyncio.run(create_task(i))) for i in range(10)]
+            is None
         )
-
-        assert len(tasks) == 10
-        assert len({task.task_id for task in tasks}) == 10
-
-        all_tasks = await watch_manager.get_all_tasks(
-            account_id=TEST_ACCOUNT_ID,
-            user_id=TEST_USER_ID,
-            role=TEST_ROLE,
-        )
-        assert len(all_tasks) == 10
 
     @pytest.mark.asyncio
-    async def test_concurrent_read_write(self, watch_manager: WatchManager):
-        """A background result must preserve a concurrent HTTP pause, including on disk."""
-        task = await watch_manager.create_task(path="/test/path")
-
-        async def pause_task():
-            await watch_manager.update_task(
-                task_id=task.task_id,
-                account_id=TEST_ACCOUNT_ID,
-                user_id=TEST_USER_ID,
-                role=TEST_ROLE,
-                is_active=False,
-            )
+    async def test_pause_wins_over_concurrent_run_settlement(self, watch_manager: WatchManager):
+        task = await _create(watch_manager, initial_run_id="run-1")
 
         await asyncio.gather(
-            pause_task(),
-            asyncio.to_thread(
-                lambda: asyncio.run(
-                    watch_manager.record_execution(task.task_id, status="completed")
-                )
+            watch_manager.update_task(
+                task.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, is_active=False
             ),
+            watch_manager.finish_run(task.task_id, "run-1", WatchRunResult(status="completed")),
         )
-        restored = WatchManager(viking_fs=watch_manager._viking_fs)
-        await restored.initialize()
-        final_task = await restored.get_task(task.task_id)
-        assert final_task is not None
-        assert final_task.is_active is False
-        assert final_task.last_status == "completed"
-        assert final_task.next_execution_time is None
+
+        final = await watch_manager.get_task(task.task_id)
+        assert final.is_active is False
+        assert final.last_status == "completed"
+        assert final.next_execution_time is None
 
 
-_CONNECTOR_AUTH = {"provider": "connector_encrypted", "ciphertext": "unused"}
+class TestTargetRewrites:
+    @pytest.mark.asyncio
+    async def test_deactivate_tasks_under_uri_matches_subtree(self, watch_manager: WatchManager):
+        root = await _create(watch_manager, "viking://resources/codeask/wiki")
+        child = await _create(watch_manager, "viking://resources/codeask/wiki/page")
+        sibling = await _create(watch_manager, "viking://resources/codeask/wiki-renamed")
+
+        deactivated = await watch_manager.deactivate_tasks_under_uri_internal(
+            "viking://resources/codeask/wiki", TEST_ACCOUNT_ID
+        )
+
+        assert {task.task_id for task in deactivated} == {root.task_id, child.task_id}
+        assert (await watch_manager.get_task(root.task_id)).is_active is False
+        assert (await watch_manager.get_task(child.task_id)).is_active is False
+        assert (await watch_manager.get_task(sibling.task_id)).is_active is True
+
+    @pytest.mark.asyncio
+    async def test_rewrite_moves_subtree_and_parent_uri(self, watch_manager: WatchManager):
+        root = await _create(
+            watch_manager,
+            "viking://resources/codeask/wiki",
+            parent_uri="viking://resources/codeask",
+        )
+        child = await _create(watch_manager, "viking://resources/codeask/wiki/page")
+
+        moved = await watch_manager.rewrite_target_prefix_internal(
+            "viking://resources/codeask/wiki", "viking://resources/docs/wiki", TEST_ACCOUNT_ID
+        )
+
+        assert {task.task_id for task in moved} == {root.task_id, child.task_id}
+        root_after = await watch_manager.get_task(root.task_id)
+        assert root_after.to_uri == "viking://resources/docs/wiki"
+        assert root_after.parent_uri == "viking://resources/docs"
+        child_after = await watch_manager.get_task(child.task_id)
+        assert child_after.to_uri == "viking://resources/docs/wiki/page"
+
+    @pytest.mark.asyncio
+    async def test_move_and_deactivate_are_account_scoped(self, watch_manager: WatchManager):
+        uri = "viking://resources/shared"
+        task_a = await _create(watch_manager, uri, path="/a", account_id="account-a")
+        task_b = await _create(watch_manager, uri, path="/b", account_id="account-b")
+
+        await watch_manager.validate_target_prefix_rewrite_internal(
+            uri, f"{uri}-moved", "account-a"
+        )
+        await watch_manager.rewrite_target_prefix_internal(uri, f"{uri}-moved", "account-a")
+        deactivated = await watch_manager.deactivate_tasks_under_uri_internal(uri, "account-b")
+
+        moved = await watch_manager.get_task_by_uri(f"{uri}-moved", "account-a", "default", "root")
+        assert moved.task_id == task_a.task_id and moved.is_active is True
+        assert [task.task_id for task in deactivated] == [task_b.task_id]
+        stayed = await watch_manager.get_task_by_uri(uri, "account-b", "default", "root")
+        assert stayed.task_id == task_b.task_id and stayed.is_active is False
+
+    @pytest.mark.asyncio
+    async def test_rewrite_onto_native_target_is_refused_without_changes(self, watch_manager):
+        await _create(watch_manager, "viking://resources/target")
+        moving = await _create(watch_manager, "viking://resources/source")
+
+        with pytest.raises(ConflictError, match="already being monitored"):
+            await watch_manager.validate_target_prefix_rewrite_internal(
+                "viking://resources/source", "viking://resources/target", TEST_ACCOUNT_ID
+            )
+        with pytest.raises(ConflictError, match="already being monitored"):
+            await watch_manager.rewrite_target_prefix_internal(
+                "viking://resources/source", "viking://resources/target", TEST_ACCOUNT_ID
+            )
+        assert (await watch_manager.get_task(moving.task_id)).to_uri == "viking://resources/source"
 
 
 class TestSharedConnectorTargets:
     """Connector watches may share a target; native watches are exclusive."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("with_connector", [False, True])
-    @pytest.mark.parametrize("operation", ["create", "update", "rewrite"])
-    async def test_missing_indexed_task_blocks_target_sharing(
-        self, watch_manager_no_fs: WatchManager, with_connector: bool, operation: str
-    ):
-        manager = watch_manager_no_fs
-        target = "viking://resources/shared"
-        source = "viking://resources/source"
-        if with_connector:
-            await manager.create_task(
-                path="tos://bucket/existing/", to_uri=target, auth_state=dict(_CONNECTOR_AUTH)
-            )
-        moving = await manager.create_task(
-            path="tos://bucket/moving/", to_uri=source, auth_state=dict(_CONNECTOR_AUTH)
-        )
-        manager._index_add(TEST_ACCOUNT_ID, target, "missing-task")
-        original_index = {key: set(ids) for key, ids in manager._uri_to_task.items()}
-        original_tasks = set(manager._tasks)
-
-        with pytest.raises(ConflictError, match="already being monitored"):
-            if operation == "create":
-                await manager.create_task(
-                    path="tos://bucket/new/", to_uri=target, auth_state=dict(_CONNECTOR_AUTH)
-                )
-            elif operation == "update":
-                await manager.update_task(
-                    moving.task_id, TEST_ACCOUNT_ID, TEST_USER_ID, TEST_ROLE, to_uri=target
-                )
-            else:
-                await manager.rewrite_target_prefix_internal(source, target, TEST_ACCOUNT_ID)
-
-        assert manager._uri_to_task == original_index
-        assert set(manager._tasks) == original_tasks
-        assert moving.to_uri == source
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -980,17 +570,17 @@ class TestSharedConnectorTargets:
         ],
     )
     async def test_uri_lookup_only_considers_visible_tasks(
-        self, watch_manager_no_fs: WatchManager, user_id, role, visible_indexes
+        self, watch_manager: WatchManager, user_id, role, visible_indexes
     ):
-        manager = watch_manager_no_fs
         to_uri = "viking://resources/shared"
         tasks = []
         for index, owner in enumerate(("alice", "alice", "bob")):
             tasks.append(
-                await manager.create_task(
+                await _create(
+                    watch_manager,
+                    to_uri,
                     path=f"tos://bucket/{index}/",
                     user_id=owner,
-                    to_uri=to_uri,
                     auth_state=dict(_CONNECTOR_AUTH),
                 )
             )
@@ -999,53 +589,51 @@ class TestSharedConnectorTargets:
             with pytest.raises(
                 ConflictError, match=f"has {len(visible_indexes)} watch tasks"
             ) as exc_info:
-                await manager.get_task_by_uri(to_uri, TEST_ACCOUNT_ID, user_id, role)
+                await watch_manager.get_task_by_uri(to_uri, TEST_ACCOUNT_ID, user_id, role)
             for index, task in enumerate(tasks):
                 assert (task.task_id in str(exc_info.value)) == (index in visible_indexes)
         else:
-            task = await manager.get_task_by_uri(to_uri, TEST_ACCOUNT_ID, user_id, role)
-            assert task is (tasks[visible_indexes[0]] if visible_indexes else None)
+            task = await watch_manager.get_task_by_uri(to_uri, TEST_ACCOUNT_ID, user_id, role)
+            expected = tasks[visible_indexes[0]].task_id if visible_indexes else None
+            assert (task.task_id if task else None) == expected
 
     @pytest.mark.asyncio
-    async def test_connector_watches_coexist_and_native_is_refused(
-        self, watch_manager: WatchManager
-    ):
+    async def test_connector_watches_coexist_and_native_is_refused(self, watch_manager):
         to_uri = "viking://resources/shared"
-        first = await watch_manager.create_task(
-            path="tos://bucket/a/",
-            to_uri=to_uri,
-            watch_interval=5,
-            auth_state=dict(_CONNECTOR_AUTH),
+        first = await _create(
+            watch_manager, to_uri, path="tos://bucket/a/", auth_state=dict(_CONNECTOR_AUTH)
         )
-        second = await watch_manager.create_task(
-            path="tos://bucket/b/",
-            to_uri=to_uri,
-            watch_interval=5,
-            auth_state=dict(_CONNECTOR_AUTH),
+        second = await _create(
+            watch_manager, to_uri, path="tos://bucket/b/", auth_state=dict(_CONNECTOR_AUTH)
         )
         assert first.task_id != second.task_id
 
         with pytest.raises(ConflictError, match="already being monitored"):
-            await watch_manager.create_task(path="/local/doc", to_uri=to_uri, watch_interval=5)
+            await _create(watch_manager, to_uri, path="/local/doc")
 
-        # Removing one Connector watch keeps the other addressable by URI again.
-        await watch_manager.delete_task(
-            first.task_id, account_id="default", user_id="default", role="user"
-        )
-        remaining = await watch_manager.get_task_by_uri(
-            to_uri, account_id="default", user_id="default", role="user"
-        )
-        assert remaining is not None
+        await watch_manager.delete_task(first.task_id, "default", "default", "user")
+        remaining = await watch_manager.get_task_by_uri(to_uri, "default", "default", "user")
         assert remaining.task_id == second.task_id
 
     @pytest.mark.asyncio
     async def test_native_watch_blocks_connector_watch(self, watch_manager: WatchManager):
         to_uri = "viking://resources/native"
-        await watch_manager.create_task(path="/local/doc", to_uri=to_uri, watch_interval=5)
+        await _create(watch_manager, to_uri, path="/local/doc")
         with pytest.raises(ConflictError, match="already being monitored"):
-            await watch_manager.create_task(
-                path="tos://bucket/a/",
-                to_uri=to_uri,
-                watch_interval=5,
-                auth_state=dict(_CONNECTOR_AUTH),
+            await _create(
+                watch_manager, to_uri, path="tos://bucket/a/", auth_state=dict(_CONNECTOR_AUTH)
             )
+
+    @pytest.mark.asyncio
+    async def test_connector_rewrite_may_land_on_connector_target(self, watch_manager):
+        auth = dict(_CONNECTOR_AUTH)
+        await _create(watch_manager, "viking://resources/target", path="tos://a/", auth_state=auth)
+        moving = await _create(
+            watch_manager, "viking://resources/source", path="tos://b/", auth_state=auth
+        )
+
+        await watch_manager.rewrite_target_prefix_internal(
+            "viking://resources/source", "viking://resources/target", TEST_ACCOUNT_ID
+        )
+
+        assert (await watch_manager.get_task(moving.task_id)).to_uri == "viking://resources/target"

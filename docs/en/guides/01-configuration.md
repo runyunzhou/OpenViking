@@ -1292,6 +1292,7 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 | `agfs` | object | RAGFS (Rust-based AGFS) configuration | {} |
 | `vectordb` | object | Vector database storage configuration | {} |
 | `task_store` | object | Durable Task/Work backend configuration | `{"provider":"file"}` |
+| `watch_store` | object | Watch store: `file` (single node) or `mysql` (shared) | `{"provider":"file"}` |
 
 
 ```json
@@ -1343,6 +1344,57 @@ Task finalization, and execution-event updates commit in one database
 transaction. `task_id` is globally unique; `account_id` and `user_id` scope
 authorization and queries. Do not use the FileStore tables and MySQL tables as
 active writers for the same deployment.
+
+#### watch_store
+
+The default `file` provider keeps Watch tasks in the internal control file
+`viking://resources/.watch_tasks.json`, as earlier releases did; it belongs to
+a single OpenViking process. Nodes that share data must use `mysql`: install
+`openviking[mysql]`, provision `openviking/service/sql/001_watch_tasks.sql`, and
+use the cache PathLock provider (`storage.agfs.pathlock.provider="cache"`) and
+the MySQL Task store. MySQL `params` take the same connection fields as
+`task_store`; `params.table` defaults to `ov_watch_tasks` and also names the
+`{table}_leader` lease table. `params.credential_encryption_key` is required:
+a base64-encoded 32-byte key used to store each Watch's private `auth_state`
+(source tokens) and `connector_states` AES-GCM encrypted, bound to the task ID.
+Every node needs the same key, and changing it makes existing Watch
+credentials unreadable. In `file` mode this state is protected by VikingFS
+file encryption, as before.
+
+```json
+{
+  "storage": {
+    "watch_store": {
+      "provider": "mysql",
+      "params": {
+        "user": "openviking",
+        "password": "change-me",
+        "database": "openviking",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "table": "ov_watch_tasks",
+        "credential_encryption_key": "base64-encoded-32-byte-key"
+      }
+    }
+  }
+}
+```
+
+Every node serves the Watch API. Nodes with `enable_watch_scheduler=true`
+compete for a leader lease in the store; the leader polls due Watches every 15
+seconds and settles finished runs. A run is the ingestion Task itself: the
+Watch row records its Task ID while the run occupies the target, and the run
+starts only while the target's Tree PathLock is held. A run whose Task is still
+missing after 10 minutes is settled as an error; a run longer than 3 hours is
+cancelled and settled as failed.
+
+`mv`, `cp`, `rm`, and `mkdir` on a path overlapping an occupied Watch target
+wait up to 10 seconds and then fail with a retryable busy error.
+
+To move from `file` to `mysql`, export `viking://resources/.watch_tasks.json`,
+stop the servers, and import it with
+`python scripts/maintenance/import_watch_tasks.py --input watch_tasks.json --config ov.conf`
+using the configuration that selects `mysql`.
 
 #### agfs (RAGFS)
 
