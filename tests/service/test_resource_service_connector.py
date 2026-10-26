@@ -21,7 +21,11 @@ from openviking.resource.watch_store_file import FileWatchStore
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
 from openviking.service.resource_service import ResourceService
-from openviking.service.task_store import PersistentTaskStore
+from openviking.service.task_store import (
+    PersistentTaskStore,
+    StoreOperationCode,
+    StoreOperationResult,
+)
 from openviking.service.task_tracker import TaskTracker
 from openviking.storage.queuefs.add_resource_msg import AddResourceMsg, AddResourcePhase
 from openviking.storage.viking_fs import VikingFS
@@ -2442,6 +2446,49 @@ async def test_monitor_returns_external_connector_stream_states(
 
     assert outcome["connector_states"] == states
     on_success.assert_awaited_once_with(states)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code", [StoreOperationCode.ALREADY_TERMINAL, StoreOperationCode.NOT_FOUND]
+)
+async def test_monitor_stops_once_another_party_ends_its_task(
+    monkeypatch,
+    connector_config,
+    ctx,
+    code,
+):
+    tracker = _task_tracker()
+    tracker.patch_task = AsyncMock(return_value=StoreOperationResult.rejected(code))
+    monkeypatch.setattr(
+        "openviking.service.task_tracker.get_task_tracker",
+        lambda: tracker,
+    )
+
+    async def no_sleep(_seconds):
+        pass
+
+    monkeypatch.setattr(connector_delegate_module.asyncio, "sleep", no_sleep)
+    client = SimpleNamespace(get_task_info=AsyncMock(return_value={"Status": "succeeded"}))
+    on_success = AsyncMock()
+
+    outcome = await ResourceService()._connector._monitor(
+        client=client,
+        connector_task_key="connector-1",
+        ov_task_id="task-1",
+        poll_interval_ms=1,
+        timeout_seconds=1,
+        ctx=ctx,
+        reason="linked",
+        link_root_uri="viking://resources/docs",
+        on_success=on_success,
+    )
+
+    assert outcome["status"] == "failed"
+    client.get_task_info.assert_awaited_once()
+    on_success.assert_not_awaited()
+    tracker.complete.assert_not_awaited()
+    tracker.fail.assert_not_awaited()
 
 
 @pytest.mark.asyncio

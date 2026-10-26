@@ -413,9 +413,12 @@ class DeletionService:
             try:
                 await tracker.cancel(task.task_id, **owner)
             except ValueError:
-                # Some system work cannot be cancelled. Wait for its owner to
+                if task.task_type == "connector_import":
+                    # The import runs in the remote Connector service, which
+                    # cannot be stopped; failing the Task ends local monitoring.
+                    await tracker.fail(task.task_id, "Identity deleted", **owner)
+                # Other system work cannot be cancelled. Wait for its owner to
                 # finish instead of deleting the data underneath it.
-                pass
         for task in active:
             remaining = deadline - time.monotonic()
             if remaining <= 0:

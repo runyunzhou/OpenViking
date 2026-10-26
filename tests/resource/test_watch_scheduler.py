@@ -494,6 +494,27 @@ class TestSweep:
         assert await state_of(scheduler, idle.task_id) is None
 
     @pytest.mark.asyncio
+    async def test_delete_tasks_fails_a_run_task_that_cannot_be_cancelled(
+        self, make_scheduler, service, tracker
+    ):
+        scheduler = await make_scheduler(service)
+        task = await create_watch(scheduler, due=False, auth_state=CONNECTOR_AUTH)
+        await _occupy(scheduler, task, "connector-run")
+        tracker.put("connector-run")
+        tracker.cancel = AsyncMock(side_effect=ValueError("not cancellable"))
+
+        async def fail(task_id, error, *, account_id, user_id):
+            tracker.put(task_id, "failed", error=error)
+
+        tracker.fail = AsyncMock(side_effect=fail)
+
+        await scheduler.delete_tasks("default", "default")
+
+        tracker.fail.assert_awaited_once()
+        assert tracker.records["connector-run"].status.value == "failed"
+        assert await state_of(scheduler, task.task_id) is None
+
+    @pytest.mark.asyncio
     async def test_delete_tasks_stops_local_submissions_before_their_task(
         self, make_scheduler, service, tracker
     ):

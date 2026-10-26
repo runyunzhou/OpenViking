@@ -621,11 +621,33 @@ class WatchScheduler:
             task, run_id = state.task, state.current_run_id
             record = await tracker.get(run_id, account_id=task.account_id, user_id=task.user_id)
             if record is not None and not record.is_terminal():
-                await self._cancel_run_task(tracker, task, run_id)
+                await self._stop_run_task(tracker, task, run_id)
             await self._watch_manager.finish_run(
                 task.task_id,
                 run_id,
                 WatchRunResult(status="cancelled", execution_task_id=run_id),
+            )
+
+    @staticmethod
+    async def _stop_run_task(tracker: Any, task: WatchTask, run_id: str) -> None:
+        """Cancel the run's Task, or fail one that cannot be cancelled.
+
+        A Connector import runs remotely and cannot be cancelled; failing its
+        Task ends local monitoring, so identity cleanup need not wait for it.
+        """
+        owner = {"account_id": task.account_id, "user_id": task.user_id}
+        try:
+            await tracker.cancel(run_id, **owner)
+        except ValueError:
+            try:
+                await tracker.fail(run_id, "Watch deleted", **owner)
+            except Exception:
+                logger.exception(
+                    "[WatchScheduler] Failed to stop Task %s of Watch %s", run_id, task.task_id
+                )
+        except Exception:
+            logger.exception(
+                "[WatchScheduler] Failed to cancel Task %s of Watch %s", run_id, task.task_id
             )
 
     @staticmethod
