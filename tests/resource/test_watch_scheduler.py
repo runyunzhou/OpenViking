@@ -18,6 +18,7 @@ from openviking.resource.feishu_watch_auth import (
 from openviking.resource.git_watch_auth import create_git_http_auth_state
 from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.resource.watch_store_file import FileWatchStore
+from openviking.resource.watch_types import WatchClaim
 from openviking.utils.git_auth import GIT_AUTH_FAILED, GitHttpAuthConfig
 from openviking_cli.exceptions import OpenVikingError
 from tests.utils.watch_fixtures import shape_watch
@@ -422,9 +423,44 @@ class TestSweep:
         assert state.current_run_id is None
         assert state.task.last_status == "error"
         assert state.task.next_execution_time is not None
+        claim = WatchClaim(task_id=task.task_id, run_id="lost-run", task=task)
+        assert not await scheduler._admits(claim)
 
     @pytest.mark.asyncio
-    async def test_overdue_run_is_cancelled_and_failed(self, make_scheduler, service, tracker):
+    async def test_missing_task_sweep_keeps_a_task_created_before_its_fence(
+        self, make_scheduler, service, tracker
+    ):
+        scheduler = await make_scheduler(service, task_missing_grace=0.1)
+        task = await create_watch(scheduler, due=False)
+        await _occupy(scheduler, task, "slow-submit")
+        claim = WatchClaim(task_id=task.task_id, run_id="slow-submit", task=task)
+        assert await scheduler._admits(claim)
+        await asyncio.sleep(0.2)
+        lookups = 0
+        lookup = tracker.get
+
+        async def created_before_fence_was_read(task_id, **kwargs):
+            nonlocal lookups
+            lookups += 1
+            if lookups == 2:
+                tracker.put(task_id)
+            return await lookup(task_id, **kwargs)
+
+        tracker.get = created_before_fence_was_read
+        await scheduler.sweep()
+
+        assert (await state_of(scheduler, task.task_id)).current_run_id == "slow-submit"
+        assert not await scheduler._admits(claim)
+        tracker.put("slow-submit", "completed")
+        await scheduler.sweep()
+        state = await state_of(scheduler, task.task_id)
+        assert state.current_run_id is None
+        assert state.task.last_status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_overdue_run_stays_occupied_until_its_task_stops(
+        self, make_scheduler, service, tracker
+    ):
         scheduler = await make_scheduler(service, run_timeout=0.2)
         task = await create_watch(scheduler, due=False)
         await _occupy(scheduler, task, "slow-run")
@@ -436,12 +472,14 @@ class TestSweep:
         await scheduler.sweep()
 
         assert tracker.cancelled == ["slow-run"]
+        assert (await state_of(scheduler, task.task_id)).current_run_id == "slow-run"
+        await scheduler.sweep()
         state = await state_of(scheduler, task.task_id)
         assert state.current_run_id is None
-        assert "timed out" in state.task.last_error
+        assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_overdue_run_settles_when_its_task_cannot_be_cancelled(
+    async def test_overdue_run_whose_task_cannot_be_cancelled_keeps_its_target(
         self, make_scheduler, service, tracker, monkeypatch
     ):
         logger = Mock()
@@ -454,9 +492,15 @@ class TestSweep:
         await asyncio.sleep(0.2)
 
         await scheduler.sweep()
+        await scheduler.sweep()
 
+        assert tracker.cancel.await_count == 1
         assert "Failed to cancel Task" in logger.exception.call_args.args[0]
+        assert (await state_of(scheduler, task.task_id)).current_run_id == "connector-run"
+        tracker.put("connector-run", "completed")
+        await scheduler.sweep()
         assert (await state_of(scheduler, task.task_id)).current_run_id is None
+        assert scheduler._cancel_requested == set()
 
     @pytest.mark.asyncio
     async def test_settle_ignores_stale_runs(self, make_scheduler, service, tracker):
@@ -485,6 +529,8 @@ class TestSweep:
         assert tracker.cancelled == ["run-1"]
         assert await state_of(scheduler, busy.task_id) is None
         assert await state_of(scheduler, idle.task_id) is None
+        claim = WatchClaim(task_id=busy.task_id, run_id="run-1", task=busy)
+        assert not await scheduler._admits(claim)
 
     @pytest.mark.asyncio
     async def test_delete_tasks_stops_local_submissions_before_their_task(

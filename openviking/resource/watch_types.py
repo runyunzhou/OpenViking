@@ -219,6 +219,7 @@ class WatchState:
     run_started_at: Optional[float]
     deleted: bool
     now: float
+    run_fenced: bool = False
 
     @property
     def enabled(self) -> bool:

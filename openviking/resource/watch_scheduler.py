@@ -10,6 +10,11 @@ Leadership only avoids duplicated polling. Exclusion comes from the claim:
 the target's Tree PathLock is held while ``current_run_id`` is set by a
 compare-and-set, and the run ID is the ingestion Task ID, so a run is
 submitted, observed and settled by that ID from any node.
+
+Occupancy is released only once the run's Task is terminal, or once it is
+certain the Task will never exist: a submission may create its Task only
+while its row is still occupied by it, not deleted and not fenced, and
+whoever releases a run without a Task first fences or deletes the row.
 """
 
 import asyncio
@@ -41,7 +46,8 @@ from openviking.resource.watch_types import (
 )
 from openviking.server.error_mapping import is_not_found_error
 from openviking.server.identity import RequestContext, Role
-from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_domain import TaskStatus
+from openviking.service.task_tracker import get_task_tracker, task_admission
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.errors import LockAcquisitionError
 from openviking.utils.git_auth import GIT_AUTH_FAILED
@@ -55,8 +61,8 @@ class WatchScheduler:
     POLL_INTERVAL = 15.0
     LEADER_TTL = 45.0
     DUE_BATCH = 100
-    # Covers the longest submission before its Task exists (a native import
-    # parses the source first); only a crashed submitter ever reaches it.
+    # A live submission past this is fenced off: it can no longer create its
+    # Task, so releasing it never leaves a running Task unprotected.
     TASK_MISSING_GRACE = 60 * 60.0
     RUN_TIMEOUT = 3 * 60 * 60.0
 
@@ -97,6 +103,7 @@ class WatchScheduler:
         self._loop_task: Optional[asyncio.Task] = None
         self._background: Set[asyncio.Task] = set()
         self._submissions: Dict[str, asyncio.Task] = {}
+        self._cancel_requested: Set[str] = set()
         self._dispatching = 0
 
     @property
@@ -265,7 +272,8 @@ class WatchScheduler:
         self._submissions[claim.run_id] = asyncio.current_task()
         try:
             async with self._slots:
-                result = await self._submit_resource(claim)
+                with task_admission(claim.run_id, lambda: self._admits(claim)):
+                    result = await self._submit_resource(claim)
         except asyncio.CancelledError:
             await run_to_completion(
                 lambda: self._finish_unsubmitted(
@@ -302,16 +310,30 @@ class WatchScheduler:
             )
         )
 
+    async def _admits(self, claim: WatchClaim) -> bool:
+        state = await self._store.get_state(claim.task_id)
+        return (
+            state is not None
+            and state.current_run_id == claim.run_id
+            and not state.deleted
+            and not state.run_fenced
+        )
+
     async def _finish_unsubmitted(self, claim: WatchClaim, result: WatchRunResult) -> bool:
         """Settle a run whose Task was never committed; False when the Task exists."""
-        task = claim.task
+        return await self._release_without_task(claim.task, claim.run_id, result)
+
+    async def _release_without_task(
+        self, task: WatchTask, run_id: str, result: WatchRunResult
+    ) -> bool:
+        if not await self._store.fence_run(task.task_id, run_id):
+            return False
         record = await get_task_tracker().get(
-            claim.run_id, account_id=task.account_id, user_id=task.user_id
+            run_id, account_id=task.account_id, user_id=task.user_id
         )
         if record is not None:
             return False
-        await self._watch_manager.finish_run(claim.task_id, claim.run_id, result)
-        return True
+        return await self._watch_manager.finish_run(task.task_id, run_id, result)
 
     async def _submit_resource(self, claim: WatchClaim) -> Optional[dict[str, Any]]:
         task = claim.task
@@ -492,9 +514,11 @@ class WatchScheduler:
         """Settle finished runs and force-settle missing or timed-out ones."""
         tracker = get_task_tracker()
         after = ""
+        seen: Set[str] = set()
         while True:
             page = await self._store.running(after=after, limit=self.DUE_BATCH)
             for state in page:
+                seen.add(state.current_run_id or "")
                 try:
                     await self._sweep_one(tracker, state)
                 except asyncio.CancelledError:
@@ -504,6 +528,7 @@ class WatchScheduler:
                         "[WatchScheduler] Sweep failed for Watch %s", state.task.task_id
                     )
             if len(page) < self.DUE_BATCH:
+                self._cancel_requested &= seen
                 return
             after = page[-1].task.task_id
 
@@ -513,8 +538,8 @@ class WatchScheduler:
         record = await tracker.get(run_id, account_id=task.account_id, user_id=task.user_id)
         if record is None:
             if age > self._task_missing_grace:
-                await self._watch_manager.finish_run(
-                    task.task_id,
+                await self._release_without_task(
+                    task,
                     run_id,
                     WatchRunResult(
                         status="error",
@@ -524,27 +549,33 @@ class WatchScheduler:
                 )
             return
         if record.is_terminal():
+            self._cancel_requested.discard(run_id)
             await self.settle(task.task_id, run_id)
             return
-        if age > self._run_timeout:
-            await self._cancel_run_task(tracker, task, run_id)
-            await self._watch_manager.finish_run(
+        # A timed-out run keeps its occupancy until its Task stops: a Task that
+        # cannot be cancelled (a connector import) still writes to the target.
+        if (
+            age > self._run_timeout
+            and record.status.value != TaskStatus.CANCELLING.value
+            and run_id not in self._cancel_requested
+        ):
+            self._cancel_requested.add(run_id)
+            logger.warning(
+                "[WatchScheduler] Watch %s run %s exceeded %gs; cancelling its Task",
                 task.task_id,
                 run_id,
-                WatchRunResult(
-                    status="failed",
-                    execution_task_id=run_id,
-                    error=f"Watch run timed out after {self._run_timeout:g}s",
-                ),
+                self._run_timeout,
             )
+            await self._cancel_run_task(tracker, task, run_id)
 
     async def delete_tasks(self, account_id: str, user_id: Optional[str] = None) -> None:
         """Remove an identity's Watches and release the runs they still occupy.
 
-        Local submissions are cancelled and awaited first, so none of them
-        commits a Task after identity cleanup has listed the Tasks to cancel.
-        A submission on another node is refused by the Task tracker's deletion
-        guard instead.
+        Rows are tombstoned before their Tasks are looked up, and a submission
+        may only create its Task while its row is not deleted, so a Task
+        created by a submission on any node is either found here or withdrawn
+        by its creator, also after the rows are purged. Local submissions are
+        cancelled and awaited first so they stop promptly.
         """
         tracker = get_task_tracker()
         states = await self._store.delete_tasks(account_id, user_id)

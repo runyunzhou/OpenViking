@@ -191,6 +191,7 @@ def watch_tables(table: str, metadata: Optional[MetaData] = None) -> tuple[Table
         Column("next_run_at", Float, nullable=True),
         Column("current_run_id", key, nullable=True),
         Column("run_started_at", Float, nullable=True),
+        Column("run_fenced", Boolean, nullable=False, default=False),
         Column("last_execution_time", Float, nullable=True),
         Column("last_task_id", key, nullable=True),
         Column("last_status", String(64), nullable=True),
@@ -329,6 +330,7 @@ class MySQLWatchStore(WatchStore):
             run_started_at=row["run_started_at"],
             deleted=bool(row["deleted"]),
             now=float(row["db_now"]),
+            run_fenced=bool(row["run_fenced"]),
         )
 
     def _select_state(self) -> Any:
@@ -661,6 +663,7 @@ class MySQLWatchStore(WatchStore):
                     .values(
                         current_run_id=run_id,
                         run_started_at=db_now(),
+                        run_fenced=False,
                         updated_at=db_now(),
                     )
                 )
@@ -691,6 +694,7 @@ class MySQLWatchStore(WatchStore):
             "last_error": result.error,
             "current_run_id": None,
             "run_started_at": None,
+            "run_fenced": False,
             "updated_at": now,
         }
         if result.deactivate:
@@ -714,6 +718,21 @@ class MySQLWatchStore(WatchStore):
             if changed:
                 await self._purge(session, [task_id])
             return bool(changed)
+
+    async def fence_run(self, task_id: str, run_id: str) -> bool:
+        """Stop admitting Task creation for *run_id* while it keeps occupying the row."""
+        c = self._tasks.c
+        async with self._transaction() as session:
+            await session.execute(
+                update(self._tasks)
+                .where(self._scope, c.task_id == task_id, c.current_run_id == run_id)
+                .values(run_fenced=True)
+            )
+            rows = await self._rows(
+                session,
+                select(c.current_run_id).where(self._scope, c.task_id == task_id),
+            )
+            return bool(rows) and rows[0]["current_run_id"] == run_id
 
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:
         """Disable an idle Watch that still targets *target_uri* without starting a run."""

@@ -105,6 +105,28 @@ class _WaitBudget:
 _wait_budget: ContextVar[Optional[_WaitBudget]] = ContextVar("task_wait_budget", default=None)
 
 
+_admission: ContextVar[Optional[tuple[str, Callable[[], Awaitable[bool]]]]] = ContextVar(
+    "task_admission", default=None
+)
+
+
+@contextmanager
+def task_admission(
+    task_id: str, admitted: Callable[[], Awaitable[bool]]
+) -> Generator[None, None, None]:
+    """Create *task_id* within this context only while *admitted* holds.
+
+    create checks before the insert and again after it, withdrawing the Task
+    when the second check fails. A revoker that records its decision and then
+    looks the Task up therefore either finds it or is guaranteed it never runs.
+    """
+    token = _admission.set((task_id, admitted))
+    try:
+        yield
+    finally:
+        _admission.reset(token)
+
+
 @contextmanager
 def _consume_wait_budget(
     task_id: str, timeout: Optional[float]
@@ -458,8 +480,12 @@ class TaskTracker:
             existing = await self.get(task_id, account_id=account_id, user_id=user_id)
             if existing is not None:
                 return existing
+        admission = _admission.get()
+        admitted = admission[1] if admission and admission[0] == task_id else None
         if await self._owner_deleting(account_id, user_id):
             raise FailedPreconditionError("Identity deletion is in progress")
+        if admitted is not None and not await admitted():
+            raise FailedPreconditionError("Task creation is no longer admitted")
         task = TaskRecord(
             task_id=task_id or str(uuid4()),
             task_type=task_type,
@@ -476,6 +502,9 @@ class TaskTracker:
         if await self._owner_deleting(account_id, user_id):
             await run_to_completion(lambda: self._withdraw(created))
             raise FailedPreconditionError("Identity deletion is in progress")
+        if admitted is not None and not await admitted():
+            await run_to_completion(lambda: self._withdraw(created))
+            raise FailedPreconditionError("Task creation is no longer admitted")
         return created
 
     async def create_if_no_running(

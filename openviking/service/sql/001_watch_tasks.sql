@@ -18,6 +18,7 @@ CREATE TABLE `ov_watch_tasks` (
     next_run_at DOUBLE NULL,
     current_run_id VARCHAR(255) COLLATE utf8mb4_bin NULL,
     run_started_at DOUBLE NULL,
+    run_fenced BOOLEAN NOT NULL DEFAULT 0,
     last_execution_time DOUBLE NULL,
     last_task_id VARCHAR(255) COLLATE utf8mb4_bin NULL,
     last_status VARCHAR(64) COLLATE ascii_bin NULL,

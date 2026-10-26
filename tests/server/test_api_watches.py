@@ -8,6 +8,8 @@ import asyncio
 import httpx
 import pytest
 
+from openviking.resource.watch_types import WatchRunResult
+
 
 @pytest.fixture
 def watch_manager(service):
@@ -121,11 +123,11 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
 
 async def test_list_exposes_last_execution_result(client: httpx.AsyncClient, watch_manager):
     task = await _seed(watch_manager, to_uri="viking://resources/test/observable")
-    await watch_manager.record_execution(
+    claim = await watch_manager.store.claim(task.task_id, target_uri=task.to_uri, manual=True)
+    await watch_manager.finish_run(
         task.task_id,
-        status="failed",
-        execution_task_id="connector-task-1",
-        error="pull failed",
+        claim.run_id,
+        WatchRunResult(status="failed", execution_task_id="connector-task-1", error="pull failed"),
     )
 
     resp = await client.get("/api/v1/watches")

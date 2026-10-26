@@ -59,6 +59,8 @@ class _Row:
     current_run_id: Optional[str] = None
     run_started_at: Optional[float] = None
     deleted: bool = False
+    # In-process only: submitters do not survive a restart.
+    run_fenced: bool = False
 
     def to_storage_dict(self) -> dict[str, Any]:
         data = self.task.to_storage_dict()
@@ -282,6 +284,7 @@ class FileWatchStore(WatchStore):
             run_started_at=row.run_started_at,
             deleted=row.deleted,
             now=now,
+            run_fenced=row.run_fenced,
         )
 
     def _on_target(self, account_id: str, uri: Optional[str]) -> list[_Row]:
@@ -495,7 +498,9 @@ class FileWatchStore(WatchStore):
             ):
                 return None
             run_id = str(uuid.uuid4())
-            claimed = replace(row, current_run_id=run_id, run_started_at=now.timestamp())
+            claimed = replace(
+                row, current_run_id=run_id, run_started_at=now.timestamp(), run_fenced=False
+            )
             await self._commit({task_id: claimed}, persist=False)
             return WatchClaim(task_id=task_id, run_id=run_id, task=row.task)
 
@@ -523,9 +528,23 @@ class FileWatchStore(WatchStore):
             if result.has_connector_states:
                 changes["connector_states"] = result.connector_states
             settled = replace(
-                row, task=_changed(task, **changes), current_run_id=None, run_started_at=None
+                row,
+                task=_changed(task, **changes),
+                current_run_id=None,
+                run_started_at=None,
+                run_fenced=False,
             )
             await self._commit({task_id: self._settled(settled)})
+            return True
+
+    async def fence_run(self, task_id: str, run_id: str) -> bool:
+        self._require_initialized()
+        async with self._lock:
+            row = self._rows.get(task_id)
+            if row is None or row.current_run_id != run_id:
+                return False
+            if not row.run_fenced:
+                await self._commit({task_id: replace(row, run_fenced=True)}, persist=False)
             return True
 
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:

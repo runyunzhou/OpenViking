@@ -136,6 +136,15 @@ class WatchStore(ABC):
         """Release occupancy and record the outcome iff *run_id* still occupies the row."""
 
     @abstractmethod
+    async def fence_run(self, task_id: str, run_id: str) -> bool:
+        """Stop admitting Task creation for *run_id*; whether it still occupies the row.
+
+        Occupancy is kept: whoever releases it must first fence, then re-check
+        that the run created no Task, so a concurrent creator that inserted
+        its Task before the fence is never left unprotected.
+        """
+
+    @abstractmethod
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:
         """Disable an idle Watch that still targets *target_uri* without starting a run."""
 

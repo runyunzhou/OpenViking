@@ -29,6 +29,7 @@ from openviking.service.task_tracker import (
     get_task_tracker,
     run_tracked_operation,
     set_task_tracker,
+    task_admission,
 )
 from openviking.service.task_work_index import get_task_context
 from openviking_cli.exceptions import DeadlineExceededError, FailedPreconditionError
@@ -216,6 +217,39 @@ async def test_deletion_fenced_during_insert_withdraws_the_task(tracker: TaskTra
     with pytest.raises(FailedPreconditionError):
         await tracker.create("connector_import", task_id="late", **_owner_kwargs())
     assert await tracker.get("late", **_owner_kwargs()) is None
+
+
+async def test_admission_gates_only_its_own_task_id(tracker: TaskTracker):
+    async def refused():
+        return False
+
+    with task_admission("run-1", refused):
+        with pytest.raises(FailedPreconditionError):
+            await tracker.create("add_resource", task_id="run-1", **_owner_kwargs())
+        assert await tracker.create("add_resource", task_id="other", **_owner_kwargs())
+    assert await tracker.get("run-1", **_owner_kwargs()) is None
+    assert await tracker.create("add_resource", task_id="run-1", **_owner_kwargs())
+
+
+async def test_admission_revoked_during_insert_withdraws_the_task(tracker: TaskTracker):
+    admitted = True
+    store_create = tracker._store.create
+
+    async def check():
+        return admitted
+
+    async def create_after_revocation(task, **kwargs):
+        # The revoker records its decision and finds no Task before this lands.
+        nonlocal admitted
+        admitted = False
+        assert await tracker.get(task.task_id, **_owner_kwargs()) is None
+        return await store_create(task, **kwargs)
+
+    tracker._store.create = create_after_revocation
+    with task_admission("run-1", check):
+        with pytest.raises(FailedPreconditionError):
+            await tracker.create("connector_import", task_id="run-1", **_owner_kwargs())
+    assert await tracker.get("run-1", **_owner_kwargs()) is None
 
 
 async def test_start_task(tracker: TaskTracker):
