@@ -4,19 +4,21 @@
 
 import asyncio
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 
 from openviking.resource.watch_manager import WatchManager
 from openviking.resource.watch_store_file import FileWatchStore
-from openviking.resource.watch_types import WatchRunResult
+from openviking.resource.watch_types import WatchAuthority, WatchRunResult
 from openviking.storage.errors import ResourceBusyError
-from openviking_cli.exceptions import ConflictError
+from openviking_cli.exceptions import ConflictError, FailedPreconditionError
 
 TEST_ACCOUNT_ID = "default"
 TEST_USER_ID = "default"
 TEST_ROLE = "ROOT"
 _CONNECTOR_AUTH = {"provider": "connector_encrypted", "ciphertext": "unused"}
+_ROOT = WatchAuthority(TEST_ACCOUNT_ID, TEST_USER_ID, "root")
 
 
 async def _create(manager: WatchManager, uri: str = "viking://resources/test", **kwargs):
@@ -38,6 +40,31 @@ class TestWatchManager:
         values = {"path": "/test/path", "to_uri": "viking://resources/test", **kwargs}
         with pytest.raises(ValueError, match=message):
             await watch_manager.create_task(**values)
+
+    @pytest.mark.asyncio
+    async def test_create_is_refused_while_its_identity_is_deleted(
+        self, watch_manager: WatchManager
+    ):
+        watch_manager.set_deletion_guard(AsyncMock(return_value=True))
+
+        with pytest.raises(FailedPreconditionError):
+            await _create(watch_manager)
+
+        assert await watch_manager.store.list_tasks(_ROOT) == []
+
+    @pytest.mark.asyncio
+    async def test_create_withdraws_a_watch_fenced_during_its_insert(
+        self, watch_manager: WatchManager
+    ):
+        # The deletion fences the identity and removes its Watches between the
+        # check and the insert, so only the creator can still remove this one.
+        watch_manager.set_deletion_guard(AsyncMock(side_effect=[False, True]))
+
+        with pytest.raises(FailedPreconditionError):
+            await _create(watch_manager, initial_run_id="first-run")
+
+        assert await watch_manager.store.list_tasks(_ROOT) == []
+        assert await watch_manager.store.running() == []
 
     @pytest.mark.asyncio
     async def test_create_requires_target_tree_lock(self, watch_manager: WatchManager, watch_vfs):

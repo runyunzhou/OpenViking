@@ -8,9 +8,10 @@ while its target's Tree lock is held; transfers rewrite rows inside their own
 lock and check occupancy there.
 """
 
+import inspect
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import Any, AsyncIterator, Dict, List, Optional, Sequence
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
 from openviking.observability.http_error_context import sanitize_public_http_error
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
@@ -25,7 +26,7 @@ from openviking.resource.watch_types import (
 )
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
-from openviking_cli.exceptions import ConflictError
+from openviking_cli.exceptions import ConflictError, FailedPreconditionError
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.logger import get_logger
 
@@ -85,6 +86,18 @@ class WatchManager:
     def __init__(self, store: WatchStore, locks: WatchPathLocks) -> None:
         self._store = store
         self._locks = locks
+        self._deletion_guard: Optional[Callable[[str, str], Any]] = None
+
+    def set_deletion_guard(self, guard: Optional[Callable[[str, str], Any]]) -> None:
+        """Refuse new Watches for identities the guard reports as being deleted."""
+        self._deletion_guard = guard
+
+    async def _owner_deleting(self, account_id: str, user_id: str) -> bool:
+        guard = self._deletion_guard
+        if guard is None:
+            return False
+        result = guard(account_id, user_id)
+        return bool(await result if inspect.isawaitable(result) else result)
 
     @property
     def store(self) -> WatchStore:
@@ -138,6 +151,10 @@ class WatchManager:
 
         *initial_run_id* registers the caller's ingestion Task as the first
         run. *lease_ref* is a lease the caller already holds on the target.
+
+        Identity deletion records its fence before removing the identity's
+        Watches; this checks the fence again after the insert, so a Watch
+        created concurrently is either removed by the deletion or withdrawn here.
         """
         if not path:
             raise ValueError("Path is required")
@@ -166,11 +183,16 @@ class WatchManager:
             original_role=original_role,
         )
         task.next_execution_time = task.calculate_next_execution_time() if is_active else None
+        if await self._owner_deleting(account_id, user_id):
+            raise FailedPreconditionError("Identity deletion is in progress")
         try:
             async with self._locks.tree(account_id, to_uri, owner_lease_ref=lease_ref):
                 await self._store.create_task(task, initial_run_id=initial_run_id)
         except LockAcquisitionError as exc:
             raise ResourceBusyError("Watch target is being changed", uri=to_uri) from exc
+        if await self._owner_deleting(account_id, user_id):
+            await run_to_completion(lambda: self._withdraw(task, initial_run_id))
+            raise FailedPreconditionError("Identity deletion is in progress")
         logger.info(
             "[WatchManager] Created task %s for path %s by user %s/%s",
             task.task_id,
@@ -179,6 +201,17 @@ class WatchManager:
             user_id,
         )
         return task
+
+    async def _withdraw(self, task: WatchTask, initial_run_id: Optional[str]) -> None:
+        await self._store.delete_task(
+            task.task_id, WatchAuthority(task.account_id, task.user_id, "root")
+        )
+        if initial_run_id:
+            await self._store.finish_run(
+                task.task_id,
+                initial_run_id,
+                WatchRunResult(status="cancelled", error="Identity deletion is in progress"),
+            )
 
     async def update_task(
         self,

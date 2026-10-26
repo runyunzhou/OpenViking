@@ -84,6 +84,9 @@ class DeletionService:
         """Bind the queue consumer and reconcile persisted deletion fences."""
         self._service.viking_fs.set_deletion_guard(self._is_deleting)
         get_task_tracker().set_deletion_guard(self._is_deleting)
+        scheduler = self._service.watch_scheduler
+        if scheduler is not None:
+            scheduler.watch_manager.set_deletion_guard(self._is_deleting)
         queue_manager = self._service._queue_manager
         queue = queue_manager.get_queue(queue_manager.DATA_CLEANUP)
         queued_task_ids = {
