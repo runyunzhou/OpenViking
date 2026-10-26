@@ -479,15 +479,15 @@ class TestSweep:
         assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_overdue_run_whose_task_cannot_be_cancelled_keeps_its_target(
+    async def test_overdue_run_that_does_not_stop_is_released_after_the_cancel_grace(
         self, make_scheduler, service, tracker, monkeypatch
     ):
         logger = Mock()
         monkeypatch.setattr("openviking.resource.watch_scheduler.logger", logger)
-        scheduler = await make_scheduler(service, run_timeout=0.1)
+        scheduler = await make_scheduler(service, run_timeout=0.1, cancel_grace=0.3)
         task = await create_watch(scheduler, due=False)
-        await _occupy(scheduler, task, "connector-run")
-        tracker.put("connector-run")
+        await _occupy(scheduler, task, "stuck-run")
+        tracker.put("stuck-run")
         tracker.cancel = AsyncMock(side_effect=ValueError("not cancellable"))
         await asyncio.sleep(0.2)
 
@@ -496,10 +496,13 @@ class TestSweep:
 
         assert tracker.cancel.await_count == 1
         assert "Failed to cancel Task" in logger.exception.call_args.args[0]
-        assert (await state_of(scheduler, task.task_id)).current_run_id == "connector-run"
-        tracker.put("connector-run", "completed")
+        assert (await state_of(scheduler, task.task_id)).current_run_id == "stuck-run"
+        await asyncio.sleep(0.3)
         await scheduler.sweep()
-        assert (await state_of(scheduler, task.task_id)).current_run_id is None
+        state = await state_of(scheduler, task.task_id)
+        assert state.current_run_id is None
+        assert state.task.last_status == "failed"
+        assert "timed out" in state.task.last_error
         assert scheduler._cancel_requested == set()
 
     @pytest.mark.asyncio

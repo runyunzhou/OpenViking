@@ -65,6 +65,7 @@ class WatchScheduler:
     # Task, so releasing it never leaves a running Task unprotected.
     TASK_MISSING_GRACE = 60 * 60.0
     RUN_TIMEOUT = 3 * 60 * 60.0
+    CANCEL_GRACE = 30 * 60.0
 
     def __init__(
         self,
@@ -79,9 +80,20 @@ class WatchScheduler:
         leader_ttl: float = LEADER_TTL,
         task_missing_grace: float = TASK_MISSING_GRACE,
         run_timeout: float = RUN_TIMEOUT,
+        cancel_grace: float = CANCEL_GRACE,
         locks: Optional[WatchPathLocks] = None,
     ) -> None:
-        if min(max_concurrency, poll_interval, leader_ttl, task_missing_grace, run_timeout) <= 0:
+        if (
+            min(
+                max_concurrency,
+                poll_interval,
+                leader_ttl,
+                task_missing_grace,
+                run_timeout,
+                cancel_grace,
+            )
+            <= 0
+        ):
             raise ValueError("Watch scheduling limits must be positive")
         if leader_ttl <= poll_interval:
             raise ValueError("leader_ttl must exceed poll_interval")
@@ -97,6 +109,7 @@ class WatchScheduler:
         self._leader_ttl = leader_ttl
         self._task_missing_grace = task_missing_grace
         self._run_timeout = run_timeout
+        self._cancel_grace = cancel_grace
         self._owner = str(uuid.uuid4())
         self._epoch: Optional[int] = None
         self._running = False
@@ -552,8 +565,27 @@ class WatchScheduler:
             self._cancel_requested.discard(run_id)
             await self.settle(task.task_id, run_id)
             return
-        # A timed-out run keeps its occupancy until its Task stops: a Task that
-        # cannot be cancelled (a connector import) still writes to the target.
+        if age > self._run_timeout + self._cancel_grace:
+            logger.warning(
+                "[WatchScheduler] Watch %s run %s did not stop %gs after cancellation; "
+                "releasing it",
+                task.task_id,
+                run_id,
+                self._cancel_grace,
+            )
+            self._cancel_requested.discard(run_id)
+            await self._watch_manager.finish_run(
+                task.task_id,
+                run_id,
+                WatchRunResult(
+                    status="failed",
+                    execution_task_id=run_id,
+                    error=f"Watch run timed out after {self._run_timeout:g}s",
+                ),
+            )
+            return
+        # Cancellation is only requested: the run keeps its target until the
+        # Task stops or the cancel grace runs out.
         if (
             age > self._run_timeout
             and record.status.value != TaskStatus.CANCELLING.value
