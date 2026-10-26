@@ -1366,8 +1366,9 @@ task ID 绑定。所有节点必须使用同一密钥，更换密钥会导致已
 所有节点都提供 Watch API。`enable_watch_scheduler=true` 的节点在存储中竞争
 leader 租约；leader 每 15 秒拉取到期的 Watch 并结算已结束的运行。一次运行就是
 对应的 ingestion Task：运行占用目标期间，Watch 行记录该 Task ID，且只有在持有
-目标 Tree PathLock 时才能开始运行。Task 超过 10 分钟仍不存在时按 error 结算；
-运行超过 3 小时会被取消并按 failed 结算。
+目标 Tree PathLock 时才能开始运行。提交在创建 Task 前停止（服务停机、身份删除、
+失败）时立即结算；Task 超过 1 小时仍不存在（仅在所在节点崩溃时发生）时按 error
+结算。运行超过 3 小时会被取消并按 failed 结算。
 
 对与被占用 Watch 目标重叠的路径执行 `mv`、`cp`、`rm`、`mkdir` 时，最多等待
 10 秒，之后返回可重试的 busy 错误。

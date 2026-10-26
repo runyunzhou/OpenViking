@@ -5,7 +5,7 @@
 import asyncio
 from datetime import datetime, timedelta
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -226,6 +226,27 @@ class TestDispatch:
         assert (await state_of(scheduler, task.task_id)).current_run_id is None
 
     @pytest.mark.asyncio
+    async def test_busy_watches_do_not_hold_capacity(self, make_scheduler, service, tracker):
+        service.refresh_resource.return_value = {"status": "completed"}
+        scheduler = await make_scheduler(service, max_concurrency=1)
+        scheduler.DUE_BATCH = 2
+        busy = [await create_watch(scheduler, f"viking://resources/busy{i}") for i in range(3)]
+        free = await create_watch(scheduler, "viking://resources/free")
+        locks = scheduler.watch_manager.locks
+
+        async with (
+            locks.tree("default", busy[0].to_uri),
+            locks.tree("default", busy[1].to_uri),
+            locks.tree("default", busy[2].to_uri),
+        ):
+            assert await scheduler.dispatch_due() == 1
+            await drain(scheduler)
+
+        assert [call.kwargs["to"] for call in service.refresh_resource.await_args_list] == [
+            free.to_uri
+        ]
+
+    @pytest.mark.asyncio
     async def test_dispatch_is_bounded_by_concurrency(self, make_scheduler, service, tracker):
         release = asyncio.Event()
 
@@ -296,6 +317,35 @@ class TestDispatch:
         state = await state_of(scheduler, task.task_id)
         assert state.current_run_id is None
         assert state.task.last_error == "worker failed"
+
+    @pytest.mark.asyncio
+    async def test_stop_settles_submissions_that_have_no_task(
+        self, make_scheduler, service, tracker
+    ):
+        started = asyncio.Event()
+
+        async def refresh(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        service.refresh_resource.side_effect = refresh
+        scheduler = await make_scheduler(service, max_concurrency=1)
+        preparing = await create_watch(scheduler, "viking://resources/preparing")
+        waiting = await create_watch(scheduler, "viking://resources/waiting")
+        assert await scheduler.dispatch_due() == 1
+        assert await scheduler.dispatch_due() == 0
+        await started.wait()
+        manual = asyncio.create_task(scheduler.schedule_task(waiting.task_id))
+        await asyncio.sleep(0.05)
+
+        await scheduler.stop()
+
+        with pytest.raises(asyncio.CancelledError):
+            await manual
+        for task in (preparing, waiting):
+            state = await state_of(scheduler, task.task_id)
+            assert state.current_run_id is None
+            assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
     async def test_missing_target_deactivates_without_refresh(
@@ -391,6 +441,24 @@ class TestSweep:
         assert "timed out" in state.task.last_error
 
     @pytest.mark.asyncio
+    async def test_overdue_run_settles_when_its_task_cannot_be_cancelled(
+        self, make_scheduler, service, tracker, monkeypatch
+    ):
+        logger = Mock()
+        monkeypatch.setattr("openviking.resource.watch_scheduler.logger", logger)
+        scheduler = await make_scheduler(service, run_timeout=0.1)
+        task = await create_watch(scheduler, due=False)
+        await _occupy(scheduler, task, "connector-run")
+        tracker.put("connector-run")
+        tracker.cancel = AsyncMock(side_effect=ValueError("not cancellable"))
+        await asyncio.sleep(0.2)
+
+        await scheduler.sweep()
+
+        assert "Failed to cancel Task" in logger.exception.call_args.args[0]
+        assert (await state_of(scheduler, task.task_id)).current_run_id is None
+
+    @pytest.mark.asyncio
     async def test_settle_ignores_stale_runs(self, make_scheduler, service, tracker):
         scheduler = await make_scheduler(service)
         task = await create_watch(scheduler, due=False)
@@ -417,6 +485,31 @@ class TestSweep:
         assert tracker.cancelled == ["run-1"]
         assert await state_of(scheduler, busy.task_id) is None
         assert await state_of(scheduler, idle.task_id) is None
+
+    @pytest.mark.asyncio
+    async def test_delete_tasks_stops_local_submissions_before_their_task(
+        self, make_scheduler, service, tracker
+    ):
+        preparing, proceed = asyncio.Event(), asyncio.Event()
+
+        async def refresh(**kwargs):
+            preparing.set()
+            await proceed.wait()
+            tracker.put(kwargs["task_id"])
+            return {"status": "queued", "task_id": kwargs["task_id"]}
+
+        service.refresh_resource.side_effect = refresh
+        scheduler = await make_scheduler(service)
+        task = await create_watch(scheduler)
+        assert await scheduler.dispatch_due() == 1
+        await preparing.wait()
+
+        await scheduler.delete_tasks("default", "default")
+        proceed.set()
+        await drain(scheduler)
+
+        assert tracker.records == {}
+        assert await state_of(scheduler, task.task_id) is None
 
 
 class TestRestartRecovery:

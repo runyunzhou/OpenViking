@@ -594,7 +594,7 @@ class MySQLWatchStore(WatchStore):
 
     # ── Run occupancy ───────────────────────────────────────────────────
 
-    async def due(self, limit: int) -> list[WatchState]:
+    async def due(self, limit: int, *, offset: int = 0) -> list[WatchState]:
         c = self._tasks.c
         async with self._transaction() as session:
             rows = await self._rows(
@@ -608,6 +608,7 @@ class MySQLWatchStore(WatchStore):
                     c.current_run_id.is_(None),
                 )
                 .order_by(c.next_run_at, c.task_id)
+                .offset(offset)
                 .limit(limit),
             )
             return [self._state(row) for row in rows]

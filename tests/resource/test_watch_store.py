@@ -348,9 +348,13 @@ async def test_due_orders_and_limits(store):
     await create(store, "viking://resources/later")
 
     due = await store.due(2)
+    rest = await store.due(2, offset=2)
 
     assert len(due) == 2
-    assert {state.task.task_id for state in due} <= {task.task_id for task in tasks}
+    assert [state.task.task_id for state in due + rest] == [
+        state.task.task_id for state in await store.due(10)
+    ]
+    assert {state.task.task_id for state in due + rest} == {task.task_id for task in tasks}
 
 
 @pytest.mark.asyncio

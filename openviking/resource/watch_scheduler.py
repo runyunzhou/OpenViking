@@ -15,7 +15,7 @@ submitted, observed and settled by that ID from any node.
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Any, Optional, Set
+from typing import Any, Dict, Optional, Set
 
 from openviking.connector.auth import is_external_feishu_auth, restore_feishu_request
 from openviking.connector.delegate import ConnectorDelegate
@@ -55,7 +55,9 @@ class WatchScheduler:
     POLL_INTERVAL = 15.0
     LEADER_TTL = 45.0
     DUE_BATCH = 100
-    TASK_MISSING_GRACE = 10 * 60.0
+    # Covers the longest submission before its Task exists (a native import
+    # parses the source first); only a crashed submitter ever reaches it.
+    TASK_MISSING_GRACE = 60 * 60.0
     RUN_TIMEOUT = 3 * 60 * 60.0
 
     def __init__(
@@ -94,6 +96,7 @@ class WatchScheduler:
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
         self._background: Set[asyncio.Task] = set()
+        self._submissions: Dict[str, asyncio.Task] = {}
         self._dispatching = 0
 
     @property
@@ -125,7 +128,11 @@ class WatchScheduler:
         if not self._running:
             return
         self._running = False
-        tasks = [task for task in (self._loop_task, *self._background) if task is not None]
+        tasks = [
+            task
+            for task in (self._loop_task, *self._background, *self._submissions.values())
+            if task is not None
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -179,22 +186,33 @@ class WatchScheduler:
         return self._epoch is not None
 
     async def dispatch_due(self) -> int:
-        """Claim due Watches up to free submission capacity; returns runs started."""
+        """Claim due Watches up to free submission capacity; returns runs started.
+
+        A Watch that cannot be claimed (its target is busy) stays due, so the
+        scan pages past it instead of letting it hold the capacity.
+        """
         capacity = self._max_concurrency - self._dispatching
-        if capacity <= 0:
-            return 0
-        started = 0
-        for state in await self._store.due(min(capacity, self.DUE_BATCH)):
-            try:
-                claim = await self._claim(state.task)
-            except Exception:
-                logger.exception("[WatchScheduler] Failed to claim Watch %s", state.task.task_id)
-                continue
-            if claim is None:
-                continue
-            started += 1
-            self._dispatching += 1
-            self._spawn(self._run(claim))
+        started = skipped = 0
+        while started < capacity:
+            page = await self._store.due(self.DUE_BATCH, offset=skipped)
+            for state in page:
+                if started >= capacity:
+                    break
+                try:
+                    claim = await self._claim(state.task)
+                except Exception:
+                    logger.exception(
+                        "[WatchScheduler] Failed to claim Watch %s", state.task.task_id
+                    )
+                    claim = None
+                if claim is None:
+                    skipped += 1
+                    continue
+                started += 1
+                self._dispatching += 1
+                self._spawn(self._run(claim))
+            if len(page) < self.DUE_BATCH:
+                break
         return started
 
     async def _claim(self, task: WatchTask, *, manual: bool = False) -> Optional[WatchClaim]:
@@ -222,8 +240,7 @@ class WatchScheduler:
 
     async def _run(self, claim: WatchClaim) -> None:
         try:
-            async with self._slots:
-                await self._submit(claim)
+            await self._submit(claim)
         finally:
             self._dispatching -= 1
 
@@ -237,45 +254,38 @@ class WatchScheduler:
         claim = await self._claim(state.task, manual=True)
         if claim is None:
             return False
-        async with self._slots:
-            await self._submit(claim)
+        await self._submit(claim)
         return True
 
     # ── Submission ──────────────────────────────────────────────────────
 
     async def _submit(self, claim: WatchClaim) -> None:
-        tracker = get_task_tracker()
+        """Submit a claimed run, tracked so stop and identity deletion can cancel it."""
         task = claim.task
+        self._submissions[claim.run_id] = asyncio.current_task()
         try:
-            result = await self._submit_resource(claim)
+            async with self._slots:
+                result = await self._submit_resource(claim)
         except asyncio.CancelledError:
+            await run_to_completion(
+                lambda: self._finish_unsubmitted(
+                    claim, WatchRunResult(status="cancelled", error="Watch submission cancelled")
+                )
+            )
             raise
         except Exception as exc:
-            # A failure after the Task was committed leaves it to settle normally.
-            record = await tracker.get(
-                claim.run_id, account_id=task.account_id, user_id=task.user_id
+            failure = WatchRunResult(
+                status="failed",
+                error=str(exc) or type(exc).__name__,
+                deactivate=isinstance(exc, FileNotFoundError)
+                or getattr(exc, "code", None) == GIT_AUTH_FAILED,
             )
-            if record is None:
-                logger.warning(
-                    "[WatchScheduler] Watch %s submission failed: %s",
-                    task.task_id,
-                    exc,
-                )
-                failure = WatchRunResult(
-                    status="failed",
-                    error=str(exc) or type(exc).__name__,
-                    deactivate=isinstance(exc, FileNotFoundError)
-                    or getattr(exc, "code", None) == GIT_AUTH_FAILED,
-                )
-                await run_to_completion(
-                    lambda: self._watch_manager.finish_run(
-                        claim.task_id,
-                        claim.run_id,
-                        failure,
-                    )
-                )
+            if await run_to_completion(lambda: self._finish_unsubmitted(claim, failure)):
+                logger.warning("[WatchScheduler] Watch %s submission failed: %s", task.task_id, exc)
                 return
             result = {"task_id": claim.run_id}
+        finally:
+            self._submissions.pop(claim.run_id, None)
         if result is None:
             return
         if result.get("task_id"):
@@ -291,6 +301,17 @@ class WatchScheduler:
                 self._result(task, status, result, result.get("error")),
             )
         )
+
+    async def _finish_unsubmitted(self, claim: WatchClaim, result: WatchRunResult) -> bool:
+        """Settle a run whose Task was never committed; False when the Task exists."""
+        task = claim.task
+        record = await get_task_tracker().get(
+            claim.run_id, account_id=task.account_id, user_id=task.user_id
+        )
+        if record is not None:
+            return False
+        await self._watch_manager.finish_run(claim.task_id, claim.run_id, result)
+        return True
 
     async def _submit_resource(self, claim: WatchClaim) -> Optional[dict[str, Any]]:
         task = claim.task
@@ -506,10 +527,7 @@ class WatchScheduler:
             await self.settle(task.task_id, run_id)
             return
         if age > self._run_timeout:
-            try:
-                await tracker.cancel(run_id, account_id=task.account_id, user_id=task.user_id)
-            except ValueError:
-                pass
+            await self._cancel_run_task(tracker, task, run_id)
             await self._watch_manager.finish_run(
                 task.task_id,
                 run_id,
@@ -521,18 +539,41 @@ class WatchScheduler:
             )
 
     async def delete_tasks(self, account_id: str, user_id: Optional[str] = None) -> None:
-        """Remove an identity's Watches and release the runs they still occupy."""
+        """Remove an identity's Watches and release the runs they still occupy.
+
+        Local submissions are cancelled and awaited first, so none of them
+        commits a Task after identity cleanup has listed the Tasks to cancel.
+        A submission on another node is refused by the Task tracker's deletion
+        guard instead.
+        """
         tracker = get_task_tracker()
-        for state in await self._store.delete_tasks(account_id, user_id):
+        states = await self._store.delete_tasks(account_id, user_id)
+        local = [
+            submission
+            for state in states
+            if (submission := self._submissions.get(state.current_run_id or "")) is not None
+            and submission is not asyncio.current_task()
+        ]
+        for submission in local:
+            submission.cancel()
+        if local:
+            await asyncio.gather(*local, return_exceptions=True)
+        for state in states:
             task, run_id = state.task, state.current_run_id
             record = await tracker.get(run_id, account_id=task.account_id, user_id=task.user_id)
             if record is not None and not record.is_terminal():
-                try:
-                    await tracker.cancel(run_id, account_id=task.account_id, user_id=task.user_id)
-                except ValueError:
-                    pass
+                await self._cancel_run_task(tracker, task, run_id)
             await self._watch_manager.finish_run(
                 task.task_id,
                 run_id,
                 WatchRunResult(status="cancelled", execution_task_id=run_id),
+            )
+
+    @staticmethod
+    async def _cancel_run_task(tracker: Any, task: WatchTask, run_id: str) -> None:
+        try:
+            await tracker.cancel(run_id, account_id=task.account_id, user_id=task.user_id)
+        except Exception:
+            logger.exception(
+                "[WatchScheduler] Failed to cancel Task %s of Watch %s", run_id, task.task_id
             )

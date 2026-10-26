@@ -453,7 +453,7 @@ class FileWatchStore(WatchStore):
 
     # ── Run occupancy ───────────────────────────────────────────────────
 
-    async def due(self, limit: int) -> list[WatchState]:
+    async def due(self, limit: int, *, offset: int = 0) -> list[WatchState]:
         self._require_initialized()
         async with self._lock:
             now = datetime.now()
@@ -470,7 +470,7 @@ class FileWatchStore(WatchStore):
                 ):
                     rows.append(row)
             rows.sort(key=lambda row: (row.task.next_execution_time, row.task.task_id))
-            return [self._state(row, now.timestamp()) for row in rows[:limit]]
+            return [self._state(row, now.timestamp()) for row in rows[offset : offset + limit]]
 
     async def running(self, *, after: str = "", limit: int = 100) -> list[WatchState]:
         self._require_initialized()

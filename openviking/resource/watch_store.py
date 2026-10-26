@@ -114,7 +114,7 @@ class WatchStore(ABC):
     # ── Run occupancy ───────────────────────────────────────────────────
 
     @abstractmethod
-    async def due(self, limit: int) -> list[WatchState]:
+    async def due(self, limit: int, *, offset: int = 0) -> list[WatchState]:
         """Enabled idle Watches whose next run time has passed, earliest first."""
 
     @abstractmethod

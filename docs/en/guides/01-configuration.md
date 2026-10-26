@@ -1384,9 +1384,11 @@ Every node serves the Watch API. Nodes with `enable_watch_scheduler=true`
 compete for a leader lease in the store; the leader polls due Watches every 15
 seconds and settles finished runs. A run is the ingestion Task itself: the
 Watch row records its Task ID while the run occupies the target, and the run
-starts only while the target's Tree PathLock is held. A run whose Task is still
-missing after 10 minutes is settled as an error; a run longer than 3 hours is
-cancelled and settled as failed.
+starts only while the target's Tree PathLock is held. A submission that stops
+before creating its Task (server shutdown, identity deletion, failure) settles
+the run at once; a run whose Task is still missing after 1 hour, which only
+happens when its node crashed, is settled as an error. A run longer than 3
+hours is cancelled and settled as failed.
 
 `mv`, `cp`, `rm`, and `mkdir` on a path overlapping an occupied Watch target
 wait up to 10 seconds and then fail with a retryable busy error.
