@@ -81,6 +81,7 @@ class ExpiryConfig(BaseModel):
     publisher_separate_process: bool = True
     shard_count: int = Field(default=128, ge=1, le=512)
     session_consumer_concurrency: int = Field(default=8, ge=1)
+    watch_consumer_concurrency: int = Field(default=4, ge=1)
     precision_seconds: Literal[60] = 60
     owner_ttl_seconds: Literal[120] = 120
     owner_renew_interval_seconds: Literal[20] = 20

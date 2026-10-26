@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0
 from .api import (
     SESSION_ITEM_TYPE,
+    WATCH_ITEM_TYPE,
+    WATCH_OBSERVER_ITEM_TYPE,
     CallbackRequest,
     CallbackResult,
     CallbackStatus,
@@ -18,6 +20,8 @@ from .api import (
 __all__ = [
     "ExpiryScheduler",
     "SESSION_ITEM_TYPE",
+    "WATCH_ITEM_TYPE",
+    "WATCH_OBSERVER_ITEM_TYPE",
     "ItemIdentity",
     "ExpiryRegistration",
     "ExpiryRegistrationResult",

@@ -300,6 +300,9 @@ class MySQLTaskWorkStore(TaskWorkStore):
             resource_id=row.resource_id,
             account_id=row.account_id,
             user_id=row.user_id,
+            schedule_kind=row.schedule_kind,
+            schedule_id=row.schedule_id,
+            run_id=row.run_id,
             meta=_json_copy(row.meta) or {},
             stage=row.stage,
             result=_json_copy(row.result),
@@ -518,6 +521,9 @@ class MySQLTaskWorkStore(TaskWorkStore):
             resource_id=stored.resource_id,
             account_id=account_id,
             user_id=user_id,
+            schedule_kind=stored.schedule_kind,
+            schedule_id=stored.schedule_id,
+            run_id=stored.run_id,
             meta=_json_copy(stored.meta),
             stage=stored.stage,
             result=_json_copy(stored.result),
@@ -1029,6 +1035,8 @@ class MySQLTaskWorkStore(TaskWorkStore):
             values: dict[str, Any] = {
                 "updated_at": TaskRecord.next_updated_at(row.updated_at),
             }
+            if patch.schedule_claim is not None:
+                values.update(zip(("schedule_kind", "schedule_id", "run_id"), patch.schedule_claim, strict=True))
             if "result" in patch.clear_fields or patch.result is not None:
                 values["result"] = (
                     None if "result" in patch.clear_fields else _json_copy(patch.result)

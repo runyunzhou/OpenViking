@@ -410,6 +410,9 @@ class TaskTracker:
         meta: Optional[Dict[str, Any]] = None,
         auth: Optional[Dict[str, Any]] = None,
         reject_if_active: bool = False,
+        schedule_kind: Optional[str] = None,
+        schedule_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> TaskRecord:
         self._validate_owner(account_id, user_id)
         if task_id is not None:
@@ -422,6 +425,9 @@ class TaskTracker:
             resource_id=resource_id,
             account_id=account_id,
             user_id=user_id,
+            schedule_kind=schedule_kind,
+            schedule_id=schedule_id,
+            run_id=run_id,
             meta=dict(meta or {}),
             auth=dict(auth or {}),
         )

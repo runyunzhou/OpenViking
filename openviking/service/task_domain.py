@@ -74,10 +74,15 @@ class TaskPatch:
     stage: Optional[str] = None
     meta: Optional[Dict[str, Any]] = None
     auth: Optional[Dict[str, Any]] = None
+    schedule_claim: Optional[tuple[str, str, str]] = None
     clear_fields: frozenset[str] = field(default_factory=frozenset)
     add_enqueue_complete_work_ids: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
+        if self.schedule_claim is not None and (
+            len(self.schedule_claim) != 3 or not all(self.schedule_claim)
+        ):
+            raise ValueError("schedule_claim requires kind, schedule ID and run ID")
         clear_fields = frozenset(str(name) for name in self.clear_fields)
         unknown = clear_fields - _TASK_PATCHABLE_FIELDS
         if unknown:
@@ -98,6 +103,7 @@ class TaskPatch:
             and self.stage is None
             and self.meta is None
             and self.auth is None
+            and self.schedule_claim is None
             and not self.clear_fields
             and not self.add_enqueue_complete_work_ids
         )
@@ -185,6 +191,9 @@ class TaskRecord:
     resource_id: Optional[str] = None
     account_id: Optional[str] = None
     user_id: Optional[str] = None
+    schedule_kind: Optional[str] = None
+    schedule_id: Optional[str] = None
+    run_id: Optional[str] = None
     meta: Dict[str, Any] = field(default_factory=dict)
     stage: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
@@ -209,6 +218,9 @@ class TaskRecord:
             "updated_at": self.updated_at,
             "processing_seconds": self.processing_seconds,
             "resource_id": self.resource_id,
+            "schedule_kind": self.schedule_kind,
+            "schedule_id": self.schedule_id,
+            "run_id": self.run_id,
             "meta": sanitize_task_result(public_meta),
             "stage": self.stage,
             "result": sanitize_task_result(deepcopy(self.result)),

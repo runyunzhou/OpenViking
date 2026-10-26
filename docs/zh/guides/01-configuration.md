@@ -1300,8 +1300,19 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 #### task_store
 
 Task 记录默认使用本地 FileStore。需要多个 OpenViking 进程共享
-Task/Work 状态时，先在 MySQL 中执行
-`openviking/service/sql/task_store_init.sql`，再选择关系型后端：
+Task/Work 状态时，先在 MySQL 中依次执行
+`openviking/service/sql/task_store_init.sql` 和
+`openviking/service/sql/001_schedule_provider.sql`，再选择关系型后端。
+初始 schema 保持固定，调度字段和 Watch 表由 `001` 增量添加。
+
+已有部署需在启动新版服务前执行一次 `001_schedule_provider.sql`，
+即使未启用 Watch 也需要；已经执行过的迁移不要重复执行。
+使用自定义表名时，需在迁移脚本的表名和索引名中分别替换
+`ov_tasks` 和 `ov_watch_tasks`。
+如果 `ov_watch_tasks` 是在加入 `service_name` 列之前创建的，按需先执行
+`002_watch_task_projection.sql`，再执行一次
+`003_watch_task_service_name.sql`。当顶层 `service_name` 不是默认值时，
+执行 `003` 前需要先设置 `@openviking_service_name`。
 
 ```json
 {
@@ -1817,6 +1828,43 @@ openviking-server --config /path/to/ov.conf
 #### 分布式 Expiry 配置
 
 共享同一份 expiry 状态的 API、publisher 和 callback 实例必须使用相同且稳定的 `service_name`。它表示部署的文档服务名，不是单个 Pod 名。
+启用 `watch_schedule_backend="redis"` 时，`expiry.service_name` 必须与顶层
+`service_name` 一致；MySQL Watch 行和 Redis timer 使用这个共同值作为部署分区。
+
+Redis Watch 使用执行 timer 和独立的结果观察 timer（OB）。执行 timer 领取 run 后，
+先注册绑定 `(Watch ID, run ID)` 的 `watch_observer`，再启动后台提交并 ACK。
+OB 按 `min(watch_interval × 60, 60)` 秒观察 ingestion Task，非终态则续 OB；
+终态时原子写入结果、成功游标和下次时间，释放 run，再注册执行 timer 后 ACK。
+下次时间为 `max(Task 创建时间 + 当前周期, 结算时间)`；没有 Task 的同步结果使用
+提交开始时间。运行期间配置更新不另起执行 timer，周期修改在 OB 后续读取时生效。
+实际投递仍受分钟桶粒度和积压影响，60 秒是注册间隔，不是观测延迟保证。
+独立部署的 publisher 和 callback 实例都需要升级到支持 `watch_observer` 的版本。
+
+Connector 首轮直接提交预留的 R0，完成回调读取真实 Task 终态后原子结算；
+原执行 timer 保留首轮恢复能力，R0 非终态时不会领取新 run，也不应用周期任务的
+超时兜底。Native 首轮处理路径保持原样。local 模式保留轮询及完成时间起算的周期。
+
+创建、更新 Watch 先提交 MySQL，再注册 timer；Redis 失败时保留 Watch 数据。
+`Watch timer registered` 日志包含 Watch、账号、用户和实际接受的到期时间，
+失败日志记录未成功的操作。成功日志仅证明当时写入成功，不代表 timer 持续健康。
+没有自动漏注册补扫，也没有新增修复接口。运维可在正确的服务 namespace 中通过
+expiry scheduler 重新注册相同的 `ItemIdentity("watch", account_id, user_id,
+watch_task_id)`；到期时间取当前时间可尽快触发观察。从 local 切换到 Redis 或迁移
+存量数据后，也需要为启用的 Watch 注册 timer。重新注册不会启用已暂停的 Watch。
+
+callback 异常时先尝试注册 60 秒退避 timer，成功则 ACK 当前 callback；
+退避注册也失败才交给 expiry 重试，最多 3 次尝试，耗尽后记录失败并 ACK 原 callback。
+此时如果没有 timer，需要运维重新注册。`next_execution_time` 是 Watch 存储侧的调度
+估计时间，不是 Redis 注册成功标记，也不等于下一次周期 tick 的准确时间。
+
+OB 将周期结果观察与业务调度间隔分开。目前成功 Task 保留 24 小时、失败 Task
+保留 7 天；长时间停机仍可能丢失尚未写回的结果。已标记 submitted 的 Task 查不到时，
+记录 `Submitted Task missing`，将旧 run 原子结算为 `error`，保留上次提交的游标，
+并把下次时间设为当前时间；执行 timer 再创建新 run。未提交且 Task 不存在时，
+等待 30 分钟提交租约过期后重提同一 run。存储查询异常走退避，不当作记录不存在。
+周期 Task 超过默认 3 小时仍非终态时尝试取消并重新读取；实际终态优先，
+否则将该 Watch run 记为失败并释放，不伪造 Task 成功。旧任务可能仍继续执行，
+因此这些恢复路径具有至少一次语义，可能重复处理。
 
 ```json
 {

@@ -31,6 +31,22 @@ class TaskStoreConfig(BaseModel):
         return self
 
 
+class WatchStoreConfig(BaseModel):
+    """Durable Watch schedule backend selection."""
+
+    provider: str = "file"
+    params: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def normalize_provider(self):
+        self.provider = self.provider.strip().lower()
+        if self.provider not in {"file", "mysql"}:
+            raise ValueError(
+                f"storage.watch_store.provider must be 'file' or 'mysql', got {self.provider!r}"
+            )
+        return self
+
+
 class StorageConfig(BaseModel):
     """Configuration for storage backend.
 
@@ -69,6 +85,11 @@ class StorageConfig(BaseModel):
     task_store: TaskStoreConfig = Field(
         default_factory=TaskStoreConfig,
         description="Persistent Task/Work storage backend",
+    )
+
+    watch_store: WatchStoreConfig = Field(
+        default_factory=WatchStoreConfig,
+        description="Persistent Watch schedule storage backend",
     )
 
     params: Dict[str, Any] = Field(
@@ -153,3 +174,13 @@ class StorageConfig(BaseModel):
 
             store = PersistentTaskStore(agfs)
         return TaskTracker(store=store)
+
+    def build_watch_store(self, viking_fs: Any, *, service_name: str):
+        """Build the persistent Watch storage backend."""
+        if self.watch_store.provider == "mysql":
+            from openviking.resource.distributed_watch_store import MySQLWatchStore
+
+            return MySQLWatchStore(params=self.watch_store.params, service_name=service_name)
+
+        # The local manager owns main's original file persistence directly.
+        return None

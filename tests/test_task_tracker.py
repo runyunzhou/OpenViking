@@ -201,6 +201,20 @@ async def test_patch_stage_and_record_owner_cancelled(tracker: TaskTracker):
     assert cancelled.stage == "cancelled"
 
 
+async def test_patch_links_initial_watch_without_replacing_task_state(tracker: TaskTracker):
+    task = await tracker.create("add_resource", **_owner_kwargs())
+    await tracker.start(task.task_id)
+    await tracker.patch_task(
+        task.task_id, TaskPatch(schedule_claim=("watch", "watch-first", task.task_id)),
+        **_owner_kwargs(),
+    )
+    stored = await tracker.get(task.task_id, **_owner_kwargs())
+    assert stored.status == TaskStatus.RUNNING
+    assert (stored.schedule_kind, stored.schedule_id, stored.run_id) == (
+        "watch", "watch-first", task.task_id,
+    )
+
+
 async def test_patch_task_updates_fields_and_dispatch_marker_atomically(tracker: TaskTracker):
     task = await tracker.create("content_write", **_owner_kwargs())
     await tracker.start(task.task_id)
@@ -567,6 +581,9 @@ async def test_public_serialization_skips_private_payloads(tracker: TaskTracker)
         "error",
         "created_at_iso",
         "updated_at_iso",
+        "schedule_kind",
+        "schedule_id",
+        "run_id",
     }
     assert public["meta"] == {"nested": [{"values": [1]}]}
     assert public["result"] == {"nested": [{"values": [2]}]}

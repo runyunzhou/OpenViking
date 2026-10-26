@@ -1593,6 +1593,8 @@ def _deep_merge(target: Dict[str, Any], values: Dict[str, Any]) -> None:
 
 
 def _apply_task_patch(task: TaskRecord, patch: TaskPatch) -> None:
+    if patch.schedule_claim is not None:
+        task.schedule_kind, task.schedule_id, task.run_id = patch.schedule_claim
     if "result" in patch.clear_fields:
         task.result = None
     elif patch.result is not None:

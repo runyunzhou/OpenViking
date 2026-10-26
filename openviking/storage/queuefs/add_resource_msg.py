@@ -20,6 +20,9 @@ class AddResourceMsg:
     root_uri: str
     account_id: str
     user_id: str
+    schedule_kind: Optional[str] = None
+    schedule_id: Optional[str] = None
+    run_id: Optional[str] = None
     group_ids: list[str] = field(default_factory=list)
     role: str
     _task_work_id: str = ""
@@ -166,6 +169,21 @@ class AddResourceMsg:
             root_uri=str(root_uri),
             account_id=account_id,
             user_id=str(data.get("user_id", "default")),
+            schedule_kind=(
+                str(data["schedule_kind"])
+                if isinstance(data.get("schedule_kind"), str) and data["schedule_kind"]
+                else None
+            ),
+            schedule_id=(
+                str(data["schedule_id"])
+                if isinstance(data.get("schedule_id"), str) and data["schedule_id"]
+                else None
+            ),
+            run_id=(
+                str(data["run_id"])
+                if isinstance(data.get("run_id"), str) and data["run_id"]
+                else None
+            ),
             group_ids=(
                 [str(group_id) for group_id in data["group_ids"]]
                 if isinstance(data.get("group_ids"), list)

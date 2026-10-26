@@ -1312,8 +1312,19 @@ Storage configuration for context data, including file storage (RAGFS) and vecto
 #### task_store
 
 Task records use the local FileStore by default. To share Task/Work state across
-OpenViking processes, provision `openviking/service/sql/task_store_init.sql` in
-MySQL and select the relational backend:
+OpenViking processes, provision `openviking/service/sql/task_store_init.sql`,
+then apply `openviking/service/sql/001_schedule_provider.sql` in MySQL before
+selecting the relational backend. The initial schema is fixed; `001` adds the
+schedule columns and Watch table.
+
+Existing installations must apply `001_schedule_provider.sql` once before
+starting the upgraded server, even when Watch is disabled. Do not rerun an
+already applied migration. For custom table names, replace `ov_tasks` and
+`ov_watch_tasks` independently in the migration's table and index names.
+If `ov_watch_tasks` was created before the `service_name` column existed, apply
+`002_watch_task_projection.sql` as needed, then apply
+`003_watch_task_service_name.sql` once. Set `@openviking_service_name` to the
+top-level `service_name` before running `003` when it is not the default.
 
 ```json
 {
@@ -1835,6 +1846,62 @@ Notes:
 #### Distributed Expiry Configuration
 
 All API, publisher, and callback instances that share expiry state must use the same stable `service_name`. It identifies the deployed document service, not an individual pod.
+When `watch_schedule_backend="redis"` is enabled, `expiry.service_name` must
+match the top-level `service_name`; Watch rows in MySQL and Redis timers use
+that shared value as the deployment partition.
+
+Redis Watch scheduling uses an execution timer and a separate result observer
+(OB). After claiming a run, the execution callback registers a `watch_observer`
+bound to `(Watch ID, run ID)` before starting background submission and acknowledging
+the callback. OB observes the ingestion Task every `min(watch_interval * 60, 60)`
+seconds. Nonterminal runs renew OB; terminal runs atomically commit the result,
+successful cursor, and next execution time and release the run. OB then registers
+the execution timer before acknowledging its callback.
+The next time is `max(Task creation time + current interval, settlement time)`;
+inline outcomes without a Task use submission start time. Configuration changes
+during a run do not create another execution timer; later OB reads see the new
+interval. Minute-bucket granularity and backlog still affect delivery: 60 seconds
+is a registration interval, not an observation latency guarantee. Separately
+deployed publishers and callback instances must both support `watch_observer`.
+
+The first Connector import directly submits its reserved R0. Its completion
+callback reads the actual terminal Task and atomically settles the result.
+The original execution timer remains a recovery path; a nonterminal R0 blocks
+new runs and is exempt from the periodic timeout fallback. Native first-import
+handling is unchanged. Local scheduling retains polling and completion-based
+intervals.
+
+Watch creation and updates commit to MySQL before registering a timer. A Redis
+failure leaves the Watch data intact. `Watch timer registered` logs identify the
+Watch, account, user, and accepted due time; failure logs identify unsuccessful
+operations. These logs confirm a write at that moment, not ongoing timer health.
+There is no automatic lost-timer sweep or dedicated repair endpoint. To recover
+a missing timer, re-register the same `ItemIdentity("watch", account_id, user_id,
+watch_task_id)` through the expiry scheduler in the correct service namespace
+(use the current time to trigger observation promptly). Existing enabled Watches
+also need registration when switching from local scheduling or after migration.
+Registration does not change a paused Watch into an active one.
+
+On callback errors, a successfully registered 60-second backoff timer allows the
+current callback to be acknowledged. If backoff registration also fails, expiry
+retries up to 3 attempts; exhaustion logs the failure and acknowledges the old
+callback. A missing timer then requires operational re-registration.
+`next_execution_time` is the Watch store's scheduling estimate, not proof of
+Redis registration or the exact next periodic tick.
+
+OB observes periodic results independently of the business interval. Completed
+Tasks are currently retained for 24 hours and failed Tasks for 7 days; a prolonged
+outage can still lose an uncommitted result. A missing submitted Task logs
+`Submitted Task missing` and atomically settles the old run as `error`, preserving
+the last committed cursor and setting the next time to now. The execution timer
+then creates a new run. A missing, unsubmitted Task waits for the 30-minute submit
+lease to expire before resubmitting the same run. Store query errors back off and
+are not interpreted as missing records.
+A periodic Task that remains nonterminal past the default 3-hour timeout is
+cancelled on a best-effort basis and read again. An actual terminal result wins;
+otherwise the Watch run is failed and released without fabricating Task success.
+The old Task may still execute, so recovery has at-least-once semantics and can
+repeat work.
 
 ```json
 {

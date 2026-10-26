@@ -357,6 +357,15 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
+    watch_schedule_backend: Literal["local", "redis"] = Field(
+        default="local",
+        description=(
+            "Watch due-time trigger backend. 'local' polls the watch store in every "
+            "scheduler process; 'redis' arms one distributed expiry timer per watch and "
+            "requires storage.watch_store.provider='mysql' plus the expiry section."
+        ),
+    )
+
     auto_generate_l0: bool = Field(
         default=True, description="Automatically generate L0 (abstract) if not provided"
     )
@@ -496,6 +505,26 @@ class OpenVikingConfig(BaseModel):
         return self
 
     def _check_expiry_backend(self) -> None:
+        if (self.watch_schedule_backend == "redis") != (self.storage.watch_store.provider == "mysql"):
+            raise ValueError("Watch supports only file + local or mysql + redis")
+        if self.watch_schedule_backend == "redis" and self.storage.task_store.provider != "mysql":
+            raise ValueError("Distributed Watch requires storage.task_store.provider='mysql'")
+        if self.uses_redis_watch_schedule() and self.storage.watch_store.provider != "mysql":
+            raise ValueError(
+                "watch_schedule_backend='redis' requires storage.watch_store.provider='mysql'"
+            )
+        if self.uses_redis_watch_schedule():
+            expiry_service_name = normalize_service_name(
+                self.expiry.service_name,
+                field_name="expiry.service_name",
+            )
+            if expiry_service_name != self.service_name:
+                raise ValueError(
+                    "watch_schedule_backend='redis' requires expiry.service_name to match "
+                    "top-level service_name so Redis timers and MySQL watch rows share the "
+                    "same service partition"
+                )
+            self.expiry.service_name = expiry_service_name
         if self.uses_redis_expiry():
             self.expiry.validate_for_runtime()
 
@@ -506,9 +535,16 @@ class OpenVikingConfig(BaseModel):
     def uses_redis_compile_schedule(self) -> bool:
         return self.compile_api.scheduler_enabled
 
+    def uses_redis_watch_schedule(self) -> bool:
+        return self.enable_watch_scheduler and self.watch_schedule_backend == "redis"
+
     def uses_redis_expiry(self) -> bool:
         """Whether any feature needs the distributed ExpiryScheduler."""
-        return self.uses_redis_session_expiry() or self.uses_redis_compile_schedule()
+        return (
+            self.uses_redis_session_expiry()
+            or self.uses_redis_compile_schedule()
+            or self.uses_redis_watch_schedule()
+        )
 
     agent_evolution: AgentEvolutionConfig = RuntimeField(
         default_factory=AgentEvolutionConfig,

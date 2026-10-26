@@ -461,10 +461,17 @@ def _main(recovery):
             idle = getattr(getattr(ov_config, "memory", None), "session_auto_commit", None)
             compile_api = getattr(ov_config, "compile_api", None)
             expiry = getattr(ov_config, "expiry", None)
-            uses_redis = (idle is not None and idle.enabled and idle.idle_backend == "redis") or (
-                compile_api is not None and compile_api.scheduler_enabled
+            session_expiry = idle is not None and idle.enabled and idle.idle_backend == "redis"
+            compile_expiry = compile_api is not None and compile_api.scheduler_enabled
+            watch_expiry = (
+                getattr(ov_config, "enable_watch_scheduler", False)
+                and getattr(ov_config, "watch_schedule_backend", "local") == "redis"
             )
-            if uses_redis and expiry is not None and expiry.publisher_separate_process:
+            if (
+                (session_expiry or compile_expiry or watch_expiry)
+                and expiry is not None
+                and expiry.publisher_separate_process
+            ):
                 if resolved_config_path is None:
                     raise RuntimeError(
                         "Cannot start expiry publisher without a resolved ov.conf path"

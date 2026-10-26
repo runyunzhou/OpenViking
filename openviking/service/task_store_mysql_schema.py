@@ -96,6 +96,13 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
                 "updated_at",
                 "task_id",
             ),
+            Index(
+                f"ix_{table_prefix}_schedule_created",
+                "schedule_kind",
+                "schedule_id",
+                "created_at",
+                "task_id",
+            ),
             {
                 "mysql_engine": "InnoDB",
                 "mysql_charset": "utf8mb4",
@@ -113,6 +120,15 @@ def make_task_store_models(table_prefix: str = "ov_tasks") -> TaskStoreModels:
         )
         account_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
         user_id: Mapped[str] = mapped_column(String(255, collation="utf8mb4_bin"))
+        schedule_kind: Mapped[Optional[str]] = mapped_column(
+            String(32, collation="ascii_bin"), nullable=True
+        )
+        schedule_id: Mapped[Optional[str]] = mapped_column(
+            String(255, collation="utf8mb4_bin"), nullable=True
+        )
+        run_id: Mapped[Optional[str]] = mapped_column(
+            String(255, collation="utf8mb4_bin"), nullable=True
+        )
         meta: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
         stage: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
         result: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)

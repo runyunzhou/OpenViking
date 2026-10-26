@@ -164,6 +164,9 @@ class AddResourceProcessor(DequeueHandlerBase):
             user_id=ctx.user.user_id,
             task_id=msg.task_id,
             meta=({"internal": True} if msg.internal_task else {"source_path": msg.source_path}),
+            schedule_kind=msg.schedule_kind,
+            schedule_id=msg.schedule_id,
+            run_id=msg.run_id,
         )
         if task.status in (
             TaskStatus.CANCELLING,

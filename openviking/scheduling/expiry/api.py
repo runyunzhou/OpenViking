@@ -10,7 +10,11 @@ from typing import Protocol
 
 SESSION_ITEM_TYPE = "session"
 COMPILE_TARGET_ITEM_TYPE = "compile_target"
-SUPPORTED_ITEM_TYPES: frozenset[str] = frozenset({SESSION_ITEM_TYPE, COMPILE_TARGET_ITEM_TYPE})
+WATCH_ITEM_TYPE = "watch"
+WATCH_OBSERVER_ITEM_TYPE = "watch_observer"
+SUPPORTED_ITEM_TYPES: frozenset[str] = frozenset(
+    {SESSION_ITEM_TYPE, COMPILE_TARGET_ITEM_TYPE, WATCH_ITEM_TYPE, WATCH_OBSERVER_ITEM_TYPE}
+)
 
 
 class ExpiryMode(str, Enum):

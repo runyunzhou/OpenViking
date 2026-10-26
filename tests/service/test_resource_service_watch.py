@@ -1744,3 +1744,39 @@ async def test_external_feishu_requires_endpoint(monkeypatch, resource_service, 
             to="viking://resources/test",
             args={auth.OAUTH_REF_ARG: reference},
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("committed_task", [False, True])
+async def test_distributed_first_processing_error_uses_task_as_authority(
+    monkeypatch, resource_service, request_context, committed_task,
+):
+    from openviking.resource.watch_manager import WatchTask
+
+    first = WatchTask(
+        task_id="first-watch", path="https://example.org/test",
+        to_uri="viking://resources/test",
+    )
+    manager = SimpleNamespace(
+        create_task=AsyncMock(return_value=first), fail_initial_submission=AsyncMock(),
+    )
+    resource_service._watch_scheduler.backend = "redis"
+    resource_service._watch_scheduler.watch_manager = manager
+    resource_service._resource_processor.process_resource = AsyncMock(
+        return_value={"status": "error", "error": "source failed"},
+    )
+    tracker = SimpleNamespace(get=AsyncMock(return_value=object() if committed_task else None))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    result = await resource_service._execute_resource_ingestion(
+        path=first.path, to=first.to_uri, ctx=request_context,
+        defer_post_processing=True, watch_interval=1, task_id="first-run",
+    )
+    assert result["status"] == "error"
+    assert manager.create_task.call_args.kwargs["initial_run_id"] == "first-run"
+    resource_service._enqueue_add_resource_job.assert_not_awaited()
+    if committed_task:
+        manager.fail_initial_submission.assert_not_awaited()
+    else:
+        manager.fail_initial_submission.assert_awaited_once_with(
+            "first-watch", "first-run", "source failed",
+        )

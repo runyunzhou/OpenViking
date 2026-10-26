@@ -562,10 +562,12 @@ class OpenVikingService:
             vlm_resolver=self._vlm_resolver,
         )
 
-        self._watch_scheduler = WatchScheduler(
+        from openviking.resource.watch_factory import build_watch_components
+
+        self._watch_scheduler, self._uri_mutation_coordinator = build_watch_components(
+            self._config,
             resource_service=self._resource_service,
             viking_fs=self._viking_fs,
-            uri_mutation_coordinator=self._uri_mutation_coordinator,
             runtime_config_manager=self._runtime_config_manager,
         )
 
@@ -616,6 +618,10 @@ class OpenVikingService:
         session_expiry_enabled = (
             session_auto_commit_config.enabled
             and getattr(session_auto_commit_config, "idle_backend", "local") == "redis"
+        )
+        watch_expiry_enabled = (
+            self._config.enable_watch_scheduler
+            and getattr(self._config, "watch_schedule_backend", "local") == "redis"
         )
         if (
             session_auto_commit_config.enabled
@@ -724,7 +730,7 @@ class OpenVikingService:
         await system_asset_synchronizer.sync(default_ctx)
 
         compile_expiry_enabled = self._compile_scheduler is not None
-        if session_expiry_enabled or compile_expiry_enabled:
+        if session_expiry_enabled or compile_expiry_enabled or watch_expiry_enabled:
             from openviking.scheduling.expiry.runtime import ExpiryRuntime, ExpiryRuntimeRoles
 
             self._expiry_runtime = ExpiryRuntime(
@@ -743,6 +749,15 @@ class OpenVikingService:
                     )
                 if compile_expiry_enabled:
                     self._compile_scheduler.install_expiry(self._expiry_runtime.scheduler)
+                if watch_expiry_enabled:
+                    from openviking.service.watch_expiry import install_watch_expiry
+
+                    # Handlers must be registered before start_roles freezes the registry.
+                    install_watch_expiry(
+                        self._expiry_runtime.scheduler,
+                        self._watch_scheduler,
+                        concurrency=expiry_config.watch_consumer_concurrency,
+                    )
                 await self._expiry_runtime.start_storage()
                 await self._expiry_runtime.start_roles()
             except Exception:
@@ -784,6 +799,9 @@ class OpenVikingService:
         runtime = self._expiry_runtime
         if runtime is None:
             self._session_service.set_session_expiry_adapter(None)
+            detach_watch = getattr(self._watch_scheduler, "set_timer_adapter", None)
+            if detach_watch is not None:
+                detach_watch(None)
             return
         try:
             await runtime.close()
@@ -795,6 +813,9 @@ class OpenVikingService:
                 raise
         else:
             self._session_service.set_session_expiry_adapter(None)
+            detach_watch = getattr(self._watch_scheduler, "set_timer_adapter", None)
+            if detach_watch is not None:
+                detach_watch(None)
             self._expiry_runtime = None
             logger.info("Expiry stopped")
 
