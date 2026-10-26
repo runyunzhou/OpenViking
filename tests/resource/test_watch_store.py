@@ -172,6 +172,24 @@ async def test_deactivate_idle_skips_occupied_and_moved_watches(store):
 
 
 @pytest.mark.asyncio
+async def test_fence_run_keeps_occupancy_until_finish_and_resets_on_claim(store):
+    task = await create(store, initial_run_id="run-1")
+
+    assert not await store.fence_run(task.task_id, "run-2")
+    assert not (await store.get_state(task.task_id)).run_fenced
+    assert await store.fence_run(task.task_id, "run-1")
+    assert await store.fence_run(task.task_id, "run-1")
+    state = await store.get_state(task.task_id)
+    assert state.current_run_id == "run-1" and state.run_fenced
+
+    assert await store.finish_run(task.task_id, "run-1", WatchRunResult(status="failed"))
+    assert not await store.fence_run(task.task_id, "run-1")
+    claim = await store.claim(task.task_id, target_uri=task.to_uri, manual=True)
+    state = await store.get_state(task.task_id)
+    assert state.current_run_id == claim.run_id and not state.run_fenced
+
+
+@pytest.mark.asyncio
 async def test_finish_run_is_a_cas_on_the_run_id(store):
     task = await create(store, initial_run_id="run-1")
 
