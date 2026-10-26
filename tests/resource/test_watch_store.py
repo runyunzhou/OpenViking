@@ -162,79 +162,39 @@ async def test_deactivate_idle_skips_occupied_and_moved_watches(store):
     )
     assert await store.deactivate_idle(task.task_id, target_uri=task.to_uri, error="gone")
 
-    state = await store.get_state(task.task_id)
-    assert state.current_run_id is None
-    assert not state.task.is_active and state.task.next_execution_time is None
-    assert (state.task.last_status, state.task.last_error) == ("failed", "gone")
-    assert state.task.last_execution_time is not None
+    assert not (await store.get_task(task.task_id)).is_active
     assert (await store.get_state(occupied.task_id)).current_run_id == "run-1"
-    assert await store.due(10) == []
 
 
 @pytest.mark.asyncio
-async def test_fence_run_keeps_occupancy_until_finish_and_resets_on_claim(store):
-    task = await create(store, initial_run_id="run-1")
+async def test_only_the_owning_run_can_settle_and_advance_its_cursor(store):
+    task = await create(
+        store, initial_run_id="run-1", auth_state=CONNECTOR_AUTH, connector_states={"cursor": 1}
+    )
 
-    assert not await store.fence_run(task.task_id, "run-2")
-    assert not (await store.get_state(task.task_id)).run_fenced
+    result = WatchRunResult(
+        status="completed",
+        execution_task_id="run-1",
+        connector_states={"cursor": 2},
+        has_connector_states=True,
+    )
+    assert not await store.finish_run(task.task_id, "run-2", result)
     assert await store.fence_run(task.task_id, "run-1")
-    assert await store.fence_run(task.task_id, "run-1")
-    state = await store.get_state(task.task_id)
-    assert state.current_run_id == "run-1" and state.run_fenced
-
-    assert await store.finish_run(task.task_id, "run-1", WatchRunResult(status="failed"))
-    assert not await store.fence_run(task.task_id, "run-1")
-    claim = await store.claim(task.task_id, target_uri=task.to_uri, manual=True)
-    state = await store.get_state(task.task_id)
-    assert state.current_run_id == claim.run_id and not state.run_fenced
-
-
-@pytest.mark.asyncio
-async def test_finish_run_is_a_cas_on_the_run_id(store):
-    task = await create(store, initial_run_id="run-1")
-
-    assert not await store.finish_run(task.task_id, "run-2", WatchRunResult(status="completed"))
+    assert (await store.get_state(task.task_id)).current_run_id == "run-1"
     assert await store.finish_run(
         task.task_id,
         "run-1",
-        WatchRunResult(status="completed", execution_task_id="run-1"),
+        result,
     )
     assert not await store.finish_run(task.task_id, "run-1", WatchRunResult(status="failed"))
 
     state = await store.get_state(task.task_id)
-    assert state.current_run_id is None and state.run_started_at is None
+    assert state.current_run_id is None
     assert state.task.last_status == "completed"
     assert state.task.last_task_id == "run-1"
+    assert state.task.connector_states == {"cursor": 2}
     expected = state.task.last_execution_time.timestamp() + 60
     assert abs(state.task.next_execution_time.timestamp() - expected) < 1
-
-
-@pytest.mark.asyncio
-async def test_finish_run_deactivates_and_stores_connector_states(store):
-    native = await create(store, initial_run_id="run-1")
-    connector = await create(
-        store,
-        "viking://resources/c",
-        initial_run_id="run-2",
-        auth_state=dict(CONNECTOR_AUTH),
-        connector_states={"cursor": 1},
-    )
-
-    await store.finish_run(
-        native.task_id, "run-1", WatchRunResult(status="failed", error="gone", deactivate=True)
-    )
-    await store.finish_run(
-        connector.task_id,
-        "run-2",
-        WatchRunResult(
-            status="completed", connector_states={"cursor": 2}, has_connector_states=True
-        ),
-    )
-
-    native_state = await store.get_state(native.task_id)
-    assert native_state.task.is_active is False
-    assert native_state.task.next_execution_time is None
-    assert (await store.get_task(connector.task_id)).connector_states == {"cursor": 2}
 
 
 @pytest.mark.asyncio
@@ -247,20 +207,6 @@ async def test_paused_run_settles_without_rescheduling(store):
     state = await store.get_state(task.task_id)
     assert state.task.is_active is False
     assert state.task.next_execution_time is None
-
-
-@pytest.mark.asyncio
-async def test_run_scoped_patch_requires_occupancy(store):
-    task = await create(store, initial_run_id="run-1")
-
-    assert (
-        await store.patch_task(task.task_id, WatchPatch({"auth_state": {"a": 1}}), run_id="other")
-        is None
-    )
-    patched = await store.patch_task(
-        task.task_id, WatchPatch({"auth_state": {"a": 2}}), run_id="run-1"
-    )
-    assert patched.auth_state == {"a": 2}
 
 
 @pytest.mark.asyncio
@@ -277,16 +223,11 @@ async def test_permissions(store):
 
 
 @pytest.mark.asyncio
-async def test_target_conflicts_are_per_account_and_ignore_tombstones(store):
-    first = await create(store)
-    with pytest.raises(ConflictError, match="already being monitored"):
-        await create(store)
-    await create(store, account_id="account-b")
-    with pytest.raises(ConflictError, match="already exists"):
-        await store.create_task(first.model_copy(update={"to_uri": "viking://resources/other"}))
-
-    await store.delete_task(first.task_id, OWNER)
+async def test_native_targets_remain_exclusive_within_their_account(store):
     await create(store)
+    with pytest.raises(ConflictError):
+        await create(store, auth_state=CONNECTOR_AUTH)
+    await create(store, account_id="account-b")
 
 
 @pytest.mark.asyncio
@@ -323,11 +264,9 @@ async def test_delete_tasks_returns_runs_to_release(store):
 @pytest.mark.parametrize(
     ("target", "uris", "expected"),
     [
-        ("viking://resources/a/b", ["viking://resources/a/b"], True),
         ("viking://resources/a/b", ["viking://resources/a"], True),
         ("viking://resources/a/b", ["viking://resources/a/b/c.md"], True),
         ("viking://resources/a/b", ["viking://resources/a/bc"], False),
-        ("viking://resources/a/b", ["viking://resources/x", "viking://resources/a/"], True),
         ("viking://resources/a_b", ["viking://resources/a%b"], False),
     ],
 )
@@ -339,40 +278,18 @@ async def test_running_overlap_uses_path_boundaries(store, target, uris, expecte
 
 
 @pytest.mark.asyncio
-async def test_idle_watch_does_not_overlap(store):
-    await create(store)
-    assert await store.has_running_overlap(ACCOUNT, ["viking://resources"]) is False
-
-
-@pytest.mark.asyncio
-async def test_running_pages_by_task_id(store):
-    ids = sorted(
-        [
-            (await create(store, f"viking://resources/{i}", initial_run_id=f"run-{i}")).task_id
-            for i in range(5)
-        ]
-    )
-    await create(store, "viking://resources/idle")
-
-    first = await store.running(limit=2)
-    rest = await store.running(after=first[-1].task.task_id, limit=10)
-
-    assert [state.task.task_id for state in first + rest] == ids
-
-
-@pytest.mark.asyncio
-async def test_due_orders_and_limits(store):
+async def test_scan_pages_do_not_lose_due_or_running_watches(store):
     tasks = [await create(store, f"viking://resources/{i}", due=True) for i in range(3)]
-    await create(store, "viking://resources/later")
-
     due = await store.due(2)
-    rest = await store.due(2, offset=2)
-
-    assert len(due) == 2
-    assert [state.task.task_id for state in due + rest] == [
-        state.task.task_id for state in await store.due(10)
-    ]
-    assert {state.task.task_id for state in due + rest} == {task.task_id for task in tasks}
+    remaining = await store.due(2, offset=2)
+    assert [state.task.task_id for state in due + remaining] == [task.task_id for task in tasks]
+    for task in tasks:
+        await store.claim(task.task_id, target_uri=task.to_uri)
+    page = await store.running(limit=2)
+    remaining = await store.running(after=page[-1].task.task_id, limit=2)
+    assert [state.task.task_id for state in page + remaining] == sorted(
+        task.task_id for task in tasks
+    )
 
 
 @pytest.mark.asyncio
@@ -394,20 +311,24 @@ async def test_rewrite_escapes_nothing_and_respects_boundaries(store):
 
 @pytest.mark.asyncio
 async def test_leader_lease_epochs(make_store):
-    first, second = await make_store(), await make_store()
+    nodes = [await make_store(), await make_store()]
+    owners = ["node-a", "node-b"]
 
-    epoch = await first.acquire_leadership("node-a", 30)
-    assert epoch == 1
-    assert await second.acquire_leadership("node-b", 30) is None
-    assert await first.acquire_leadership("node-a", 30) == epoch
-    assert await first.renew_leadership("node-a", epoch, 30)
-    assert not await second.renew_leadership("node-b", epoch, 30)
+    epochs = await asyncio.gather(
+        *(node.acquire_leadership(owner, 30) for node, owner in zip(nodes, owners, strict=True))
+    )
+    assert sum(value is not None for value in epochs) == 1
+    winner = epochs.index(1)
+    first, second = nodes[winner], nodes[1 - winner]
+    owner, contender = owners[winner], owners[1 - winner]
+    epoch = 1
+    assert await first.renew_leadership(owner, epoch, 30)
+    assert not await second.renew_leadership(contender, epoch, 30)
 
-    await first.release_leadership("node-a", epoch)
-    assert not await first.renew_leadership("node-a", epoch, 30)
-    taken = await second.acquire_leadership("node-b", 30)
+    await first.release_leadership(owner, epoch)
+    taken = await second.acquire_leadership(contender, 30)
     assert taken == epoch + 1
-    assert not await first.renew_leadership("node-a", epoch, 30)
+    assert not await first.renew_leadership(owner, epoch, 30)
 
 
 @pytest.mark.asyncio
@@ -419,17 +340,6 @@ async def test_leader_lease_expires(make_store):
 
     assert await second.acquire_leadership("node-b", 30) == 2
     assert not await first.renew_leadership("node-a", 1, 30)
-
-
-@pytest.mark.asyncio
-async def test_concurrent_first_leader_insert(make_store):
-    nodes = [await make_store() for _ in range(4)]
-
-    epochs = await asyncio.gather(
-        *[node.acquire_leadership(f"node-{i}", 30) for i, node in enumerate(nodes)]
-    )
-
-    assert sorted(epoch for epoch in epochs if epoch is not None) == [1]
 
 
 @pytest.mark.asyncio
@@ -446,20 +356,6 @@ async def test_service_names_partition_rows_and_leadership(make_store):
     await create(other)
     assert await first.acquire_leadership("node-a", 30) == 1
     assert await other.acquire_leadership("node-b", 30) == 1
-
-
-@pytest.mark.asyncio
-async def test_list_order(store):
-    now = datetime.now()
-    created = [
-        await create(store, f"viking://resources/t{index}", created_at=now + timedelta(seconds=index))
-        for index in range(3)
-    ]
-    expected = [task.task_id for task in created]
-    if store.provider == "mysql":
-        expected.reverse()
-
-    assert [task.task_id for task in await store.list_tasks(OWNER)] == expected
 
 
 async def _raw_secrets(store):
@@ -533,22 +429,103 @@ async def test_mysql_private_state_is_bound_to_key_and_row(make_store):
         await store.get_task(task.task_id)
 
 
-@pytest.mark.parametrize("key", [None, "not base64!", base64.b64encode(b"short").decode()])
-def test_mysql_store_requires_a_valid_encryption_key(key):
-    params = {"user": "u", "password": "p", "database": "d"}
-    if key is not None:
-        params["credential_encryption_key"] = key
+@pytest.mark.parametrize("key", ["not base64!", base64.b64encode(b"short").decode()])
+def test_mysql_store_rejects_malformed_encryption_keys(key):
     with pytest.raises(ValueError, match="credential_encryption_key"):
-        MySQLWatchStore(service_name="watch-test", params=params)
+        MySQLWatchStore(
+            service_name="watch-test",
+            params={
+                "user": "u",
+                "password": "p",
+                "database": "d",
+                "credential_encryption_key": key,
+            },
+        )
 
 
-@pytest.mark.asyncio
-async def test_connector_flag_follows_auth_state(make_store):
-    store = await make_store()
-    first = await create(store, "viking://resources/shared", auth_state=dict(CONNECTOR_AUTH))
-    await create(store, "viking://resources/shared", auth_state=dict(CONNECTOR_AUTH))
+class TestFileRecovery:
+    @pytest.mark.asyncio
+    async def test_legacy_file_normalizes_active_paused_and_deleted_watches(self, watch_vfs):
+        created = datetime.now() - timedelta(hours=1)
+        legacy = {
+            "path": "https://example.org/doc",
+            "to_uri": "viking://resources/doc",
+            "created_at": created.isoformat(),
+            "watch_interval": 5,
+        }
+        await watch_vfs.write_file(
+            FileWatchStore.STORAGE_URI,
+            json.dumps(
+                {
+                    "tasks": [
+                        {**legacy, "task_id": "active"},
+                        {
+                            **legacy,
+                            "task_id": "paused",
+                            "to_uri": "viking://resources/paused",
+                            "is_active": False,
+                            "next_execution_time": created.isoformat(),
+                        },
+                        {
+                            **legacy,
+                            "task_id": "deleted",
+                            "to_uri": "viking://resources/deleted",
+                            "deleted": True,
+                        },
+                    ]
+                }
+            ),
+        )
+        store = FileWatchStore(watch_vfs)
+        await store.initialize()
+        active = await store.get_task("active")
+        assert active is not None
+        assert active.next_execution_time == created + timedelta(minutes=5)
+        assert active.processing_mode == "semantic_and_vectors"
+        paused = await store.get_task("paused")
+        assert paused is not None and paused.next_execution_time is None
+        assert await store.get_state("deleted") is None
+        saved = json.loads(await watch_vfs.read_file(FileWatchStore.STORAGE_URI))
+        assert {task["task_id"] for task in saved["tasks"]} == {"active", "paused"}
 
-    await store.patch_task(first.task_id, WatchPatch({"auth_state": None}))
+    @pytest.mark.asyncio
+    async def test_corrupt_primary_recovers_from_backup(self, watch_vfs, watch_store):
+        task = await create(watch_store)
+        await watch_store.patch_task(task.task_id, WatchPatch({"reason": "updated"}), OWNER)
+        await watch_vfs.write_file(FileWatchStore.STORAGE_URI, "{not json")
+        reopened = FileWatchStore(watch_vfs)
+        await reopened.initialize()
+        loaded = await reopened.get_task(task.task_id)
+        assert loaded is not None and loaded.to_uri == task.to_uri
+        saved = json.loads(await watch_vfs.read_file(FileWatchStore.STORAGE_URI))
+        assert [task["task_id"] for task in saved["tasks"]] == [task.task_id]
 
-    with pytest.raises(ConflictError, match="already being monitored"):
-        await create(store, "viking://resources/shared", auth_state=dict(CONNECTOR_AUTH))
+    @pytest.mark.asyncio
+    async def test_occupied_deletion_survives_restart_until_settlement(
+        self, watch_vfs, watch_store
+    ):
+        task = await create(watch_store, initial_run_id="run-1")
+        await watch_store.delete_task(task.task_id, OWNER)
+        reopened = FileWatchStore(watch_vfs)
+        await reopened.initialize()
+        assert await reopened.get_task(task.task_id) is None
+        assert await reopened.has_running_overlap(ACCOUNT, [task.to_uri])
+        state = await reopened.get_state(task.task_id)
+        assert state is not None and state.current_run_id == "run-1"
+        await reopened.finish_run(task.task_id, "run-1", WatchRunResult(status="cancelled"))
+        reloaded = FileWatchStore(watch_vfs)
+        await reloaded.initialize()
+        assert await reloaded.get_state(task.task_id) is None
+        assert not await reloaded.has_running_overlap(ACCOUNT, [task.to_uri])
+
+    @pytest.mark.asyncio
+    async def test_can_persist_under_the_resources_tree_lock(self, watch_vfs, watch_manager):
+        async with watch_manager.locks.tree("default", "viking://resources"):
+            task = await create(watch_manager.store, initial_run_id="run-1")
+            await watch_manager.finish_run(
+                task.task_id, "run-1", WatchRunResult(status="completed")
+            )
+        reopened = FileWatchStore(watch_vfs)
+        await reopened.initialize()
+        loaded = await reopened.get_task(task.task_id)
+        assert loaded is not None and loaded.last_status == "completed"

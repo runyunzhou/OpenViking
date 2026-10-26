@@ -100,6 +100,16 @@ class WatchManager:
     async def close(self) -> None:
         await self._store.close()
 
+    async def admits_run(self, task_id: str, run_id: str) -> bool:
+        """Allow Task creation only while the run still owns a live, unfenced Watch."""
+        state = await self._store.get_state(task_id)
+        return (
+            state is not None
+            and state.current_run_id == run_id
+            and not state.deleted
+            and not state.run_fenced
+        )
+
     async def create_task(
         self,
         path: str,

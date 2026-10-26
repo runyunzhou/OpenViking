@@ -324,13 +324,7 @@ class WatchScheduler:
         )
 
     async def _admits(self, claim: WatchClaim) -> bool:
-        state = await self._store.get_state(claim.task_id)
-        return (
-            state is not None
-            and state.current_run_id == claim.run_id
-            and not state.deleted
-            and not state.run_fenced
-        )
+        return await self._watch_manager.admits_run(claim.task_id, claim.run_id)
 
     async def _finish_unsubmitted(self, claim: WatchClaim, result: WatchRunResult) -> bool:
         """Settle a run whose Task was never committed; False when the Task exists."""
@@ -565,27 +559,8 @@ class WatchScheduler:
             self._cancel_requested.discard(run_id)
             await self.settle(task.task_id, run_id)
             return
-        if age > self._run_timeout + self._cancel_grace:
-            logger.warning(
-                "[WatchScheduler] Watch %s run %s did not stop %gs after cancellation; "
-                "releasing it",
-                task.task_id,
-                run_id,
-                self._cancel_grace,
-            )
-            self._cancel_requested.discard(run_id)
-            await self._watch_manager.finish_run(
-                task.task_id,
-                run_id,
-                WatchRunResult(
-                    status="failed",
-                    execution_task_id=run_id,
-                    error=f"Watch run timed out after {self._run_timeout:g}s",
-                ),
-            )
-            return
-        # Cancellation is only requested: the run keeps its target until the
-        # Task stops or the cancel grace runs out.
+        # Request cancellation even when the first sweep arrives after the
+        # release deadline. The deadline remains relative to the run's start.
         if (
             age > self._run_timeout
             and record.status.value != TaskStatus.CANCELLING.value
@@ -599,6 +574,27 @@ class WatchScheduler:
                 self._run_timeout,
             )
             await self._cancel_run_task(tracker, task, run_id)
+        if age > self._run_timeout + self._cancel_grace:
+            self._cancel_requested.discard(run_id)
+            # Cancellation may have made the Task terminal; preserve its result.
+            if await self.settle(task.task_id, run_id):
+                return
+            logger.warning(
+                "[WatchScheduler] Watch %s run %s exceeded the %gs release deadline; "
+                "releasing it after requesting cancellation",
+                task.task_id,
+                run_id,
+                self._run_timeout + self._cancel_grace,
+            )
+            await self._watch_manager.finish_run(
+                task.task_id,
+                run_id,
+                WatchRunResult(
+                    status="failed",
+                    execution_task_id=run_id,
+                    error=f"Watch run timed out after {self._run_timeout:g}s",
+                ),
+            )
 
     async def delete_tasks(self, account_id: str, user_id: Optional[str] = None) -> None:
         """Remove an identity's Watches and release the runs they still occupy.

@@ -1,10 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Watch test fixtures: the default file Watch store over real local RAGFS.
-
-Import the fixtures a module needs, e.g.
-``from tests.utils.watch_fixtures import watch_manager, watch_store, watch_vfs``.
-"""
+"""Shared Watch fixtures over local RAGFS."""
 
 from dataclasses import replace
 from datetime import datetime
@@ -29,28 +25,15 @@ def local_viking_fs(root: Path):
 
 async def shape_watch(store: WatchStore, task_id: str, **values: Any) -> None:
     """Set ``next_run_at``, ``current_run_id`` or ``run_started_at`` (epoch) directly."""
-    unknown = values.keys() - {"next_run_at", "current_run_id", "run_started_at"}
-    if unknown:
-        raise ValueError(f"unsupported fields: {sorted(unknown)}")
-    if isinstance(store, FileWatchStore):
-        row = store._rows[task_id]
-        task = row.task
-        if "next_run_at" in values:
-            at = values.pop("next_run_at")
-            task = task.model_copy(
-                update={"next_execution_time": datetime.fromtimestamp(at) if at else None}
-            )
-        await store._commit({task_id: replace(row, task=task, **values)})
-        return
-    from sqlalchemy import update
-
-    async def write() -> None:
-        async with store._transaction() as session:
-            await session.execute(
-                update(store._tasks).where(store._tasks.c.task_id == task_id).values(**values)
-            )
-
-    await store._mysql_runtime.run(write)
+    assert isinstance(store, FileWatchStore)
+    row = store._rows[task_id]
+    task = row.task
+    if "next_run_at" in values:
+        at = values.pop("next_run_at")
+        task = task.model_copy(
+            update={"next_execution_time": datetime.fromtimestamp(at) if at else None}
+        )
+    await store._commit({task_id: replace(row, task=task, **values)})
 
 
 @pytest_asyncio.fixture
@@ -67,5 +50,5 @@ async def watch_store(watch_vfs) -> AsyncIterator[FileWatchStore]:
 
 
 @pytest_asyncio.fixture
-async def watch_manager(watch_store: WatchStore, watch_vfs) -> WatchManager:
+async def watch_manager(watch_store: FileWatchStore, watch_vfs) -> WatchManager:
     return WatchManager(watch_store, WatchPathLocks(watch_vfs))

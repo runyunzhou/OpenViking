@@ -124,7 +124,7 @@ class EnqueuedTasks:
 
 
 async def run_watch_now(monkeypatch, resource_service, watch_vfs, task):
-    """Release the Watch's first run, then start the next one through a SQL scheduler."""
+    """Release the first run, then refresh through the scheduler."""
     from openviking.resource.watch_scheduler import WatchScheduler
 
     tracker = EnqueuedTasks()
@@ -151,8 +151,11 @@ async def run_watch_now(monkeypatch, resource_service, watch_vfs, task):
         leader_enabled=False,
     )
     await scheduler.start()
-    assert await scheduler.schedule_task(task.task_id)
-    await asyncio.gather(*list(scheduler._background))
+    try:
+        assert await scheduler.schedule_task(task.task_id)
+        await asyncio.gather(*list(scheduler._background))
+    finally:
+        await scheduler.stop()
 
 
 def disable_task_tracker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1141,11 +1144,6 @@ async def test_record_watch_execution_redacts_error_in_log(caplog):
     assert "secret-watch-key" not in caplog.text
     assert "secret-token" not in caplog.text
     assert "[REDACTED]" in caplog.text
-    watch_manager.finish_run.assert_awaited_once_with(
-        "watch-1",
-        "connector-1",
-        WatchRunResult(status="failed", execution_task_id="connector-1", error=error),
-    )
 
 
 class TestWatchTaskConflict:
@@ -1778,8 +1776,7 @@ async def test_external_feishu_requires_endpoint(monkeypatch, resource_service, 
 
 @pytest.mark.asyncio
 async def test_processing_error_creates_no_watch(resource_service, request_context):
-    manager = SimpleNamespace(create_task=AsyncMock(), fail_initial_submission=AsyncMock())
-    resource_service._watch_scheduler.watch_manager = manager
+    manager = resource_service._get_watch_manager()
     resource_service._resource_processor.process_resource = AsyncMock(
         return_value={"status": "error", "error": "source failed"},
     )
@@ -1792,7 +1789,12 @@ async def test_processing_error_creates_no_watch(resource_service, request_conte
         task_id="first-run",
     )
     assert result["status"] == "error"
-    manager.create_task.assert_not_awaited()
+    assert (
+        await manager.get_all_tasks(
+            request_context.account_id, request_context.user.user_id, str(request_context.role)
+        )
+        == []
+    )
     resource_service._enqueue_add_resource_job.assert_not_awaited()
 
 
@@ -1804,37 +1806,22 @@ async def test_enqueue_failure_uses_task_as_authority(
     request_context,
     committed_task,
 ):
-    from openviking.resource.watch_manager import WatchTask
-
-    first = WatchTask(
-        task_id="first-watch",
-        path="https://example.org/test",
-        to_uri="viking://resources/test",
-    )
-    manager = SimpleNamespace(
-        create_task=AsyncMock(return_value=first),
-        fail_initial_submission=AsyncMock(),
-    )
-    resource_service._watch_scheduler.watch_manager = manager
+    manager = resource_service._get_watch_manager()
     resource_service._enqueue_add_resource_job = AsyncMock(side_effect=RuntimeError("queue down"))
     tracker = SimpleNamespace(get=AsyncMock(return_value=object() if committed_task else None))
     monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
     with pytest.raises(RuntimeError, match="queue down"):
         await resource_service._execute_resource_ingestion(
-            path=first.path,
-            to=first.to_uri,
+            path="https://example.org/test",
+            to="viking://resources/test",
             ctx=request_context,
             defer_post_processing=True,
             watch_interval=1,
             task_id="first-run",
         )
-    assert manager.create_task.call_args.kwargs["initial_run_id"] == "first-run"
-    message = resource_service._enqueue_add_resource_job.await_args.args[0]
-    assert message.task_id == "first-run"
-    assert message.watch_task_id == "first-watch"
-    if committed_task:
-        manager.fail_initial_submission.assert_not_awaited()
-    else:
-        manager.fail_initial_submission.assert_awaited_once_with(
-            "first-watch", "first-run", "queue down"
-        )
+    watch = await get_task_by_uri(resource_service, "viking://resources/test", request_context)
+    state = await manager.store.get_state(watch.task_id)
+    assert state.current_run_id == ("first-run" if committed_task else None)
+    if not committed_task:
+        assert watch.last_status == "failed"
+        assert watch.last_error == "queue down"

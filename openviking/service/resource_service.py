@@ -69,6 +69,7 @@ from openviking.server.user_config import (
     effective_skill_add_target,
 )
 from openviking.service.task_domain import TaskPatch
+from openviking.service.task_tracker import task_admission
 from openviking.storage.acl import AclAction, AclSpec
 from openviking.storage.pathlock_transfer import PathLockGuard
 from openviking.storage.queuefs import QueueManager, get_queue_manager
@@ -1950,6 +1951,7 @@ class ResourceService:
                 Callable[[str, Optional[str], Optional[str]], Awaitable[None]]
             ] = None
             watch_task_id: Optional[str] = None
+            admission = contextlib.nullcontext()
             if create_watch and watch_manager is not None:
                 # The Watch is created occupied by the import's Task ID, so no
                 # scheduled run can start before the first import settles.
@@ -1977,6 +1979,10 @@ class ResourceService:
                     raise InternalError("Failed to create Connector watch task.")
                 watch_task_id = watch.task_id
                 first_run_id = task_id
+                admission = task_admission(
+                    first_run_id,
+                    lambda: watch_manager.admits_run(watch_task_id, first_run_id),
+                )
                 logger.info(
                     "[ResourceService] Connector watch ready before import: watch_task_id=%s "
                     "run_id=%s to=%s add_type=%s is_active=%s",
@@ -2039,26 +2045,27 @@ class ResourceService:
 
                 on_success = apply_connector_acl
             try:
-                result = await connector.submit(
-                    path=path,
-                    ctx=ctx,
-                    declared_add_type=add_type,
-                    to=target_to,
-                    reason=reason,
-                    connector_args=normalized_args.processor_kwargs,
-                    tags=tags,
-                    tag_mode=tag_mode,
-                    wait_for_completion=(
-                        not manage_watch and watch_interval > 0
-                        if wait_for_completion is None
-                        else wait_for_completion
-                    ),
-                    connector_states=connector_states,
-                    on_success=on_success,
-                    on_complete=on_complete,
-                    task_id=task_id,
-                    **kwargs,
-                )
+                with admission:
+                    result = await connector.submit(
+                        path=path,
+                        ctx=ctx,
+                        declared_add_type=add_type,
+                        to=target_to,
+                        reason=reason,
+                        connector_args=normalized_args.processor_kwargs,
+                        tags=tags,
+                        tag_mode=tag_mode,
+                        wait_for_completion=(
+                            not manage_watch and watch_interval > 0
+                            if wait_for_completion is None
+                            else wait_for_completion
+                        ),
+                        connector_states=connector_states,
+                        on_success=on_success,
+                        on_complete=on_complete,
+                        task_id=task_id,
+                        **kwargs,
+                    )
             except asyncio.CancelledError:
                 if on_complete is not None:
                     await on_complete(

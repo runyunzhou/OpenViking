@@ -15,7 +15,7 @@ from openviking.service.task_work_index import bind_task_context
 from openviking.storage.abstract_overview import body_for_preview
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
 from openviking.storage.viking_fs import VikingFS
-from openviking_cli.exceptions import InvalidArgumentError
+from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.utils.watch_fixtures import local_viking_fs
 
@@ -2048,8 +2048,7 @@ async def test_transfer_waits_for_running_watch_then_proceeds(request_context, m
         "viking://resources/codeask/wiki", "viking://resources/archive/wiki", ctx=request_context
     )
 
-    assert len(watch_manager.overlap_calls) == 3
-    assert len(viking_fs._async_agfs.requests) == 3
+    assert watch_manager.running == []
     assert viking_fs._async_agfs.held == 0
     assert len(viking_fs.mv_calls) == 1
 
@@ -2059,8 +2058,7 @@ async def test_transfer_waits_for_running_watch_then_proceeds(request_context, m
 async def test_fs_operation_reports_retryable_busy_while_watch_keeps_running(
     request_context, monkeypatch, operation
 ):
-    monkeypatch.setattr("openviking.service.fs_service.WATCH_BUSY_WAIT_SECONDS", 0.05)
-    monkeypatch.setattr("openviking.service.fs_service.WATCH_BUSY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr("openviking.service.fs_service.WATCH_BUSY_WAIT_SECONDS", 0)
     viking_fs = _FakeVikingFS()
     viking_fs.mkdir = AsyncMock()
     watch_manager = _FakeWatchManager()
@@ -2088,33 +2086,29 @@ async def test_fs_operation_reports_retryable_busy_while_watch_keeps_running(
 @pytest.fixture
 def local_fs_service(tmp_path):
     viking_fs = local_viking_fs(tmp_path / "agfs")
-    return FSService(viking_fs=viking_fs), viking_fs, tmp_path / "agfs" / "viking" / "default"
+    return FSService(viking_fs=viking_fs), viking_fs
 
 
 @pytest.mark.asyncio
 async def test_transfer_into_missing_parent_fails_without_creating_it(
     request_context, local_fs_service
 ):
-    service, viking_fs, root = local_fs_service
+    service, viking_fs = local_fs_service
     await viking_fs.write_file("viking://resources/a.md", "a", ctx=request_context)
 
-    with pytest.raises(Exception, match="not found|Not found|NotFound"):
+    with pytest.raises(NotFoundError):
         await service.mv(
             "viking://resources/a.md", "viking://resources/missing/a.md", ctx=request_context
         )
 
-    assert not (root / "resources" / "missing").exists()
-    assert (root / "resources" / "a.md").exists()
+    assert not await viking_fs.exists("viking://resources/missing", ctx=request_context)
+    assert await viking_fs.read_file("viking://resources/a.md", ctx=request_context) == "a"
 
 
 @pytest.mark.asyncio
 async def test_rm_of_missing_path_does_not_create_it(request_context, local_fs_service):
-    service, viking_fs, root = local_fs_service
-    await viking_fs.mkdir("viking://resources/present", ctx=request_context)
+    service, viking_fs = local_fs_service
+    await viking_fs.mkdir("viking://resources", ctx=request_context)
 
-    try:
-        await service.rm("viking://resources/present/gone", ctx=request_context, recursive=True)
-    except Exception:
-        pass
-
-    assert not (root / "resources" / "present" / "gone").exists()
+    await service.rm("viking://resources/gone", ctx=request_context, recursive=True)
+    assert not await viking_fs.exists("viking://resources/gone", ctx=request_context)

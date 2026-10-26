@@ -11,7 +11,7 @@ import pytest_asyncio
 
 from openviking.pyagfs import get_binding_client
 from openviking.resource.watch_store_file import FileWatchStore
-from openviking.resource.watch_types import WatchTask
+from openviking.resource.watch_types import WatchAuthority, WatchPatch, WatchTask
 from openviking.server.identity import RequestContext, Role
 from openviking.storage.acl import AclAction, AclManager
 from openviking.storage.collection_schemas import CollectionSchemas
@@ -718,8 +718,11 @@ async def test_watch_persistence_overwrites_after_backup_removal_failure(binding
     store = FileWatchStore(fs)
     await store.initialize()
     ctx = root_ctx()
-    await store._save(store._rows)
-    await store._save(store._rows)
+    task = WatchTask.from_dict(
+        {"path": "https://example.com/doc", "to_uri": "viking://resources/doc"}
+    )
+    await store.create_task(task)
+    await store.patch_task(task.task_id, WatchPatch({"reason": "before"}), WatchAuthority())
     assert await fs.exists(store.STORAGE_BAK_URI, ctx=ctx)
     real_rm = fs.rm
 
@@ -729,10 +732,9 @@ async def test_watch_persistence_overwrites_after_backup_removal_failure(binding
         return await real_rm(uri, **kwargs)
 
     monkeypatch.setattr(fs, "rm", fail_backup_removal)
-    task = WatchTask(path="https://example.com/doc", to_uri="viking://resources/doc")
-    await store.create_task(task)
+    await store.patch_task(task.task_id, WatchPatch({"reason": "after"}), WatchAuthority())
     stored = json.loads(await fs.read_file(store.STORAGE_URI, ctx=ctx))
-    assert [item["task_id"] for item in stored["tasks"]] == [task.task_id]
+    assert stored["tasks"][0]["reason"] == "after"
     backup = json.loads(await fs.read_file(store.STORAGE_BAK_URI, ctx=ctx))
-    assert backup["tasks"] == []
+    assert backup["tasks"][0]["reason"] == "before"
     assert not await fs.exists(store.STORAGE_TMP_URI, ctx=ctx)
