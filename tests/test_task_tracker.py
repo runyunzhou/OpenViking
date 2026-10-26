@@ -17,6 +17,7 @@ from openviking.server.identity import RequestContext, Role
 from openviking.service.session_service import SessionService
 from openviking.service.task_domain import TaskPatch
 from openviking.service.task_store import (
+    SYSTEM_TASK_ACCOUNT_ID,
     PersistentTaskStore,
     _task_from_payload,
     _task_to_payload,
@@ -30,7 +31,7 @@ from openviking.service.task_tracker import (
     set_task_tracker,
 )
 from openviking.service.task_work_index import get_task_context
-from openviking_cli.exceptions import DeadlineExceededError
+from openviking_cli.exceptions import DeadlineExceededError, FailedPreconditionError
 from openviking_cli.session.user_id import UserIdentifier
 
 pytestmark = pytest.mark.asyncio
@@ -175,6 +176,24 @@ async def test_create_task(tracker: TaskTracker):
     assert task.task_type == "session_commit"
     assert task.resource_id == "sess-123"
     assert task.status == TaskStatus.PENDING
+
+
+async def test_deletion_guard_refuses_new_tasks_for_deleting_identities(tracker: TaskTracker):
+    existing = await tracker.create("add_resource", task_id="replayed", **_owner_kwargs())
+    deleting = {("acme", "alice")}
+
+    async def guard(account_id, user_id):
+        return (account_id, user_id) in deleting
+
+    tracker.set_deletion_guard(guard)
+
+    with pytest.raises(FailedPreconditionError):
+        await tracker.create("add_resource", task_id="late", **_owner_kwargs())
+    assert await tracker.get("late", **_owner_kwargs()) is None
+    replayed = await tracker.create("add_resource", task_id="replayed", **_owner_kwargs())
+    assert replayed.task_id == existing.task_id
+    assert await tracker.create("add_resource", **_owner_kwargs(user_id="bob"))
+    assert await tracker.create("account_delete", account_id=SYSTEM_TASK_ACCOUNT_ID, user_id="root")
 
 
 async def test_start_task(tracker: TaskTracker):

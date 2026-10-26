@@ -59,7 +59,11 @@ from openviking.service.task_store import (
 )
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import TaskWorkIndex
-from openviking_cli.exceptions import DeadlineExceededError, OpenVikingError
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    FailedPreconditionError,
+    OpenVikingError,
+)
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -295,11 +299,28 @@ class TaskTracker:
         self._running: ContextVar[tuple[str, str, str, bool] | None] = ContextVar(
             "task_tracker_running_work", default=None
         )
+        self._deletion_guard: Optional[Callable[[str, str], Any]] = None
 
     @staticmethod
     def _validate_owner(account_id: str, user_id: str) -> None:
         if not account_id or not user_id:
             raise ValueError("Task ownership requires non-empty account_id and user_id")
+
+    def set_deletion_guard(self, guard: Optional[Callable[[str, str], Any]]) -> None:
+        """Reject new Tasks for identities the guard reports as being deleted.
+
+        Identity cleanup cancels the Tasks it can list; a submission that was
+        already past authentication must not add one after that.
+        """
+        self._deletion_guard = guard
+
+    async def _ensure_owner_not_deleting(self, account_id: str, user_id: str) -> None:
+        guard = self._deletion_guard
+        if guard is None or account_id == SYSTEM_TASK_ACCOUNT_ID:
+            return
+        result = guard(account_id, user_id)
+        if await result if inspect.isawaitable(result) else result:
+            raise FailedPreconditionError("Identity deletion is in progress")
 
     def attach_work_index(self, work_index: TaskWorkIndex) -> None:
         """Replace the process-local active-handle index."""
@@ -416,6 +437,7 @@ class TaskTracker:
             existing = await self.get(task_id, account_id=account_id, user_id=user_id)
             if existing is not None:
                 return existing
+        await self._ensure_owner_not_deleting(account_id, user_id)
         task = TaskRecord(
             task_id=task_id or str(uuid4()),
             task_type=task_type,
