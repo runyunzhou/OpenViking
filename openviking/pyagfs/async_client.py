@@ -11,6 +11,7 @@ from typing import Any, BinaryIO, Dict, List, Union
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.storage.errors import InvalidPathLockRequestError
 
+from .leader import LeaderCandidate, LeaderMode, _LocalLeaderBackend, leader_candidate
 from .protocols import AGFSSyncClientProtocol
 
 _SYSTEM_ACCOUNT_ID = "_system"
@@ -91,6 +92,29 @@ class AsyncAGFSClient:
 
     def __init__(self, client: AGFSSyncClientProtocol):
         self._client = client
+        self._local_leader_backend = _LocalLeaderBackend()
+
+    def leader_candidate(
+        self,
+        key: str,
+        holder_id: str,
+        *,
+        ttl_secs: float,
+        renew_interval_secs: float,
+        retry_interval_secs: float,
+        mode: LeaderMode = "distributed",
+    ) -> LeaderCandidate:
+        """Create a leader candidate whose terms expose only a stop event."""
+        return leader_candidate(
+            self._client,
+            self._local_leader_backend,
+            key=key,
+            holder_id=holder_id,
+            ttl_secs=ttl_secs,
+            renew_interval_secs=renew_interval_secs,
+            retry_interval_secs=retry_interval_secs,
+            mode=mode,
+        )
 
     async def run(self, method_name: str, /, *args: Any, **kwargs: Any) -> Any:
         """Run a sync method off-thread, settling I/O before propagating cancellation."""
