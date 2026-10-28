@@ -2628,13 +2628,16 @@ impl RAGFSBindingClient {
         let manager = self.clone_leader_manager()?;
         let leases = Arc::clone(&self.leader_leases);
         let task = self.rt.spawn(async move {
-            let mut leases = leases.lock().await;
-            let Some(lease) = leases.get(&lease_ref).cloned() else {
+            let lease = {
+                let leases = leases.lock().await;
+                leases.get(&lease_ref).cloned()
+            };
+            let Some(lease) = lease else {
                 return Ok(false);
             };
             let renewed = manager.renew(&lease, ttl).await?;
             if !renewed {
-                leases.remove(&lease_ref);
+                leases.lock().await.remove(&lease_ref);
             }
             Ok::<bool, ragfs::cache_runtime::CacheError>(renewed)
         });

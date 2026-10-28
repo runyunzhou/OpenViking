@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import math
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -16,6 +18,25 @@ from openviking_cli.utils.logger import get_logger
 logger = get_logger(__name__)
 
 LeaderMode = Literal["distributed", "local"]
+_MIN_TTL_SECS = 0.001
+_LEADER_COMPONENT_CHARS = frozenset("._-:")
+
+
+def _validate_component(name: str, value: str) -> None:
+    if not value or not all(
+        char.isascii() and (char.isalnum() or char in _LEADER_COMPONENT_CHARS)
+        for char in value
+    ):
+        raise ValueError(
+            f"{name} must contain only ASCII letters, digits, '.', '_', '-' or ':'"
+        )
+
+
+def _validate_timing(name: str, value: float) -> None:
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("leader timing values must be finite positive numbers")
+    if name == "ttl_secs" and value < _MIN_TTL_SECS:
+        raise ValueError("ttl_secs must be at least 0.001 seconds")
 
 
 class _LeaderBackend(Protocol):
@@ -60,11 +81,26 @@ class _NativeLeaderBackend:
         )
         try:
             return await asyncio.shield(future)
-        except asyncio.CancelledError as cancelled:
+        except asyncio.CancelledError:
+            await self._release_acquired_after_cancel(future)
+            raise
+
+    async def _release_acquired_after_cancel(
+        self, future: asyncio.Future[str | None]
+    ) -> None:
+        try:
             lease_ref = await future
-            if lease_ref is not None:
-                await self.release(lease_ref)
-            raise cancelled
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("Leader lease acquisition cleanup failed")
+            return
+        if lease_ref is None:
+            return
+        try:
+            await self.release(lease_ref)
+        except Exception:
+            logger.exception("Failed to release leader lease after cancellation")
 
     async def renew(self, lease_ref: str, ttl_secs: float) -> bool:
         return bool(await self._client.leader_renew_async(lease_ref, ttl_secs))
@@ -83,13 +119,13 @@ class _LocalLeaderBackend:
     """One-process fallback for file-backed deployments."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()
         self._owners: dict[str, str] = {}
         self._leases: dict[str, _LocalLease] = {}
 
     async def acquire(self, key: str, holder_id: str, ttl_secs: float) -> Optional[str]:
         del holder_id
-        async with self._lock:
+        with self._lock:
             now = time.monotonic()
             current_ref = self._owners.get(key)
             if current_ref is not None:
@@ -104,7 +140,7 @@ class _LocalLeaderBackend:
             return lease_ref
 
     async def renew(self, lease_ref: str, ttl_secs: float) -> bool:
-        async with self._lock:
+        with self._lock:
             lease = self._leases.get(lease_ref)
             now = time.monotonic()
             if (
@@ -118,10 +154,13 @@ class _LocalLeaderBackend:
             return True
 
     async def release(self, lease_ref: str) -> None:
-        async with self._lock:
+        with self._lock:
             lease = self._leases.pop(lease_ref, None)
             if lease is not None and self._owners.get(lease.key) == lease_ref:
                 self._owners.pop(lease.key, None)
+
+
+_LOCAL_LEADER_BACKEND = _LocalLeaderBackend()
 
 
 @dataclass(frozen=True)
@@ -145,10 +184,11 @@ class LeaderCandidate(AsyncIterator[Leadership]):
         renew_interval_secs: float,
         retry_interval_secs: float,
     ) -> None:
-        if not key or not holder_id:
-            raise ValueError("leader key and holder_id must not be empty")
-        if min(ttl_secs, renew_interval_secs, retry_interval_secs) <= 0:
-            raise ValueError("leader timing values must be positive")
+        _validate_component("leader key", key)
+        _validate_component("holder_id", holder_id)
+        _validate_timing("ttl_secs", ttl_secs)
+        _validate_timing("renew_interval_secs", renew_interval_secs)
+        _validate_timing("retry_interval_secs", retry_interval_secs)
         if renew_interval_secs >= ttl_secs:
             raise ValueError("renew_interval_secs must be less than ttl_secs")
         self._backend = backend
