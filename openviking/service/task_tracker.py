@@ -90,6 +90,7 @@ _CANCELLABLE_TASK_TYPES = {
     "admin_reindex",
     "snapshot_restore_reindex",
 }
+_IDENTITY_CLEANUP_TASK_TYPES = {"account_delete", "user_delete"}
 _CANCEL_POLL_INTERVAL = 30
 _WAIT_INITIAL_POLL_INTERVAL = 0.05
 _WAIT_MAX_POLL_INTERVAL = 10.0
@@ -487,7 +488,10 @@ class TaskTracker:
                 return existing
         admission = _admission.get()
         admitted = admission[1] if admission and admission[0] == task_id else None
-        if await self._owner_deleting(account_id, user_id):
+        # Compatibility for deletion fences written before cleanup tasks used
+        # system ownership. Remove after legacy non-system cleanup owners age out.
+        enforce_identity_admission = task_type not in _IDENTITY_CLEANUP_TASK_TYPES
+        if enforce_identity_admission and await self._owner_deleting(account_id, user_id):
             raise FailedPreconditionError("Identity deletion is in progress")
         if admitted is not None and not await admitted():
             raise FailedPreconditionError("Task creation is no longer admitted")
@@ -514,7 +518,7 @@ class TaskTracker:
             created = self._public(creation.task)
             if not creation.created:
                 return created
-            if await self._owner_deleting(account_id, user_id):
+            if enforce_identity_admission and await self._owner_deleting(account_id, user_id):
                 refusal = "Identity deletion is in progress"
                 raise FailedPreconditionError(refusal)
             if admitted is not None and not await admitted():

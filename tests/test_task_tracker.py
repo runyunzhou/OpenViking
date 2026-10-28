@@ -197,6 +197,25 @@ async def test_deletion_guard_refuses_new_tasks_for_deleting_identities(tracker:
     assert await tracker.create("account_delete", account_id=SYSTEM_TASK_ACCOUNT_ID, user_id="root")
 
 
+async def test_identity_cleanup_task_creation_allows_legacy_deleting_owner(
+    tracker: TaskTracker,
+):
+    async def guard(account_id, user_id):
+        return (account_id, user_id) == ("acc", "alice")
+
+    tracker.set_deletion_guard(guard)
+
+    task = await tracker.create(
+        "user_delete",
+        task_id="legacy-delete",
+        account_id="acc",
+        user_id="alice",
+    )
+    assert task.task_id == "legacy-delete"
+    with pytest.raises(FailedPreconditionError):
+        await tracker.create("add_resource", account_id="acc", user_id="alice")
+
+
 async def test_wait_uses_short_initial_poll(monkeypatch, tracker: TaskTracker):
     task = await tracker.create("add_resource", task_id="task", **_owner_kwargs())
     delays = []
