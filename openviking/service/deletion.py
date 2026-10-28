@@ -146,12 +146,7 @@ class DeletionService:
             return False
         if await self._is_deleting(account_id, user_id):
             return True
-        if await self._manager.get_account(account_id) is None:
-            return True
-        try:
-            user = await self._manager.get_user_membership(account_id, user_id)
-        except NotFoundError:
-            return True
+        user = await self._manager.get_user(account_id, user_id)
         return user is None
 
     async def delete(

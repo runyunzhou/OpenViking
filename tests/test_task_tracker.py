@@ -197,6 +197,20 @@ async def test_deletion_guard_refuses_new_tasks_for_deleting_identities(tracker:
     assert await tracker.create("account_delete", account_id=SYSTEM_TASK_ACCOUNT_ID, user_id="root")
 
 
+async def test_wait_uses_short_initial_poll(monkeypatch, tracker: TaskTracker):
+    task = await tracker.create("add_resource", task_id="task", **_owner_kwargs())
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+        await tracker.complete(task.task_id, {}, **_owner_kwargs())
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    assert (await tracker.wait(task.task_id, **_owner_kwargs())).status is TaskStatus.COMPLETED
+    assert delays == [0.05]
+
+
 @pytest.mark.parametrize("failure", ["deletion", "identity-query", "watch-admission"])
 async def test_creation_rejected_after_insert_withdraws_the_task(tracker, failure):
     deleting = set()
