@@ -54,12 +54,17 @@ from openviking.service.task_store import (
     StoreOperationCode,
     StoreOperationResult,
     TaskAlreadyActive,
+    TaskCreationResult,
     TaskWorkStore,
     WorkRegistration,
 )
 from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import TaskWorkIndex
-from openviking_cli.exceptions import DeadlineExceededError, OpenVikingError
+from openviking_cli.exceptions import (
+    DeadlineExceededError,
+    FailedPreconditionError,
+    OpenVikingError,
+)
 from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -86,7 +91,8 @@ _CANCELLABLE_TASK_TYPES = {
     "snapshot_restore_reindex",
 }
 _CANCEL_POLL_INTERVAL = 30
-_TASK_WAIT_POLL_INTERVAL = 0.05
+_TASK_WAIT_POLL_INTERVAL = 10.0
+_WORK_WAIT_POLL_INTERVAL = 5.0
 _PUBLIC_QUEUE_NAMES = ("Semantic", "Embedding")
 
 _sanitize_error = sanitize_error
@@ -100,6 +106,28 @@ class _WaitBudget:
 
 
 _wait_budget: ContextVar[Optional[_WaitBudget]] = ContextVar("task_wait_budget", default=None)
+
+
+_admission: ContextVar[Optional[tuple[str, Callable[[], Awaitable[bool]]]]] = ContextVar(
+    "task_admission", default=None
+)
+
+
+@contextmanager
+def task_admission(
+    task_id: str, admitted: Callable[[], Awaitable[bool]]
+) -> Generator[None, None, None]:
+    """Create *task_id* within this context only while *admitted* holds.
+
+    create checks before the insert and again after it. A confirmed revocation
+    withdraws an unused Task or cancels one that another caller has taken over.
+    A failed check or cancelled caller only withdraws an unused Task.
+    """
+    token = _admission.set((task_id, admitted))
+    try:
+        yield
+    finally:
+        _admission.reset(token)
 
 
 @contextmanager
@@ -296,11 +324,51 @@ class TaskTracker:
         self._running: ContextVar[tuple[str, str, str, bool] | None] = ContextVar(
             "task_tracker_running_work", default=None
         )
+        self._deletion_guard: Optional[Callable[[str, str], Any]] = None
 
     @staticmethod
     def _validate_owner(account_id: str, user_id: str) -> None:
         if not account_id or not user_id:
             raise ValueError("Task ownership requires non-empty account_id and user_id")
+
+    def set_deletion_guard(self, guard: Optional[Callable[[str, str], Any]]) -> None:
+        """Reject new Tasks for identities the guard reports as being deleted.
+
+        Identity cleanup records its fence and then lists the Tasks to cancel;
+        create inserts the Task and then reads the fence again. One of the two
+        reads observes the other's write, so a Task inserted concurrently with
+        a deletion is either listed by cleanup or withdrawn/cancelled here.
+        """
+        self._deletion_guard = guard
+
+    async def _owner_deleting(self, account_id: str, user_id: str) -> bool:
+        guard = self._deletion_guard
+        if guard is None or account_id == SYSTEM_TASK_ACCOUNT_ID:
+            return False
+        result = guard(account_id, user_id)
+        return bool(await result if inspect.isawaitable(result) else result)
+
+    async def _withdraw(
+        self, task_id: str, *, account_id: str, user_id: str, refusal: Optional[str]
+    ) -> None:
+        withdrawn = await self._store.withdraw_unaccepted(
+            task_id, account_id=account_id, user_id=user_id
+        )
+        if withdrawn.is_applied:
+            self._work_index.forget_task(task_id, account_id=account_id, user_id=user_id)
+            return
+        if withdrawn.accepted or refusal is None:
+            return
+        cancellation = await self._request_cancellation(
+            task_id,
+            account_id=account_id,
+            user_id=user_id,
+            allow_terminal=False,
+        )
+        if cancellation.accepted:
+            self._work_index.cancel_active(task_id, account_id=account_id, user_id=user_id)
+        elif cancellation.code is StoreOperationCode.NOT_CANCELLABLE:
+            await self.fail(task_id, refusal, account_id=account_id, user_id=user_id)
 
     def attach_work_index(self, work_index: TaskWorkIndex) -> None:
         """Replace the process-local active-handle index."""
@@ -417,6 +485,12 @@ class TaskTracker:
             existing = await self.get(task_id, account_id=account_id, user_id=user_id)
             if existing is not None:
                 return existing
+        admission = _admission.get()
+        admitted = admission[1] if admission and admission[0] == task_id else None
+        if await self._owner_deleting(account_id, user_id):
+            raise FailedPreconditionError("Identity deletion is in progress")
+        if admitted is not None and not await admitted():
+            raise FailedPreconditionError("Task creation is no longer admitted")
         task = TaskRecord(
             task_id=task_id or str(uuid4()),
             task_type=task_type,
@@ -426,10 +500,41 @@ class TaskTracker:
             meta=dict(meta or {}),
             auth=dict(auth or {}),
         )
-        stored = await run_to_completion(
-            lambda: self._store.create(task, reject_if_active=reject_if_active)
-        )
-        return self._public(stored or task)
+        creation: Optional[TaskCreationResult] = None
+        refusal: Optional[str] = None
+
+        async def persist() -> None:
+            nonlocal creation
+            # Retain the committed result even when the caller cancels during I/O.
+            creation = await self._store.create(task, reject_if_active=reject_if_active)
+
+        try:
+            await run_to_completion(persist)
+            assert creation is not None
+            created = self._public(creation.task)
+            if not creation.created:
+                return created
+            if await self._owner_deleting(account_id, user_id):
+                refusal = "Identity deletion is in progress"
+                raise FailedPreconditionError(refusal)
+            if admitted is not None and not await admitted():
+                refusal = "Task creation is no longer admitted"
+                raise FailedPreconditionError(refusal)
+        except BaseException:
+            if creation is not None and creation.created:
+                try:
+                    await run_to_completion(
+                        lambda: self._withdraw(
+                            task.task_id,
+                            account_id=account_id,
+                            user_id=user_id,
+                            refusal=refusal,
+                        )
+                    )
+                except BaseException:
+                    logger.exception("[TaskTracker] Failed to withdraw Task %s", task.task_id)
+            raise
+        return created
 
     async def create_if_no_running(
         self,
@@ -1108,7 +1213,7 @@ class TaskTracker:
         user_id: Optional[str] = None,
         timeout: Optional[float] = None,
         stop_waiting: Optional[Callable[[], bool]] = None,
-        poll_interval: float = _TASK_WAIT_POLL_INTERVAL,
+        poll_interval: float = _WORK_WAIT_POLL_INTERVAL,
     ) -> None:
         wanted = set(work_ids)
         if not wanted:
@@ -1144,7 +1249,7 @@ class TaskTracker:
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
         timeout: Optional[float] = None,
-        poll_interval: float = _TASK_WAIT_POLL_INTERVAL,
+        poll_interval: float = _WORK_WAIT_POLL_INTERVAL,
     ) -> None:
         with _consume_wait_budget(task_id, timeout) as remaining:
             deadline = None if remaining is None else time.monotonic() + remaining

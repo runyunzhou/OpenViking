@@ -104,7 +104,17 @@ async def test_health_endpoint_without_api_key():
 
 
 @pytest.mark.parametrize(
-    "credentials", ["anonymous", "partial", "trusted", "keyed", "malformed", "asserted-root", "root-only", "invalid-root-only"]
+    "credentials",
+    [
+        "anonymous",
+        "partial",
+        "trusted",
+        "keyed",
+        "malformed",
+        "asserted-root",
+        "root-only",
+        "invalid-root-only",
+    ],
 )
 async def test_health_trusted_identity_contract(credentials, caplog, service):
     app = create_app(
@@ -287,10 +297,6 @@ async def test_ready_returns_200_after_initialized(monkeypatch):
     monkeypatch.setattr(
         "openviking_cli.utils.ollama.detect_ollama_in_config",
         lambda config: (False, None, None),
-    )
-    monkeypatch.setattr(
-        "openviking_cli.utils.config.open_viking_config.OpenVikingConfigSingleton.get_instance",
-        lambda: SimpleNamespace(embedding=SimpleNamespace(get_embedder=lambda: None)),
     )
 
     app = create_app(config=ServerConfig(), service=service)

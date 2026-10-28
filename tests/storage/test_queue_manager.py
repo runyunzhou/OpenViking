@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import threading
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -100,6 +101,10 @@ async def test_skill_shutdown_releases_lock_after_embedding_worker_exits(
     started, queued, release = threading.Event(), threading.Event(), threading.Event()
     events = []
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
+    # Exercise shutdown ordering without depending on the production polling interval.
+    monkeypatch.setattr(
+        tracker, "wait_for_work", partial(tracker.wait_for_work, poll_interval=0.01)
+    )
     monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
     task = await tracker.create(
         "add_skill", task_id="skill-task", account_id="acc", user_id="alice"

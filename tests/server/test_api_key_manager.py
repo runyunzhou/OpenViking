@@ -5,6 +5,7 @@
 
 import asyncio
 import hashlib
+import threading
 import uuid
 from types import SimpleNamespace
 
@@ -101,6 +102,61 @@ async def test_create_duplicate_account_raises(manager: APIKeyManager):
     await manager.create_account(acct, "alice")
     with pytest.raises(AlreadyExistsError):
         await manager.create_account(acct, "bob")
+
+
+async def test_account_reads_and_mutations_cross_loops_after_waiter_cancellation(
+    manager: APIKeyManager, manager_service, monkeypatch
+):
+    acct = _uid()
+    await manager.create_account(acct, "admin")
+    agfs = manager_service.viking_fs.agfs
+    entered, release, readers_waiting = threading.Event(), threading.Event(), threading.Event()
+    write = agfs.write
+
+    def delayed_write(path, *args, **kwargs):
+        if path == f"/local/{acct}/_system/users.json" and not entered.is_set():
+            entered.set()
+            if not release.wait(timeout=10):
+                raise TimeoutError("account write was not released")
+        return write(path, *args, **kwargs)
+
+    async def worker_operations():
+        tasks = [
+            asyncio.create_task(manager.get_account(acct)),
+            asyncio.create_task(manager.get_user_membership(acct, "alice")),
+            asyncio.create_task(manager.register_user(acct, "bob")),
+        ]
+        await asyncio.sleep(0)
+        readers_waiting.set()
+        return await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+
+    monkeypatch.setattr(agfs, "write", delayed_write)
+    writer = asyncio.create_task(manager.register_user(acct, "alice"))
+    worker = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 5)
+        worker = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(worker_operations())))
+        assert await asyncio.to_thread(readers_waiting.wait, 5)
+        cancelled = asyncio.create_task(manager.get_account(acct))
+        await asyncio.sleep(0)
+        cancelled.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled
+    finally:
+        release.set()
+        results = await asyncio.gather(
+            writer, *([worker] if worker is not None else []), return_exceptions=True
+        )
+    assert not any(isinstance(result, BaseException) for result in results)
+    account, membership, bob_key = results[1]
+    assert account["status"] == "active"
+    assert membership == {"user_id": "alice", "role": Role.USER}
+    assert (await manager.resolve_identity(bob_key)).user_id == "bob"
+    assert {item["user_id"] for item in await _list_users(manager, acct)} == {
+        "admin",
+        "alice",
+        "bob",
+    }
 
 
 async def test_ensure_trusted_identities_creates_missing_users_once(

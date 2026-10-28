@@ -189,6 +189,7 @@ async def _initialize_runtime_state(
         oauth_store=getattr(app.state, "oauth_store", None),
         usage_audit_runtime=getattr(app.state, "usage_audit_runtime", None),
         gateway_app=getattr(app.state, "gateway_app", None),
+        require_registered_identity=config.get_effective_auth_mode() == "api_key",
     )
     logger.info("OpenVikingService initialization complete")
 

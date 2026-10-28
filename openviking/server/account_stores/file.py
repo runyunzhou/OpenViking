@@ -15,6 +15,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from typing_extensions import deprecated
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.core.identifiers import validate_identifier_length
 from openviking.pyagfs import AGFSAlreadyExistsError, AGFSNotFoundError, AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
@@ -135,11 +136,11 @@ class FileStore(AccountStore):
         self._prefix_index: Dict[str, list[UserKeyEntry]] = {}
         self._user_group_ids: Dict[tuple[str, str], tuple[str, ...]] = {}
         # Serializes internal refreshes so overlapping reloads can't interleave.
-        self._reload_lock = asyncio.Lock()
+        self._reload_lock = AsyncSemaphore(1)
         # Serializes all mutations made by the unified manager in this process.
         # File locks remain responsible for inter-instance coordination.
-        self._mutation_lock = asyncio.Lock()
-        self._deletion_lock = asyncio.Lock()
+        self._mutation_lock = AsyncSemaphore(1)
+        self._deletion_lock = AsyncSemaphore(1)
 
     def _discard_account_state(self, account_id: str) -> None:
         """Remove an account and its key index entries from in-memory state."""
