@@ -19,6 +19,7 @@ logger = get_logger(__name__)
 
 LeaderMode = Literal["distributed", "local"]
 _MIN_TTL_SECS = 0.001
+_MAX_TTL_SECS = (2**63 - 1) / 1000
 _LEADER_COMPONENT_CHARS = frozenset("._-:")
 
 
@@ -37,6 +38,8 @@ def _validate_timing(name: str, value: float) -> None:
         raise ValueError("leader timing values must be finite positive numbers")
     if name == "ttl_secs" and value < _MIN_TTL_SECS:
         raise ValueError("ttl_secs must be at least 0.001 seconds")
+    if name == "ttl_secs" and value > _MAX_TTL_SECS:
+        raise ValueError("ttl_secs must not exceed i64::MAX milliseconds")
 
 
 class _LeaderBackend(Protocol):
@@ -82,14 +85,15 @@ class _NativeLeaderBackend:
         try:
             return await asyncio.shield(future)
         except asyncio.CancelledError:
-            await self._release_acquired_after_cancel(future)
+            if future.done():
+                await self._release_acquired_after_cancel(future)
             raise
 
     async def _release_acquired_after_cancel(
         self, future: asyncio.Future[str | None]
     ) -> None:
         try:
-            lease_ref = await future
+            lease_ref = future.result()
         except asyncio.CancelledError:
             return
         except Exception:
@@ -149,6 +153,8 @@ class _LocalLeaderBackend:
                 or self._owners.get(lease.key) != lease_ref
             ):
                 self._leases.pop(lease_ref, None)
+                if lease is not None and self._owners.get(lease.key) == lease_ref:
+                    self._owners.pop(lease.key, None)
                 return False
             lease.expires_at = now + ttl_secs
             return True

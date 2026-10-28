@@ -183,7 +183,7 @@ use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::time::{Duration, UNIX_EPOCH};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock};
 
 /// Validate and convert a wait timeout from Python.
 ///
@@ -201,17 +201,18 @@ fn validate_timeout_secs(v: f64) -> PyResult<Duration> {
 
 /// Validate a positive leader lease TTL from Python.
 fn validate_leader_ttl_secs(v: f64) -> PyResult<Duration> {
-    if v.is_finite() && v >= 0.001 {
+    let max_ttl_secs = (i64::MAX as f64) / 1000.0;
+    if v.is_finite() && (0.001..=max_ttl_secs).contains(&v) {
         Ok(Duration::from_secs_f64(v))
     } else {
         Err(PyValueError::new_err(
-            "ttl_secs must be a finite number >= 0.001",
+            "ttl_secs must be a finite number between 0.001 and i64::MAX milliseconds",
         ))
     }
 }
 
 use ragfs::cache::{CachePolicy, CacheTraversalMode};
-use ragfs::cache_runtime::{CacheRuntime, DynamicProviderConfig, RedisProviderConfig};
+use ragfs::cache_runtime::{CacheError, CacheRuntime, DynamicProviderConfig, RedisProviderConfig};
 use ragfs::core::builder::{
     CacheFsConfig, CacheRuntimeProviderConfig, CacheStackConfig, EncryptionConfig,
 };
@@ -1540,6 +1541,8 @@ struct RAGFSBindingClient {
     service_name: String,
     /// Opaque public references to hidden leader ownership tokens.
     leader_leases: Arc<AsyncMutex<HashMap<String, LeaderLease>>>,
+    /// Blocks leader operations during close and waits in-flight operations out.
+    leader_closing: Arc<AsyncRwLock<bool>>,
 }
 
 impl RAGFSBindingClient {
@@ -1751,6 +1754,7 @@ impl RAGFSBindingClient {
             cache_runtime: stack.cache_runtime,
             service_name: service_name.unwrap_or_else(|| "ragfs".to_string()),
             leader_leases: Arc::new(AsyncMutex::new(HashMap::new())),
+            leader_closing: Arc::new(AsyncRwLock::new(false)),
         })
     }
 
@@ -1760,14 +1764,16 @@ impl RAGFSBindingClient {
         let cache_runtime = self.cache_runtime.clone();
         let service_name = self.service_name.clone();
         let leader_leases = Arc::clone(&self.leader_leases);
+        let leader_closing = Arc::clone(&self.leader_closing);
         py_detach_blocking(py, || {
             self.rt.block_on(async move {
+                let mut closing = leader_closing.write().await;
+                *closing = true;
                 let mount_result = mountable.shutdown().await;
                 let cache_result = match cache_runtime {
                     Some(runtime) => {
                         if let Ok(manager) = LeaderManager::new(runtime.clone(), &service_name) {
-                            let leases =
-                                std::mem::take(&mut *leader_leases.lock().await);
+                            let leases = std::mem::take(&mut *leader_leases.lock().await);
                             for lease in leases.into_values() {
                                 let _ = manager.release(&lease).await;
                             }
@@ -1776,6 +1782,7 @@ impl RAGFSBindingClient {
                     }
                     None => Ok(()),
                 };
+                drop(closing);
                 mount_result.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
                 cache_result.map_err(PyRuntimeError::new_err)
             })
@@ -2599,20 +2606,24 @@ impl RAGFSBindingClient {
         let ttl = validate_leader_ttl_secs(ttl_secs)?;
         let manager = self.clone_leader_manager()?;
         let leases = Arc::clone(&self.leader_leases);
-        let task = self
-            .rt
-            .spawn(async move { manager.try_acquire(&key, &holder_id, ttl).await });
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let lease = task
-                .await
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
-                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        let leader_closing = Arc::clone(&self.leader_closing);
+        let task = self.rt.spawn(async move {
+            let closing = leader_closing.read().await;
+            if *closing {
+                return Err(CacheError::Closed);
+            }
+            let lease = manager.try_acquire(&key, &holder_id, ttl).await?;
             let Some(lease) = lease else {
                 return Ok(None);
             };
             let lease_ref = Uuid::new_v4().to_string();
             leases.lock().await.insert(lease_ref.clone(), lease);
-            Ok(Some(lease_ref))
+            Ok::<Option<String>, CacheError>(Some(lease_ref))
+        });
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            task.await
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))
         })
     }
 
@@ -2627,7 +2638,12 @@ impl RAGFSBindingClient {
         let ttl = validate_leader_ttl_secs(ttl_secs)?;
         let manager = self.clone_leader_manager()?;
         let leases = Arc::clone(&self.leader_leases);
+        let leader_closing = Arc::clone(&self.leader_closing);
         let task = self.rt.spawn(async move {
+            let closing = leader_closing.read().await;
+            if *closing {
+                return Err(CacheError::Closed);
+            }
             let lease = {
                 let leases = leases.lock().await;
                 leases.get(&lease_ref).cloned()
@@ -2657,10 +2673,19 @@ impl RAGFSBindingClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let manager = self.clone_leader_manager()?;
         let leases = Arc::clone(&self.leader_leases);
+        let leader_closing = Arc::clone(&self.leader_closing);
         let task = self.rt.spawn(async move {
-            let lease = leases.lock().await.remove(&lease_ref);
+            let closing = leader_closing.read().await;
+            if *closing {
+                return Err(CacheError::Closed);
+            }
+            let lease = {
+                let leases = leases.lock().await;
+                leases.get(&lease_ref).cloned()
+            };
             if let Some(lease) = lease {
                 manager.release(&lease).await?;
+                leases.lock().await.remove(&lease_ref);
             }
             Ok::<(), ragfs::cache_runtime::CacheError>(())
         });
