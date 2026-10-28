@@ -38,8 +38,9 @@ from openviking.service.deletion import DeletionService, setup_deletion
 from openviking.service.task_store import (
     SYSTEM_TASK_ACCOUNT_ID,
     SYSTEM_TASK_USER_ID,
+    PersistentTaskStore,
 )
-from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_tracker import TaskTracker, get_task_tracker, set_task_tracker
 from openviking.service.task_work_index import (
     TaskWorkRejected,
     bind_task_context,
@@ -3249,6 +3250,69 @@ async def test_remove_user(
         headers=root_headers(),
     )
     assert missing.status_code == 404
+
+
+async def test_delete_user_cleanup_uses_system_owner_when_actor_is_deleted(
+    lightweight_admin_app: FastAPI,
+):
+    try:
+        previous_tracker = get_task_tracker()
+    except RuntimeError:
+        previous_tracker = None
+    tracker = TaskTracker(PersistentTaskStore(_FakeAGFS()))
+    set_task_tracker(tracker)
+
+    acct = _uid()
+    try:
+        manager = lightweight_admin_app.state.api_key_manager
+        deletion_service = DeletionService(
+            service=lightweight_admin_app.state.fake_service,
+            manager=manager,
+            service_loop=asyncio.get_running_loop(),
+        )
+        await manager.create_account(acct, "alice")
+        await manager.register_user(acct, "bob", Role.ADMIN)
+        await manager.register_user(acct, "charlie", Role.USER)
+        bob_ctx = RequestContext(user=UserIdentifier(acct, "bob"), role=Role.ADMIN)
+
+        await deletion_service._submit(acct, "bob", actor=bob_ctx, enqueue=False)
+        result = await deletion_service._submit(acct, "charlie", actor=bob_ctx, enqueue=False)
+
+        task = await tracker.get(
+            result["task_id"],
+            account_id=SYSTEM_TASK_ACCOUNT_ID,
+            user_id=SYSTEM_TASK_USER_ID,
+        )
+        assert task is not None
+        assert task.task_type == "user_delete"
+        assert task.resource_id == f"{acct}/charlie"
+
+        deletion = await manager.get_deletion(acct, "charlie")
+        assert deletion["owner_account_id"] == SYSTEM_TASK_ACCOUNT_ID
+        assert deletion["owner_user_id"] == SYSTEM_TASK_USER_ID
+
+        await manager.register_user(acct, "dave", Role.USER)
+        stale_task_id = str(uuid.uuid4())
+        await manager.begin_deletion(
+            acct,
+            "dave",
+            task_id=stale_task_id,
+            owner_account_id=acct,
+            owner_user_id="bob",
+        )
+        retried = await deletion_service._submit(
+            acct,
+            "dave",
+            actor=RequestContext(user=UserIdentifier(acct, "alice"), role=Role.ADMIN),
+            enqueue=False,
+        )
+
+        assert retried["task_id"] != stale_task_id
+        repaired = await manager.get_deletion(acct, "dave")
+        assert repaired["owner_account_id"] == SYSTEM_TASK_ACCOUNT_ID
+        assert repaired["owner_user_id"] == SYSTEM_TASK_USER_ID
+    finally:
+        set_task_tracker(previous_tracker)
 
 
 # ---- Role management ----

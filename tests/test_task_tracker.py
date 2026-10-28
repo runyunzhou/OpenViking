@@ -211,6 +211,22 @@ async def test_wait_uses_short_initial_poll(monkeypatch, tracker: TaskTracker):
     assert delays == [0.05]
 
 
+async def test_wait_for_task_work_uses_short_initial_poll(monkeypatch, tracker: TaskTracker):
+    task = await tracker.create("add_resource", task_id="task", **_owner_kwargs())
+    await tracker.start(task.task_id, **_owner_kwargs())
+    await tracker.register_work(task.task_id, "work", "Semantic", **_owner_kwargs())
+    delays = []
+
+    async def sleep(delay):
+        delays.append(delay)
+        await tracker.mark_work_done(task.task_id, "work", **_owner_kwargs())
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    await tracker.wait_for_task_work(task.task_id, **_owner_kwargs())
+    assert delays == [0.05]
+
+
 @pytest.mark.parametrize("failure", ["deletion", "identity-query", "watch-admission"])
 async def test_creation_rejected_after_insert_withdraws_the_task(tracker, failure):
     deleting = set()

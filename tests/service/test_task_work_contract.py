@@ -246,7 +246,7 @@ async def test_task_work_wait_includes_recovered_and_later_enqueued_work(tracker
     await tracker.register_work("task", "root", "Inline", **OWNER)
     await tracker.reconcile_delivery("task", "semantic", "Semantic", **OWNER)
     waiting = asyncio.create_task(
-        tracker.wait_for_task_work("task", exclude_work_id="root", poll_interval=0.001, **OWNER)
+        tracker.wait_for_task_work("task", exclude_work_id="root", **OWNER)
     )
     try:
         await asyncio.sleep(0)

@@ -91,9 +91,8 @@ _CANCELLABLE_TASK_TYPES = {
     "snapshot_restore_reindex",
 }
 _CANCEL_POLL_INTERVAL = 30
-_TASK_WAIT_INITIAL_POLL_INTERVAL = 0.05
-_TASK_WAIT_MAX_POLL_INTERVAL = 10.0
-_WORK_WAIT_POLL_INTERVAL = 5.0
+_WAIT_INITIAL_POLL_INTERVAL = 0.05
+_WAIT_MAX_POLL_INTERVAL = 10.0
 _PUBLIC_QUEUE_NAMES = ("Semantic", "Embedding")
 
 _sanitize_error = sanitize_error
@@ -849,12 +848,10 @@ class TaskTracker:
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
         timeout: Optional[float] = None,
-        poll_interval: float = _TASK_WAIT_INITIAL_POLL_INTERVAL,
-        max_poll_interval: float = _TASK_WAIT_MAX_POLL_INTERVAL,
     ) -> TaskRecord:
         with _consume_wait_budget(task_id, timeout) as remaining:
             deadline = None if remaining is None else time.monotonic() + remaining
-            next_poll_interval = poll_interval
+            next_poll_interval = _WAIT_INITIAL_POLL_INTERVAL
             while True:
                 if account_id is not None and user_id is not None:
                     status = await self.get_task_status(
@@ -887,7 +884,7 @@ class TaskTracker:
                     if remaining is None
                     else min(next_poll_interval, remaining)
                 )
-                next_poll_interval = min(max_poll_interval, next_poll_interval * 2)
+                next_poll_interval = min(_WAIT_MAX_POLL_INTERVAL, next_poll_interval * 2)
 
     async def list_tasks(
         self,
@@ -1219,13 +1216,13 @@ class TaskTracker:
         user_id: Optional[str] = None,
         timeout: Optional[float] = None,
         stop_waiting: Optional[Callable[[], bool]] = None,
-        poll_interval: float = _WORK_WAIT_POLL_INTERVAL,
     ) -> None:
         wanted = set(work_ids)
         if not wanted:
             return
         with _consume_wait_budget(task_id, timeout) as remaining:
             deadline = None if remaining is None else time.monotonic() + remaining
+            next_poll_interval = _WAIT_INITIAL_POLL_INTERVAL
             while True:
                 works = await self._store.get_works(
                     task_id,
@@ -1244,8 +1241,11 @@ class TaskTracker:
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"Timed out waiting for Work in Task {task_id}")
                 await asyncio.sleep(
-                    poll_interval if remaining is None else min(poll_interval, remaining)
+                    next_poll_interval
+                    if remaining is None
+                    else min(next_poll_interval, remaining)
                 )
+                next_poll_interval = min(_WAIT_MAX_POLL_INTERVAL, next_poll_interval * 2)
 
     async def wait_for_task_work(
         self,
@@ -1255,10 +1255,10 @@ class TaskTracker:
         account_id: Optional[str] = None,
         user_id: Optional[str] = None,
         timeout: Optional[float] = None,
-        poll_interval: float = _WORK_WAIT_POLL_INTERVAL,
     ) -> None:
         with _consume_wait_budget(task_id, timeout) as remaining:
             deadline = None if remaining is None else time.monotonic() + remaining
+            next_poll_interval = _WAIT_INITIAL_POLL_INTERVAL
             while await self._store.has_open_work(
                 task_id,
                 exclude_work_id=exclude_work_id,
@@ -1269,8 +1269,11 @@ class TaskTracker:
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"Timed out waiting for Work in Task {task_id}")
                 await asyncio.sleep(
-                    poll_interval if remaining is None else min(poll_interval, remaining)
+                    next_poll_interval
+                    if remaining is None
+                    else min(next_poll_interval, remaining)
                 )
+                next_poll_interval = min(_WAIT_MAX_POLL_INTERVAL, next_poll_interval * 2)
 
     async def is_enqueue_complete(
         self,
