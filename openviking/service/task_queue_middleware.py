@@ -197,20 +197,27 @@ class TaskWorkQueueMiddleware(QueueMiddleware):
     ) -> ProcessResult | None:
         from openviking.service.task_domain import WorkState
 
+        status = await self._tracker.get_task_status(
+            metadata.task_id,
+            account_id=metadata.account_id,
+            user_id=metadata.user_id,
+        )
         state = await self._tracker.get_work_state(
             metadata.task_id,
             metadata.work_id,
             account_id=metadata.account_id,
             user_id=metadata.user_id,
         )
+        if status is None or status in TERMINAL_TASK_STATUSES:
+            if state is not None:
+                await self._tracker.settle_work(
+                    metadata.task_id,
+                    metadata.work_id,
+                    account_id=metadata.account_id,
+                    user_id=metadata.user_id,
+                )
+            return ProcessResult.success()
         if state is None:
-            status = await self._tracker.get_task_status(
-                metadata.task_id,
-                account_id=metadata.account_id,
-                user_id=metadata.user_id,
-            )
-            if status in TERMINAL_TASK_STATUSES:
-                return ProcessResult.success()
             await self._tracker.reconcile_delivery(
                 metadata.task_id,
                 metadata.work_id,
