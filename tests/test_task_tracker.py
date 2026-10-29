@@ -197,9 +197,7 @@ async def test_deletion_guard_refuses_new_tasks_for_deleting_identities(tracker:
     assert await tracker.create("account_delete", account_id=SYSTEM_TASK_ACCOUNT_ID, user_id="root")
 
 
-async def test_identity_cleanup_task_creation_allows_legacy_deleting_owner(
-    tracker: TaskTracker,
-):
+async def test_identity_cleanup_task_creation_allows_deleting_owner(tracker: TaskTracker):
     async def guard(account_id, user_id):
         return (account_id, user_id) == ("acc", "alice")
 
@@ -207,11 +205,11 @@ async def test_identity_cleanup_task_creation_allows_legacy_deleting_owner(
 
     task = await tracker.create(
         "user_delete",
-        task_id="legacy-delete",
+        task_id="cleanup",
         account_id="acc",
         user_id="alice",
     )
-    assert task.task_id == "legacy-delete"
+    assert task.task_id == "cleanup"
     with pytest.raises(FailedPreconditionError):
         await tracker.create("add_resource", account_id="acc", user_id="alice")
 

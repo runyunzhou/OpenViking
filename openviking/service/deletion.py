@@ -112,23 +112,6 @@ class DeletionService:
                 user_id=owner_user_id,
             )
             if task is None:
-                if (
-                    owner_account_id != SYSTEM_TASK_ACCOUNT_ID
-                    or owner_user_id != SYSTEM_TASK_USER_ID
-                ):
-                    deletion = await self._manager.replace_deletion_task(
-                        account_id,
-                        user_id,
-                        expected_task_id=task_id,
-                        task_id=str(uuid4()),
-                        owner_account_id=SYSTEM_TASK_ACCOUNT_ID,
-                        owner_user_id=SYSTEM_TASK_USER_ID,
-                    )
-                    if not deletion:
-                        continue
-                    task_id = deletion["task_id"]
-                    owner_account_id = deletion["owner_account_id"]
-                    owner_user_id = deletion["owner_user_id"]
                 task = await tracker.create(
                     "account_delete" if user_id is None else "user_delete",
                     resource_id=account_id if user_id is None else f"{account_id}/{user_id}",
@@ -216,8 +199,16 @@ class DeletionService:
         actor: RequestContext,
         enqueue: bool = True,
     ) -> dict[str, str]:
-        request_owner_account_id = SYSTEM_TASK_ACCOUNT_ID
-        request_owner_user_id = SYSTEM_TASK_USER_ID
+        if (
+            user_id is None
+            or actor.role == Role.ROOT
+            or (actor.account_id == account_id and actor.user.user_id == user_id)
+        ):
+            request_owner_account_id = SYSTEM_TASK_ACCOUNT_ID
+            request_owner_user_id = SYSTEM_TASK_USER_ID
+        else:
+            request_owner_account_id = actor.account_id
+            request_owner_user_id = actor.user.user_id
 
         async with self._request_lock:
             task_id = str(uuid4())
@@ -237,13 +228,7 @@ class DeletionService:
                     account_id=owner_account_id,
                     user_id=owner_user_id,
                 )
-                owner_is_system = (
-                    owner_account_id == SYSTEM_TASK_ACCOUNT_ID
-                    and owner_user_id == SYSTEM_TASK_USER_ID
-                )
-                if (
-                    existing is not None and existing.status in _TERMINAL_TASK_STATUSES
-                ) or (existing is None and not owner_is_system):
+                if existing is not None and existing.status in _TERMINAL_TASK_STATUSES:
                     deletion = await self._manager.replace_deletion_task(
                         account_id,
                         user_id,

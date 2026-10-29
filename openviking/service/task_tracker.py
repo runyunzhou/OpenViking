@@ -488,8 +488,8 @@ class TaskTracker:
                 return existing
         admission = _admission.get()
         admitted = admission[1] if admission and admission[0] == task_id else None
-        # Compatibility for deletion fences written before cleanup tasks used
-        # system ownership. Remove after legacy non-system cleanup owners age out.
+        # Identity cleanup may be owned by an actor that is itself being deleted;
+        # fencing it would strand the target deletion without a cleanup task.
         enforce_identity_admission = task_type not in _IDENTITY_CLEANUP_TASK_TYPES
         if enforce_identity_admission and await self._owner_deleting(account_id, user_id):
             raise FailedPreconditionError("Identity deletion is in progress")
