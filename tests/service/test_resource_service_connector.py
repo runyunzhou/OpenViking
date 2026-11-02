@@ -929,9 +929,21 @@ async def test_connector_watch_runtime_restores_request_credentials(
     service = admission_watch_service.service
     await service._viking_fs.mkdir("viking://resources/x", ctx=ctx, exist_ok=True)
 
+    async def remote_submit(**_kwargs):
+        records = await admission_watch_service.tracker.list_tasks(
+            account_id="acct", user_id="alice"
+        )
+        assert len(records) == 1 and records[0].task_type == "connector_import"
+        assert not records[0].is_terminal()
+        state = await service._watch_manager.store.get_state(task.task_id)
+        assert state.current_run_id == records[0].task_id
+        async with service._watch_manager.locks.tree("acct", task.to_uri):
+            pass
+        return {"task_key": "connector-1"}
+
     old_states, new_states = {"cursor": 1}, {"cursor": 2}
     client = SimpleNamespace(
-        submit_doc_add=AsyncMock(return_value={"task_key": "connector-1"}),
+        submit_doc_add=AsyncMock(side_effect=remote_submit),
         get_task_info=AsyncMock(return_value={"Status": status, "StreamStates": new_states}),
     )
     _install_connector_dependencies(
@@ -949,49 +961,16 @@ async def test_connector_watch_runtime_restores_request_credentials(
     assert await service._watch_runtime.schedule_task(task.task_id)
     await _settle_background(service)
 
+    client.submit_doc_add.assert_awaited_once()
     submitted = client.submit_doc_add.await_args.kwargs
     assert submitted["api_key"] == "secret"
     assert submitted["stream_states"] == old_states
     updated = await service._get_watch_manager().get_task(task.task_id)
     assert updated.last_status == ("completed" if status == "succeeded" else "failed")
     assert updated.connector_states == (new_states if status == "succeeded" else old_states)
-
-
-@pytest.mark.asyncio
-async def test_connector_task_and_watch_exist_before_remote_submit(
-    monkeypatch, connector_config, ctx, admission_watch_service
-):
-    service = admission_watch_service.service
-    tracker = admission_watch_service.tracker
-    await service._viking_fs.mkdir("viking://resources/x", ctx=ctx, exist_ok=True)
-
-    async def remote_submit(**_kwargs):
-        records = await tracker.list_tasks(account_id="acct", user_id="alice")
-        assert len(records) == 1 and records[0].task_type == "connector_import"
-        state = await service._watch_manager.store.get_state(task.task_id)
-        assert state.current_run_id == records[0].task_id
-        async with service._watch_manager.locks.tree("acct", task.to_uri):
-            pass
-        return {"task_key": "external-1"}
-
-    client = SimpleNamespace(
-        submit_doc_add=AsyncMock(side_effect=remote_submit),
-        get_task_info=AsyncMock(return_value={"status": "succeeded"}),
+    record = await admission_watch_service.tracker.get(
+        updated.last_task_id, account_id="acct", user_id="alice"
     )
-    _install_connector_dependencies(monkeypatch, tracker, client, discard_monitor=False)
-    auth_state = await service._connector.create_watch_auth_state(
-        api_key="secret",
-        account_id="acct",
-        add_type="tos",
-        path="tos://bucket/docs/",
-        connector_args={"tos_prefix": ["tos://bucket/docs/"]},
-    )
-    task = await _connector_watch(service, auth_state=auth_state)
-    receipt = await service._watch_manager.trigger(task.task_id)
-    await asyncio.gather(*list(service._background_tasks))
-    await service._watch_runtime.sweep()
-    client.submit_doc_add.assert_awaited_once()
-    record = await tracker.get(receipt.task_id, account_id="acct", user_id="alice")
     assert record.is_terminal()
     assert record.task_type == "connector_import"
 
@@ -2234,6 +2213,7 @@ async def test_add_resource_falls_back_for_shared_source_with_parent(
         ("route_source", False),
         ("skip_watch_management", True),
         ("stage_callback", object()),
+        ("on_task_created", "external-value"),
         ("watch_auth_state", {}),
         ("understanding_response_id", "response-1"),
         ("parser_backend", "understanding"),
@@ -2241,12 +2221,14 @@ async def test_add_resource_falls_back_for_shared_source_with_parent(
     ],
 )
 async def test_add_resource_rejects_internal_execution_fields(ctx, service, field, value):
+    service._submit_resource_ingestion = AsyncMock()
     with pytest.raises(InvalidArgumentError, match=field):
         await service.add_resource(
             path="https://example.com/manual.pdf",
             ctx=ctx,
             **{field: value},
         )
+    service._submit_resource_ingestion.assert_not_awaited()
 
 
 @pytest.mark.asyncio

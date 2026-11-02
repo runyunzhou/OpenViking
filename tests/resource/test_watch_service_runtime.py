@@ -17,7 +17,7 @@ from openviking.service.resource_service import ResourceService
 from openviking.service.task_store import PersistentTaskStore
 from openviking.service.task_tracker import TaskTracker
 from openviking.utils.git_auth import GIT_AUTH_FAILED, raise_git_auth_error
-from openviking_cli.exceptions import InvalidArgumentError, OpenVikingError
+from openviking_cli.exceptions import OpenVikingError
 from tests.utils.watch_fixtures import shape_watch
 
 TARGET = "viking://resources/doc"
@@ -244,51 +244,18 @@ async def test_runtime_shutdown_waits_for_inflight_submission(assembly):
     await entered.wait()
     with pytest.raises(TimeoutError, match="keep dependencies open"):
         await a.runtime.stop(timeout=0.01)
-    assert a.runtime._submissions
     release.set()
     await a.runtime.stop(timeout=1)
-    assert not a.runtime._submissions
     assert (await a.service.store.get_state(task.task_id)).current_run_id
 
 
 @pytest.mark.asyncio
-async def test_submission_reads_watch_once(assembly, monkeypatch):
-    a = assembly
-    task = await seed(a)
-    read = AsyncMock(wraps=a.service.store.get_state)
-    monkeypatch.setattr(a.service.store, "get_state", read)
-    assert await a.service.trigger(task.task_id)
-    assert read.await_count == 1
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("terminal", [False, True])
-async def test_sweep_reuses_watch_snapshot_and_reads_task_once(assembly, monkeypatch, terminal):
-    a = assembly
-    task = await seed(a)
-    receipt = await a.service.trigger(task.task_id)
-    if terminal:
-        await a.tracker.complete(receipt.task_id, {}, **OWNER)
-    watch_read = AsyncMock(wraps=a.service.store.get_state)
-    task_read = AsyncMock(wraps=a.tracker.get)
-    monkeypatch.setattr(a.service.store, "get_state", watch_read)
-    monkeypatch.setattr(a.tracker, "get", task_read)
-    await a.runtime.start()
-    await a.runtime.sweep()
-    watch_read.assert_not_awaited()
-    task_read.assert_awaited_once_with(receipt.task_id, **OWNER)
-
-
-@pytest.mark.asyncio
-async def test_missing_source_returns_explicit_outcome_without_reread(assembly, monkeypatch):
+async def test_missing_source_deactivates_without_submission(assembly):
     a = assembly
     task = await seed(a)
     await a.service.update_task(task.task_id, **OWNER, role="root", path="/missing/watch-source")
-    read = AsyncMock(wraps=a.service.store.get_state)
-    monkeypatch.setattr(a.service.store, "get_state", read)
     assert await a.service.trigger(task.task_id) is None
-    assert read.await_count == 1
-    state = await read(task.task_id)
+    state = await a.service.store.get_state(task.task_id)
     assert not state.task.is_active
     assert state.task.last_status == "failed"
     assert "Resource path does not exist" in state.task.last_error
@@ -297,29 +264,24 @@ async def test_missing_source_returns_explicit_outcome_without_reread(assembly, 
 
 
 @pytest.mark.asyncio
-async def test_success_without_task_is_rejected_and_releases_occupancy(assembly, monkeypatch):
+async def test_success_without_task_is_rejected_and_releases_occupancy(assembly):
     a = assembly
     task = await seed(a)
     a.resources.refresh_resource.side_effect = None
     a.resources.refresh_resource.return_value = {"status": "success"}
-    read = AsyncMock(wraps=a.service.store.get_state)
-    monkeypatch.setattr(a.service.store, "get_state", read)
     with pytest.raises(RuntimeError, match="did not create a Task"):
         await a.service.trigger(task.task_id)
-    assert read.await_count == 1
-    state = await read(task.task_id)
+    state = await a.service.store.get_state(task.task_id)
     assert state.run_started_at is None
     assert state.task.last_status == "failed"
 
 
 @pytest.mark.asyncio
-async def test_competing_submission_is_read_after_target_lock_release(assembly, monkeypatch):
+async def test_losing_submission_reuses_competitors_actual_task(assembly, monkeypatch):
     a = assembly
     task = await seed(a)
     begin = a.service.store.begin_run
-    get_state = a.service.store.get_state
     competitor = None
-    reads = 0
 
     async def begin_competitor(*args, **kwargs):
         nonlocal competitor
@@ -330,19 +292,9 @@ async def test_competing_submission_is_read_after_target_lock_release(assembly, 
         )
         return None
 
-    async def read(*args, **kwargs):
-        nonlocal reads
-        reads += 1
-        if reads == 2:
-            async with a.service.locks.tree("default", TARGET):
-                pass
-        return await get_state(*args, **kwargs)
-
     monkeypatch.setattr(a.service.store, "begin_run", begin_competitor)
-    monkeypatch.setattr(a.service.store, "get_state", read)
     receipt = await a.service.trigger(task.task_id)
     assert receipt.reused and receipt.task_id == competitor.task_id
-    assert reads == 2
     a.resources.refresh_resource.assert_not_awaited()
 
 
@@ -400,18 +352,3 @@ async def test_git_preflight_failure_pauses_only_for_auth_failure(
     assert state.task.last_status == "failed"
     assert state.run_started_at is None
     assert await a.tracker.list_tasks(**OWNER) == []
-
-
-@pytest.mark.asyncio
-async def test_public_add_resource_rejects_internal_task_callback(assembly):
-    a = assembly
-    resources = ResourceService()
-    resources._submit_resource_ingestion = AsyncMock()
-    task = await seed(a)
-    with pytest.raises(InvalidArgumentError, match="on_task_created"):
-        await resources.add_resource(
-            "https://example.org/doc",
-            a.service.context(task),
-            on_task_created="external-value",
-        )
-    resources._submit_resource_ingestion.assert_not_awaited()

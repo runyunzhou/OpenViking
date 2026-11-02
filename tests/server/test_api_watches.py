@@ -3,7 +3,6 @@
 
 """Tests for watch management endpoints (RFC #2104)."""
 
-import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -12,7 +11,8 @@ import pytest
 import pytest_asyncio
 from pydantic import ValidationError
 
-from openviking.resource.watch_scheduler import WatchScheduler
+from openviking.resource.watch_manager import WatchManager
+from openviking.resource.watch_types import WatchRunResult
 from openviking.server.routers.watches import UpdateWatchRequest
 from openviking.service.resource_service import ResourceService
 from openviking_cli.utils.config.open_viking_config import (
@@ -45,14 +45,14 @@ def watch_test_config(tmp_path, monkeypatch):
 
 
 @pytest_asyncio.fixture
-async def service():
+async def service(watch_store, watch_vfs):
     """Exercise real watch endpoints without initializing the vector backend."""
-    scheduler = WatchScheduler(resource_service=AsyncMock(spec=ResourceService))
-    await scheduler.start()
-    yield SimpleNamespace(watch_scheduler=scheduler)
-    await scheduler.stop()
-
-from openviking.resource.watch_types import WatchRunResult
+    manager = WatchManager(
+        watch_store,
+        viking_fs=watch_vfs,
+        resource_service=AsyncMock(spec=ResourceService),
+    )
+    yield SimpleNamespace(watch_manager=manager)
 
 
 @pytest.fixture
@@ -210,27 +210,21 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
     assert resp.json()["result"]["next_execution_time"] is None
     assert resp.json()["result"]["watch_interval"] == 4320
 
-    # POST trigger — monkeypatch scheduler so we don't actually run a fetch.
-    # Class-level setattr means the function is bound as a method, so the
-    # fake must accept `self` (the WatchManager instance) as first arg.
+    # POST trigger
     triggered = []
-    schedule_started = asyncio.Event()
 
-    async def fake_schedule(_self, task_id):
+    async def fake_trigger(_self, task_id):
         triggered.append(task_id)
-        schedule_started.set()
         return True
 
     monkeypatch.setattr(
         "openviking.resource.watch_manager.WatchManager.trigger",
-        fake_schedule,
+        fake_trigger,
     )
     resp = await client.post(f"/api/v1/watches/{task.task_id}/trigger")
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"]["scheduled"] is True
-    # Trigger is fire-and-forget — wait briefly for the background task to run.
-    await asyncio.wait_for(schedule_started.wait(), timeout=2.0)
     assert triggered == [task.task_id]
 
     # DELETE
@@ -344,20 +338,17 @@ async def test_trigger_by_uri(client: httpx.AsyncClient, watch_manager, monkeypa
     task = await _seed(watch_manager, to_uri="viking://resources/test/trig")
 
     triggered = []
-    schedule_started = asyncio.Event()
 
-    async def fake_schedule(_self, task_id):
+    async def fake_trigger(_self, task_id):
         triggered.append(task_id)
-        schedule_started.set()
         return True
 
     monkeypatch.setattr(
         "openviking.resource.watch_manager.WatchManager.trigger",
-        fake_schedule,
+        fake_trigger,
     )
     resp = await client.post("/api/v1/watches/trigger", params={"to_uri": task.to_uri})
     assert resp.status_code == 200
-    await asyncio.wait_for(schedule_started.wait(), timeout=2.0)
     assert triggered == [task.task_id]
 
 

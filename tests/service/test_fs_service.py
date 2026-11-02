@@ -1102,7 +1102,14 @@ async def test_resource_scope_rm_does_not_refresh_global_root(request_context):
 
 
 @pytest.mark.asyncio
-async def test_resource_rm_deactivates_watch_tasks(request_context):
+@pytest.mark.parametrize(
+    ("uri", "deactivates"),
+    [
+        ("viking://resources/codeask/wiki", True),
+        ("viking://resources/.watch_tasks.json", False),
+    ],
+)
+async def test_resource_rm_deactivates_only_resource_watches(request_context, uri, deactivates):
     viking_fs = _FakeVikingFS()
     watch_manager = _FakeWatchManager()
     service = FSService(
@@ -1111,25 +1118,11 @@ async def test_resource_rm_deactivates_watch_tasks(request_context):
     )
     service._enqueue_delete_refresh = AsyncMock()
 
-    await service.rm("viking://resources/codeask/wiki", ctx=request_context, recursive=True)
+    await service.rm(uri, ctx=request_context, recursive=deactivates)
 
-    assert watch_manager.deactivate_calls == [
-        {"uri": "viking://resources/codeask/wiki", "account_id": "default"}
-    ]
-
-
-@pytest.mark.asyncio
-async def test_resource_rm_does_not_deactivate_watch_task_control_uri(request_context):
-    viking_fs = _FakeVikingFS()
-    watch_manager = _FakeWatchManager()
-    service = FSService(
-        viking_fs=viking_fs,
-        watch_manager=watch_manager,
+    assert watch_manager.deactivate_calls == (
+        [{"uri": uri, "account_id": "default"}] if deactivates else []
     )
-
-    await service.rm("viking://resources/.watch_tasks.json", ctx=request_context)
-
-    assert watch_manager.deactivate_calls == []
 
 
 @pytest.mark.asyncio

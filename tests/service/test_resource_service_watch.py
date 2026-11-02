@@ -1362,29 +1362,50 @@ class TestWatchTaskConflict:
     """Tests for watch task conflict detection."""
 
     @pytest.mark.asyncio
-    async def test_conflict_when_active_task_exists(
-        self, resource_service: ResourceService, request_context: RequestContext
+    @pytest.mark.parametrize("second_source", ["/test/path1", "/test/path2"])
+    async def test_active_target_conflict_preserves_watch_without_creating_task(
+        self, resource_service: ResourceService, request_context: RequestContext, second_source
     ):
-        """A different source cannot replace an active watch."""
+        """A target rejects another import, whether or not the source matches."""
+        from openviking.service.task_tracker import get_task_tracker
+
         to_uri = "viking://resources/conflict_test"
 
         await resource_service.add_resource(
             path="/test/path1",
             ctx=request_context,
             to=to_uri,
+            reason="Original reason",
             watch_interval=30.0,
+            args={"branch": "main"},
         )
+        same_user_ctx = RequestContext(
+            user=UserIdentifier(request_context.account_id, request_context.user.user_id),
+            role=request_context.role,
+        )
+        original = await get_task_by_uri(resource_service, to_uri, same_user_ctx)
+        assert original is not None
+        task_count_before = get_task_tracker().count()
 
-        with pytest.raises(ConflictError) as exc_info:
+        with pytest.raises(ConflictError, match="already being monitored") as exc_info:
             await resource_service.add_resource(
-                path="/test/path2",
-                ctx=request_context,
+                path=second_source,
+                ctx=same_user_ctx,
                 to=to_uri,
+                reason="Updated reason",
                 watch_interval=45.0,
+                args={"branch": "release"},
             )
 
-        assert "already being monitored" in str(exc_info.value)
         assert to_uri in str(exc_info.value)
+        assert get_task_tracker().count() == task_count_before
+        unchanged = await get_task_by_uri(resource_service, to_uri, request_context)
+        assert unchanged.task_id == original.task_id
+        assert unchanged.path == "/test/path1"
+        assert unchanged.reason == "Original reason"
+        assert unchanged.watch_interval == 30.0
+        assert unchanged.processor_kwargs == {"branch": "main"}
+        assert unchanged.is_active
 
     @pytest.mark.asyncio
     async def test_same_source_to_different_targets_creates_separate_tasks(
@@ -1409,75 +1430,6 @@ class TestWatchTaskConflict:
         assert first.path == second.path == source
         assert (first.watch_interval, second.watch_interval) == (30.0, 45.0)
         assert first.is_active and second.is_active
-
-    @pytest.mark.asyncio
-    async def test_same_source_conflicts_with_active_task(
-        self, resource_service: ResourceService, request_context: RequestContext
-    ):
-        """An active watch on the target rejects re-adding even the same source.
-
-        The kernel cannot tell whether two imports are the same source (Connector
-        types carry their identity in args), so only the target decides.
-        """
-        to_uri = "viking://resources/idempotent_watch"
-        source = "/test/same-path"
-
-        await resource_service.add_resource(
-            path=source,
-            ctx=request_context,
-            to=to_uri,
-            reason="Original reason",
-            watch_interval=30.0,
-            args={"branch": "main"},
-        )
-        original = await get_task_by_uri(resource_service, to_uri, request_context)
-        assert original is not None
-
-        with pytest.raises(ConflictError, match="already being monitored"):
-            await resource_service.add_resource(
-                path=source,
-                ctx=request_context,
-                to=to_uri,
-                reason="Updated reason",
-                watch_interval=45.0,
-                args={"branch": "release"},
-            )
-
-        unchanged = await get_task_by_uri(resource_service, to_uri, request_context)
-        assert unchanged is not None
-        assert unchanged.task_id == original.task_id
-        assert unchanged.reason == "Original reason"
-        assert unchanged.watch_interval == 30.0
-        assert unchanged.processor_kwargs == {"branch": "main"}
-        assert unchanged.is_active is True
-
-    @pytest.mark.asyncio
-    async def test_conflict_does_not_create_async_task(
-        self, resource_service: ResourceService, request_context: RequestContext
-    ):
-        """A rejected watch request must not leave behind a user-invisible task."""
-        from openviking.service.task_tracker import get_task_tracker, set_task_tracker
-
-        set_task_tracker(None)
-        to_uri = "viking://resources/conflict_no_task"
-
-        await resource_service.add_resource(
-            path="/test/path1",
-            ctx=request_context,
-            to=to_uri,
-            watch_interval=30.0,
-        )
-        task_count_before = get_task_tracker().count()
-
-        with pytest.raises(ConflictError):
-            await resource_service.add_resource(
-                path="/test/path2",
-                ctx=request_context,
-                to=to_uri,
-                watch_interval=45.0,
-            )
-
-        assert get_task_tracker().count() == task_count_before
 
     @pytest.mark.asyncio
     async def test_conflict_when_task_exists_but_hidden_by_permission(
@@ -1514,39 +1466,6 @@ class TestWatchTaskConflict:
         assert task is not None
 
         assert task.task_id not in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_same_user_context_sees_existing_task(
-        self, resource_service: ResourceService, request_context: RequestContext
-    ):
-        to_uri = "viking://resources/same_user_conflict"
-        same_user_ctx = RequestContext(
-            user=UserIdentifier("test_account", "test_user"), role=Role.USER
-        )
-
-        await resource_service.add_resource(
-            path="/test/path1",
-            ctx=request_context,
-            to=to_uri,
-            watch_interval=30.0,
-        )
-
-        visible_task = await get_task_by_uri(resource_service, to_uri, same_user_ctx)
-        assert visible_task is not None
-
-        with pytest.raises(ConflictError) as exc_info:
-            await resource_service.add_resource(
-                path="/test/path2",
-                ctx=same_user_ctx,
-                to=to_uri,
-                watch_interval=45.0,
-            )
-
-        assert "already being monitored" in str(exc_info.value)
-        assert to_uri in str(exc_info.value)
-
-        original_task = await get_task_by_uri(resource_service, to_uri, request_context)
-        assert original_task is not None
 
     @pytest.mark.asyncio
     async def test_reactivate_inactive_task(

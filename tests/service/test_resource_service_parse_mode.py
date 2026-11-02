@@ -95,31 +95,6 @@ def service(monkeypatch: pytest.MonkeyPatch) -> ResourceService:
 
 
 @pytest.mark.asyncio
-async def test_no_split_is_forwarded_and_persisted_for_watch_replay(
-    service: ResourceService,
-    ctx: RequestContext,
-):
-    watch_manager = SimpleNamespace(
-        create_task=AsyncMock(return_value=SimpleNamespace(task_id="watch-1")),
-    )
-    service._watch_manager = watch_manager
-
-    await service.add_resource(
-        path="/test/path",
-        ctx=ctx,
-        to="viking://resources/no_split_watch",
-        watch_interval=30.0,
-        args={"parse_mode": "no_split"},
-    )
-
-    processor = service._resource_processor
-    assert processor.calls[-1]["parse_mode"] == "no_split"
-    assert watch_manager.create_task.await_args.kwargs["processor_kwargs"]["parse_mode"] == (
-        "no_split"
-    )
-
-
-@pytest.mark.asyncio
 async def test_no_split_watch_replay_preserves_auto_bound_file_target(
     watch_store,
     watch_vfs,
@@ -157,6 +132,8 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
     task = tasks[0]
     assert task.to_uri == "viking://resources/test"
     assert task.to_is_directory is False
+    assert task.processor_kwargs["parse_mode"] == "no_split"
+    assert service._resource_processor.calls[-1]["parse_mode"] == "no_split"
 
     first_run = await watch_store.get_state(task.task_id)
     await watch_manager.finish_run(

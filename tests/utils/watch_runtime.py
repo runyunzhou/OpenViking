@@ -35,7 +35,6 @@ class RuntimeHarness(WatchRuntime):
                 refresh_resource=refresh, _connector=fake_resources._connector
             )
         runtime_config = kwargs.pop("runtime_config_manager", None)
-        kwargs.pop("cancel_grace", None)
         manager = WatchManager(
             store,
             viking_fs=viking_fs,

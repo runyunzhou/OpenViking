@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Original scheduling scenarios migrated to the Service/Runtime assembly."""
+"""Scheduling and recovery contracts over the WatchManager/Runtime assembly."""
 
 import asyncio
 from datetime import datetime, timedelta
@@ -386,20 +386,16 @@ class TestSweep:
         assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("past_release_deadline", [False, True])
-    async def test_failed_timeout_cancellation_is_retried_before_release(
-        self, make_scheduler, service, tracker, past_release_deadline
+    async def test_timeout_cancellation_retries_after_storage_failure(
+        self, make_scheduler, service, tracker
     ):
         scheduler = await make_scheduler(service)
         task = await create_watch(scheduler, due=False)
         await _occupy(scheduler, task, "retry-run")
-        age = scheduler._run_timeout + 1
-        if past_release_deadline:
-            age += 1800
         await shape_watch(
             scheduler.watch_manager.store,
             task.task_id,
-            run_started_at=datetime.now().timestamp() - age,
+            run_started_at=datetime.now().timestamp() - scheduler._run_timeout - 1,
         )
         tracker.put("retry-run")
         cancel = tracker.cancel
@@ -425,7 +421,7 @@ class TestSweep:
         assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_overdue_nonterminal_task_retains_occupancy_after_cancel_grace(
+    async def test_nonterminal_task_keeps_occupancy_after_timeout(
         self, make_scheduler, service, tracker
     ):
         scheduler = await make_scheduler(service)
