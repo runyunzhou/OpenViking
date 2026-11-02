@@ -33,6 +33,9 @@ PAYLOAD_FIELDS = MUTABLE_FIELDS - {
     "auth_state",
     "connector_states",
 }
+PRIVATE_PATCH_FIELDS = frozenset(
+    {"source_checkpoint", "source_checkpoint_version", "credential_version", "credential_paused"}
+)
 TERMINAL_RUN_STATUSES = frozenset({"completed", "failed", "cancelled", "error"})
 
 
@@ -76,6 +79,11 @@ class WatchTask(BaseModel):
     connector_states: Optional[Dict[str, Any]] = Field(
         default=None, description="Private external Connector stream states"
     )
+    source_checkpoint: Optional[Dict[str, Any]] = Field(default=None)
+    source_checkpoint_version: int = Field(default=0)
+    run_source_checkpoint_version: Optional[int] = Field(default=None)
+    credential_version: int = Field(default=0)
+    credential_paused: bool = Field(default=False)
     created_at: datetime = Field(default_factory=datetime.now, description="Task creation time")
     last_execution_time: Optional[datetime] = Field(None, description="Last execution time")
     last_task_id: Optional[str] = Field(None, description="Latest ingestion task identifier")
@@ -126,6 +134,14 @@ class WatchTask(BaseModel):
         """Convert task to a dictionary including private persisted fields."""
         data = self.to_dict()
         data["to_is_directory"] = self.to_is_directory
+        for name in (
+            "source_checkpoint",
+            "source_checkpoint_version",
+            "run_source_checkpoint_version",
+            "credential_version",
+            "credential_paused",
+        ):
+            data[name] = getattr(self, name)
         if self.auth_state is not None:
             data["auth_state"] = self.auth_state
         if self.connector_states is not None:
@@ -141,7 +157,7 @@ class WatchTask(BaseModel):
                 data[name] = datetime.fromisoformat(data[name])
         if data.get("processor_kwargs") is None:
             data["processor_kwargs"] = {}
-        for name in ("auth_state", "connector_states"):
+        for name in ("auth_state", "connector_states", "source_checkpoint"):
             if data.get(name) is not None and not isinstance(data.get(name), dict):
                 data[name] = None
         return cls(**data)
@@ -172,6 +188,9 @@ class WatchPatch:
     """Explicit field updates; omitted fields are never replaced."""
 
     values: dict[str, Any]
+    invalidate_source_checkpoint: bool = False
+    credential_state: Optional[dict[str, Any]] = None
+    expected_auth_state: Optional[dict[str, Any]] = None
 
     def normalized(self) -> dict[str, Any]:
         unknown = self.values.keys() - MUTABLE_FIELDS
@@ -198,6 +217,37 @@ class WatchPatch:
         for name, default in defaults.items():
             if name in values and values[name] is None:
                 values[name] = default
+        return values
+
+    def resolve(self, task: WatchTask) -> dict[str, Any]:
+        """Resolve private state changes against the row held by the store."""
+        values = self.normalized()
+        state = self.credential_state
+        if state is not None:
+            if "is_active" in values or "watch_interval" in values:
+                raise ValueError("credential_state cannot be combined with scheduling changes")
+            if (
+                task.auth_state != self.expected_auth_state
+                or task.account_id != state["ov_account_id"]
+                or task.user_id != state["ov_user_id"]
+                or state["version"] <= task.credential_version
+            ):
+                return {}
+            values["credential_version"] = state["version"]
+            if state["authorized"] and task.credential_paused:
+                values.update(credential_paused=False, is_active=task.watch_interval > 0)
+            elif not state["authorized"] and task.is_active:
+                values.update(credential_paused=True, is_active=False)
+        elif "is_active" in values:
+            values["credential_paused"] = False
+        if self.invalidate_source_checkpoint or any(
+            name in values and values[name] != getattr(task, name)
+            for name in ("path", "instruction", "processor_kwargs")
+        ):
+            values.update(
+                source_checkpoint=None,
+                source_checkpoint_version=task.source_checkpoint_version + 1,
+            )
         return values
 
 
@@ -243,9 +293,12 @@ class WatchRunResult:
     deactivate: bool = False
     connector_states: Optional[dict[str, Any]] = None
     has_connector_states: bool = False
+    source_checkpoint: Optional[dict[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.status not in TERMINAL_RUN_STATUSES:
             raise ValueError("Watch run result must be terminal")
         if self.has_connector_states and not isinstance(self.connector_states, dict):
             raise ValueError("connector_states must be an object")
+        if self.source_checkpoint is not None and not isinstance(self.source_checkpoint, dict):
+            raise ValueError("source_checkpoint must be an object")

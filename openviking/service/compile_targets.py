@@ -2612,13 +2612,8 @@ class CompileVersions:
         return targets
 
     @asynccontextmanager
-    async def before_remove(
-        self, uri: str, ctx: RequestContext, *, lease_ref: Optional[Dict[str, Any]] = None
-    ) -> AsyncIterator[Any]:
-        """Hold a managed descendant's content lease through deletion and metadata updates.
-
-        *lease_ref* is the caller's outer lease, which this lease extends.
-        """
+    async def before_remove(self, uri: str, ctx: RequestContext) -> AsyncIterator[Any]:
+        """Hold a managed descendant's content lease through deletion and metadata updates."""
         uri = uri.rstrip("/")
         await self._reject_running(ctx.account_id, uri)
         record = await self.owning_target(ctx.account_id, uri)
@@ -2631,7 +2626,7 @@ class CompileVersions:
             lock_uri = "viking://" + "/".join(parts[:-1])
         try:
             lease = await self._fs._async_agfs.pathlock_acquire_tree(
-                self._fs._uri_to_path(lock_uri, ctx=ctx), owner_lease_ref=lease_ref
+                self._fs._uri_to_path(lock_uri, ctx=ctx)
             )
         except LockAcquisitionError as exc:
             raise ResourceBusyError("Resource is being processed", uri=uri) from exc

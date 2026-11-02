@@ -35,6 +35,7 @@ from openviking.resource.watch_store import (
 )
 from openviking.resource.watch_types import (
     PAYLOAD_FIELDS,
+    PRIVATE_PATCH_FIELDS,
     PermissionDeniedError,
     WatchAuthority,
     WatchPatch,
@@ -346,7 +347,14 @@ class FileWatchStore(WatchStore):
             if task.task_id in self._rows:
                 raise ConflictError(f"Watch '{task.task_id}' already exists", resource=task.task_id)
             row = _Row(
-                task=task.model_copy(deep=True),
+                task=task.model_copy(
+                    deep=True,
+                    update={
+                        "run_source_checkpoint_version": (
+                            task.source_checkpoint_version if initial_run_id else None
+                        )
+                    },
+                ),
                 current_run_id=initial_run_id,
                 run_started_at=time.time() if initial_run_id else None,
             )
@@ -374,7 +382,11 @@ class FileWatchStore(WatchStore):
                     raise PermissionDeniedError(f"No permission to update Watch {task_id}")
                 return None
             task = row.task
-            changes = {name: values[name] for name in PAYLOAD_FIELDS & values.keys()}
+            values = patch.resolve(task)
+            changes = {
+                name: values[name]
+                for name in (PAYLOAD_FIELDS | PRIVATE_PATCH_FIELDS) & values.keys()
+            }
             for name in ("auth_state", "connector_states"):
                 if name in values:
                     changes[name] = values[name]
@@ -489,6 +501,9 @@ class FileWatchStore(WatchStore):
                 return None
             begun = replace(
                 row,
+                task=_changed(
+                    row.task, run_source_checkpoint_version=row.task.source_checkpoint_version
+                ),
                 current_run_id=run_id,
                 run_started_at=now.timestamp(),
             )
@@ -555,6 +570,12 @@ class FileWatchStore(WatchStore):
             }
             if result.has_connector_states:
                 changes["connector_states"] = result.connector_states
+            if (
+                result.source_checkpoint is not None
+                and task.run_source_checkpoint_version == task.source_checkpoint_version
+            ):
+                changes["source_checkpoint"] = result.source_checkpoint
+            changes["run_source_checkpoint_version"] = None
             settled = replace(
                 row,
                 task=_changed(task, **changes),

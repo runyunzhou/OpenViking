@@ -11,6 +11,7 @@ Initialize after FS and TaskTracker; close after callers, Runtime, resource
 monitors and queue callbacks stop. The Manager spawns no background coroutines.
 """
 
+import asyncio
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -108,6 +109,8 @@ class WatchPathLocks:
 
 
 class WatchManager:
+    DEFAULT_GIT_PROBE_TIMEOUT = 30.0
+
     def __init__(
         self,
         store: WatchStore,
@@ -267,6 +270,8 @@ class WatchManager:
         account_id: str,
         user_id: str,
         role: str,
+        invalidate_source_checkpoint: bool = False,
+        credential_state: Optional[Dict[str, Any]] = None,
         **values: Any,
     ) -> WatchTask:
         # Internal callers omit optional None values; auth/state None clears them.
@@ -278,6 +283,17 @@ class WatchManager:
         unknown = values.keys() - MUTABLE_FIELDS
         if unknown:
             raise ValueError(f"Unsupported Watch update fields: {sorted(unknown)}")
+        authority = WatchAuthority(account_id, user_id, role)
+        expected_auth = None
+        if credential_state is not None:
+            if "is_active" in values or "watch_interval" in values:
+                raise ValueError("credential_state cannot be combined with scheduling changes")
+            current = await self._store.get_task(task_id, authority)
+            if current is None:
+                raise ValueError(f"Task {task_id} not found")
+            if not await self._credential_owner_matches(current, credential_state):
+                return current
+            expected_auth = current.auth_state
         interval = values.get("watch_interval")
         if interval is not None and interval <= 0:
             if values.get("is_active") is True:
@@ -286,12 +302,47 @@ class WatchManager:
             values["is_active"] = False
         task = await self._store.patch_task(
             task_id,
-            WatchPatch(values),
-            WatchAuthority(account_id, user_id, role),
+            WatchPatch(
+                values,
+                invalidate_source_checkpoint=invalidate_source_checkpoint,
+                credential_state=credential_state,
+                expected_auth_state=expected_auth,
+            ),
+            authority,
         )
         if task is None:
             raise ValueError(f"Task {task_id} not found")
         return task
+
+    async def _credential_owner_matches(self, task: WatchTask, state: Dict[str, Any]) -> bool:
+        from openviking.connector.auth import extract_credential_reference
+
+        if not ConnectorDelegate.is_watch_auth_state(task.auth_state):
+            return False
+        delegate = ConnectorDelegate(
+            viking_fs=self._viking_fs, background_tasks=set(), link_reason_memory=None
+        )
+        _, _, _, auth_config = await delegate.restore_watch_request(
+            task.auth_state, account_id=task.account_id, path=task.path
+        )
+        reference = extract_credential_reference(auth_config)
+        return (
+            reference is not None
+            and task.account_id == state["ov_account_id"]
+            and task.user_id == state["ov_user_id"]
+            and all(
+                reference.get(key, "default" if key == "ov_account_id" else None) == state[key]
+                for key in (
+                    "account_id",
+                    "resource_id",
+                    "user_id",
+                    "ov_user_id",
+                    "ov_account_id",
+                    "type",
+                    "platform",
+                )
+            )
+        )
 
     async def get_task(
         self,
@@ -483,7 +534,7 @@ class WatchManager:
             if actual_run.run_id is None:
                 if isinstance(result, WatchRunResult):
                     outcome = result
-                elif (result or {}).get("status") in {"failed", "error", "cancelled"}:
+                elif (result or {}).get("status") in {"completed", "failed", "error", "cancelled"}:
                     outcome = self.result(run.task, result["status"], result, None)
                 else:
                     raise RuntimeError("Resource submission did not create a Task")
@@ -567,7 +618,7 @@ class WatchManager:
                         auth, config=config
                     ).refresh_user_access_token(auth.get("refresh_token"))
                     auth = apply_feishu_refreshed_token(auth, refreshed)
-                    await self.update_auth_state(task.task_id, auth)
+                    await self.update_auth_state(task.task_id, auth, run_id=run.run_id)
                 kwargs["feishu_access_token"] = auth["access_token"]
             except FeishuTokenRefreshError as exc:
                 if not exc.permanent:
@@ -587,6 +638,12 @@ class WatchManager:
             if connector_auth is not None:
                 kwargs["connector_auth_config"] = connector_auth
             kwargs["connector_states"] = task.connector_states
+        if not connector:
+            checkpoint = await self._probe_git_checkpoint(task, kwargs, ctx)
+            if checkpoint is not None:
+                kwargs["git_head_sha_hint"] = checkpoint["head_sha"]
+                if checkpoint == task.source_checkpoint:
+                    return WatchRunResult(status="completed", execution_task_id=task.last_task_id)
         return await self._resource_service.refresh_resource(
             path=task.path,
             ctx=ctx,
@@ -605,6 +662,37 @@ class WatchManager:
             **kwargs,
         )
 
+    async def _probe_git_checkpoint(
+        self, task: WatchTask, kwargs: Dict[str, Any], ctx: RequestContext
+    ) -> Optional[Dict[str, Any]]:
+        from openviking.parse.accessors.git_accessor import GitAccessor
+        from openviking.utils.code_hosting_utils import is_git_repo_url
+
+        if not is_git_repo_url(task.path):
+            return None
+        try:
+            probe_kwargs = dict(kwargs)
+            if probe_kwargs.get("auth_config") is None:
+                processor = getattr(self._resource_service, "_resource_processor", None)
+                if processor is not None:
+                    token = await processor.github_token_for(task.path, ctx)
+                    if token:
+                        probe_kwargs["auth_config"] = {"token": token}
+            probed = await asyncio.wait_for(
+                GitAccessor().probe_git_remote_head(task.path, **probe_kwargs),
+                timeout=self.DEFAULT_GIT_PROBE_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[WatchManager] Git probe failed for %s: %s; falling back to refresh",
+                task.path,
+                self._public_error(str(exc)),
+            )
+            return None
+        if probed is None:
+            return None
+        return {"kind": "git", "head_sha": probed[1], "instruction": task.instruction}
+
     @staticmethod
     def result(
         task: WatchTask,
@@ -621,6 +709,15 @@ class WatchManager:
         if status in {"failed", "error"} and not error:
             errors = result.get("errors")
             error = "; ".join(str(item) for item in errors) if errors else "watch ingestion failed"
+        # A successful source import may later fail in semantic/embedding Work.
+        # Its explicit checkpoint still describes the revision actually imported.
+        checkpoint = result.get("source_checkpoint") if status != "cancelled" else None
+        if status == "completed":
+            from openviking.service.resource_service import ResourceService
+
+            checkpoint = checkpoint or ResourceService._initial_source_checkpoint(
+                result.get("meta"), instruction=task.instruction
+            )
         return WatchRunResult(
             status=status,
             execution_task_id=result.get("task_id"),
@@ -628,6 +725,7 @@ class WatchManager:
             deactivate=result.get("code") == GIT_AUTH_FAILED,
             connector_states=states if has_states else None,
             has_connector_states=has_states,
+            source_checkpoint=checkpoint,
         )
 
     async def settle(self, task_id: str, run_id: str) -> bool:

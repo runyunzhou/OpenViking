@@ -1676,7 +1676,9 @@ class ResourceService:
 
         proc = None
         try:
-            env = build_git_http_auth_env(auth_config, repo_url) if auth_config is not None else None
+            env = (
+                build_git_http_auth_env(auth_config, repo_url) if auth_config is not None else None
+            )
             env = overlay_parser_subprocess_env(
                 ParserNetworkContext(ParserNetworkOperation.GIT_COMMAND, repo_url),
                 env,
@@ -1717,9 +1719,7 @@ class ResourceService:
         # definitive ref/error classification.
         head_sha = None
         if not tracked_commit:
-            head_sha = GitAccessor._parse_ls_remote_ref(
-                stdout.decode(errors="replace"), ref
-            )
+            head_sha = GitAccessor._parse_ls_remote_ref(stdout.decode(errors="replace"), ref)
         repo_name = parse_code_hosting_url(source)
         return _ResourceSourceInfo(
             source_name=repo_name.rsplit("/", 1)[-1] if repo_name else None,

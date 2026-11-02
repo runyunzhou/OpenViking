@@ -55,6 +55,7 @@ from openviking.resource.watch_store import (
 )
 from openviking.resource.watch_types import (
     PAYLOAD_FIELDS,
+    PRIVATE_PATCH_FIELDS,
     PermissionDeniedError,
     WatchAuthority,
     WatchPatch,
@@ -428,7 +429,12 @@ class MySQLWatchStore(WatchStore):
                         last_task_id=task.last_task_id,
                         last_status=task.last_status,
                         last_error=task.last_error,
-                        payload=self._payload(task),
+                        payload={
+                            **self._payload(task),
+                            "run_source_checkpoint_version": (
+                                task.source_checkpoint_version if initial_run_id else None
+                            ),
+                        },
                         connector=is_connector(task.auth_state),
                         auth_state=self._cipher.seal(task.task_id, "auth_state", task.auth_state),
                         connector_states=self._cipher.seal(
@@ -473,9 +479,10 @@ class MySQLWatchStore(WatchStore):
                         raise PermissionDeniedError(f"No permission to update Watch {task_id}")
                 return None
             row = rows[0]
+            values = patch.resolve(self._task(row))
             sets: dict[str, Any] = {}
             payload = dict(row["payload"] or {})
-            for name in PAYLOAD_FIELDS & values.keys():
+            for name in (PAYLOAD_FIELDS | PRIVATE_PATCH_FIELDS) & values.keys():
                 payload[name] = values[name]
             if payload != row["payload"]:
                 sets["payload"] = payload
@@ -644,6 +651,11 @@ class MySQLWatchStore(WatchStore):
         if not manual:
             where.extend([c.enabled.is_(True), c.next_run_at <= db_now()])
         async with self._transaction() as session:
+            rows = await self._rows(session, select(*self._tasks.c).where(*where).with_for_update())
+            if not rows:
+                return None
+            payload = dict(rows[0]["payload"] or {})
+            payload["run_source_checkpoint_version"] = payload.get("source_checkpoint_version", 0)
             changed = (
                 await session.execute(
                     update(self._tasks)
@@ -652,6 +664,7 @@ class MySQLWatchStore(WatchStore):
                         current_run_id=run_id,
                         run_started_at=db_now(),
                         updated_at=db_now(),
+                        payload=payload,
                     )
                 )
             ).rowcount
@@ -732,6 +745,16 @@ class MySQLWatchStore(WatchStore):
         if started_at is not None:
             where.append(c.run_started_at == started_at)
         async with self._transaction() as session:
+            rows = await self._rows(session, select(*self._tasks.c).where(*where).with_for_update())
+            if not rows:
+                return False
+            payload = dict(rows[0]["payload"] or {})
+            if result.source_checkpoint is not None and payload.get(
+                "run_source_checkpoint_version"
+            ) == payload.get("source_checkpoint_version", 0):
+                payload["source_checkpoint"] = result.source_checkpoint
+            payload["run_source_checkpoint_version"] = None
+            values["payload"] = payload
             changed = (
                 await session.execute(update(self._tasks).where(*where).values(**values))
             ).rowcount

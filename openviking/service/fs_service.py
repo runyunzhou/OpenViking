@@ -8,6 +8,7 @@ Provides file system operations: ls, mkdir, rm, mv, tree, stat, read, abstract, 
 
 import asyncio
 from collections.abc import Coroutine
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Literal, Optional
@@ -525,21 +526,8 @@ class FSService:
                     if acl is not None
                     else None
                 )
-                if managed:
-                    await viking_fs.mkdir(uri, ctx=ctx, lease_ref=lease)
-                    await versions.record_effects(
-                        [{"uri": directory_uri, "kind": "directory"}], ctx
-                    )
-                try:
-                    await viking_fs.mkdir(uri, ctx=ctx, **({"lease_ref": lease} if lease else {}))
-                    if not managed:
-                        lease = await viking_fs._async_agfs.pathlock_acquire_exact(
-                            viking_fs._uri_to_path(abstract_uri, ctx=ctx)
-                        )
-                    await initialize(acl_update, lease)
-                else:
-                    await viking_fs.mkdir(uri, ctx=ctx, lease_ref=lease)
-                    await initialize(acl_update, lease)
+                await viking_fs.mkdir(uri, ctx=ctx, lease_ref=lease)
+                await initialize(acl_update, lease)
 
         async def initialize(acl_update, lease):
             abstract = self._normalize_directory_description(description)
@@ -1242,12 +1230,10 @@ class FSService:
         move: bool = False,
         recursive: bool = True,
     ):
-        """Hold both transfer scopes, free of Watch runs, through final registration.
+        """Hold both transfer scopes, free of Watch runs, through Watch migration.
 
-        The yielded lease extends the native transfer's own locking. When the
-        transfer touches a Compile target, its snapshot is registered under the
-        same lease; once attempted, the final directory state is the rollback
-        baseline even on failure. Service-level guards run before locking.
+        The yielded lease extends the native transfer's own locking and covers
+        Compile target migration on move. Service-level guards run before locking.
         """
         viking_fs = self._ensure_initialized()
         source_path = viking_fs._uri_to_path(from_uri, ctx=ctx)
@@ -1278,6 +1264,7 @@ class FSService:
             requests = [{"path": path, "kind": "exact"} for path in (source_path, target_path)]
         async with self._hold_watch_scope(requests, [from_uri, to_uri], ctx) as lease:
             yield lease
+
     async def _finish_transfer_after_caller_cancel(
         self,
         transaction: Coroutine[Any, Any, Any],

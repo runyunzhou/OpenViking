@@ -3204,7 +3204,10 @@ async def test_user_other_auth_cannot_disclose_or_rotate_personal_key(
         update={"auth_mode": auth_mode}
     )
     lightweight_admin_app.dependency_overrides[get_request_context] = lambda: RequestContext(
-        UserIdentifier(account, "alice"), Role(Role.USER), from_oauth=from_oauth, api_key="identity-token"
+        UserIdentifier(account, "alice"),
+        Role(Role.USER),
+        from_oauth=from_oauth,
+        api_key="identity-token",
     )
     response = await lightweight_admin_client.get(f"/api/v1/admin/accounts/{account}/users")
     assert response.status_code == 200
@@ -3248,8 +3251,12 @@ async def test_in_flight_user_rotation_cannot_overwrite_admin_reset(
         response = await asyncio.wait_for(pending, timeout=5)
     assert response.status_code == 401
     url = f"/api/v1/admin/accounts/{account}/users"
-    assert (await lightweight_admin_client.get(url, headers={"X-API-Key": reset_key})).status_code == 200
-    assert (await lightweight_admin_client.get(url, headers={"X-API-Key": old_key})).status_code == 401
+    assert (
+        await lightweight_admin_client.get(url, headers={"X-API-Key": reset_key})
+    ).status_code == 200
+    assert (
+        await lightweight_admin_client.get(url, headers={"X-API-Key": old_key})
+    ).status_code == 401
 
 
 @pytest.mark.parametrize(
@@ -4474,10 +4481,7 @@ async def test_user_point_read_returns_role_without_credentials(
         headers=root_headers(),
     )
     assert unknown_account.status_code == 404
-    assert (
-        unknown_account.json()["error"]["message"]
-        == f"Account not found: {unknown_account_id}"
-    )
+    assert unknown_account.json()["error"]["message"] == f"Account not found: {unknown_account_id}"
 
 
 async def test_user_point_read_admin_scoped_to_own_account(lightweight_admin_client):

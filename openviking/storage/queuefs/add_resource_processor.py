@@ -372,6 +372,11 @@ class AddResourceProcessor(DequeueHandlerBase):
                     reason=msg.reason,
                     source_name=msg.source_name,
                 )
+                checkpoint = self._resource_service._initial_source_checkpoint(
+                    result.get("meta"), instruction=msg.instruction
+                )
+                if checkpoint is not None:
+                    result["source_checkpoint"] = checkpoint
                 await tracker.complete(
                     msg.task_id,
                     result,

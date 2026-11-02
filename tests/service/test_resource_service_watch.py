@@ -1213,7 +1213,11 @@ async def test_native_task_runs_after_submission_and_settles_after_work(
     await tracker.start_work(message.task_id, "queue-work", **owner)
     data[TASK_WORK_ID_FIELD] = "queue-work"
     service.execute_add_resource_job = AsyncMock(
-        return_value={"status": "success", "root_uri": to_uri}
+        return_value={
+            "status": "success",
+            "root_uri": to_uri,
+            "meta": {"resolved_head_sha": "a" * 40},
+        }
     )
     processor = AddResourceProcessor(service, QueueManager.ADD_RESOURCE, service._viking_fs)
     await asyncio.to_thread(lambda: asyncio.run(processor._process(message, data)))
@@ -1234,6 +1238,11 @@ async def test_native_task_runs_after_submission_and_settles_after_work(
     assert state.task.last_error == ("Work failed" if work_failed else None)
     assert state.task.is_active is is_active
     assert (state.task.next_execution_time is not None) is is_active
+    assert state.task.source_checkpoint == {
+        "kind": "git",
+        "head_sha": "a" * 40,
+        "instruction": "",
+    }
 
 
 @pytest.mark.asyncio
@@ -1331,31 +1340,44 @@ async def test_first_native_watch_preserves_failed_task_completion(
 
 
 @pytest.mark.asyncio
-async def test_record_watch_execution_persists_checkpoint_after_completed_status():
-    watch_manager = SimpleNamespace(
-        record_execution=AsyncMock(),
-        update_source_checkpoint=AsyncMock(),
+async def test_first_watch_checkpoint_waits_for_terminal_task(
+    native_watch_submission, request_context
+):
+    service = native_watch_submission.service
+    tracker = native_watch_submission.tracker
+    to_uri = "viking://resources/checkpoint"
+    await service._execute_resource_ingestion(
+        path="https://github.com/volcengine/OpenViking.git",
+        to=to_uri,
+        ctx=request_context,
+        instruction="original",
+        defer_post_processing=True,
+        watch_interval=1,
+        task_id="checkpoint",
     )
-    scheduler = SimpleNamespace(
-        watch_manager=watch_manager,
-        release_execution=AsyncMock(),
+    watch = await get_task_by_uri(service, to_uri, request_context)
+    manager = service._get_watch_manager()
+    assert watch.source_checkpoint is None
+    data = native_watch_submission.queue.enqueue.await_args.args[1]
+    message = AddResourceMsg.from_dict(data)
+    service.execute_add_resource_job = AsyncMock(
+        return_value={"status": "success", "meta": {"resolved_head_sha": "a" * 40}}
     )
-    service = ResourceService(watch_scheduler=scheduler)
-    checkpoint = {"kind": "git", "head_sha": "a" * 40}
-
-    await service.record_watch_execution(
-        "watch-1",
-        status="completed",
-        execution_task_id="add-resource-1",
-        source_checkpoint=checkpoint,
+    processor = AddResourceProcessor(service, QueueManager.ADD_RESOURCE, service._viking_fs)
+    await processor._process(message, data)
+    saved = await manager.get_task(watch.task_id)
+    assert saved.source_checkpoint == {
+        "kind": "git",
+        "head_sha": "a" * 40,
+        "instruction": "original",
+    }
+    task = await tracker.get(
+        message.task_id,
+        account_id=request_context.account_id,
+        user_id=request_context.user.user_id,
     )
-
-    watch_manager.record_execution.assert_awaited_once()
-    watch_manager.update_source_checkpoint.assert_awaited_once_with(
-        "watch-1",
-        checkpoint,
-    )
-    scheduler.release_execution.assert_awaited_once_with("watch-1")
+    assert task.is_terminal()
+    assert saved.last_task_id == task.task_id
 
 
 class TestWatchTaskConflict:
@@ -1574,9 +1596,17 @@ class TestWatchTaskCancellation:
         task = await get_task_by_uri(resource_service, to_uri, request_context)
         assert task is not None
         assert task.is_active is True
-        await resource_service._watch_scheduler.watch_manager.update_source_checkpoint(
+        manager = resource_service._get_watch_manager()
+        state = await manager.store.get_state(task.task_id)
+        from openviking.resource.watch_types import WatchRunResult
+
+        await manager.finish_run(
             task.task_id,
-            {"kind": "git", "head_sha": "a" * 40, "instruction": ""},
+            state.current_run_id,
+            WatchRunResult(
+                status="completed",
+                source_checkpoint={"kind": "git", "head_sha": "a" * 40, "instruction": ""},
+            ),
         )
 
         await resource_service.add_resource(
@@ -1589,6 +1619,7 @@ class TestWatchTaskCancellation:
         task = await get_task_by_uri(resource_service, to_uri, request_context)
         assert task is not None
         assert task.is_active is False
+        assert task.source_checkpoint is None
 
     @pytest.mark.asyncio
     async def test_cancel_nonexistent_task_no_error(

@@ -969,7 +969,7 @@ async def read(
     uri_list = requested if isinstance(requested, list) else [requested]
     if not uri_list or any(not item for item in uri_list):
         raise InvalidArgumentError(
-            'read takes uri for one file or uris for several, e.g. '
+            "read takes uri for one file or uris for several, e.g. "
             'read(uri="viking://resources/a.md") or '
             'read(uris=["viking://resources/a.md", "viking://resources/b.md"])'
         )
