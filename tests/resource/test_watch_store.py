@@ -140,6 +140,54 @@ async def test_begin_run_is_exclusive_across_nodes(make_store):
 
 
 @pytest.mark.asyncio
+async def test_start_without_id_and_attach_real_task_across_nodes(make_store):
+    first, second = await make_store(), await make_store()
+    task = await create(first, due=True, auth_state=CONNECTOR_AUTH)
+    run = await first.begin_run(
+        task.task_id,
+        target_uri=task.to_uri,
+    )
+    assert run
+    await first.patch_task(task.task_id, WatchPatch({"path": "changed", "reason": "new"}))
+    assert run.run_id is None
+    assert run.task.path == "https://example.org/doc"
+    assert run.task.auth_state == CONNECTOR_AUTH
+    assert await second.has_running_overlap(ACCOUNT, [task.to_uri])
+    assert await second.due(10) == []
+    claims = await asyncio.gather(
+        first.attach_task(task.task_id, "real-a", started_at=run.started_at),
+        second.attach_task(task.task_id, "real-b", started_at=run.started_at),
+    )
+    assert sum(claims) == 1
+    state = await first.get_state(task.task_id)
+    assert state.current_run_id == ("real-a" if claims[0] else "real-b")
+    assert await second.finish_run(
+        task.task_id, state.current_run_id, WatchRunResult(status="completed")
+    )
+    assert (await first.get_state(task.task_id)).run_started_at is None
+
+
+@pytest.mark.asyncio
+async def test_expired_start_cannot_attach_or_settle_next_submission(make_store):
+    first, second = await make_store(), await make_store()
+    task = await create(first, due=True)
+    run = await first.begin_run(
+        task.task_id,
+        target_uri=task.to_uri,
+    )
+    assert await second.finish_run(
+        task.task_id, None, WatchRunResult(status="failed"), started_at=run.started_at
+    )
+    next_run = await second.begin_run(task.task_id, target_uri=task.to_uri, manual=True)
+    assert next_run
+    assert not await first.attach_task(task.task_id, "late", started_at=run.started_at)
+    assert not await first.finish_run(
+        task.task_id, None, WatchRunResult(status="failed"), started_at=run.started_at
+    )
+    assert await second.attach_task(task.task_id, "new", started_at=next_run.started_at)
+
+
+@pytest.mark.asyncio
 async def test_begin_run_requires_due_enabled_and_unmoved_target(store):
     not_due = await create(store, "viking://resources/later")
     task = await create(store, due=True)
@@ -198,7 +246,6 @@ async def test_only_the_owning_run_can_settle_and_advance_its_cursor(store):
         has_connector_states=True,
     )
     assert not await store.finish_run(task.task_id, "run-2", result)
-    assert await store.fence_run(task.task_id, "run-1")
     assert (await store.get_state(task.task_id)).current_run_id == "run-1"
     assert await store.finish_run(
         task.task_id,

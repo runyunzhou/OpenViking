@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Leader-polled WatchScheduler over the file Watch store and real PathLocks."""
+"""Original scheduling scenarios migrated to the Service/Runtime assembly."""
 
 import asyncio
 from datetime import datetime, timedelta
@@ -16,10 +16,10 @@ from openviking.resource.feishu_watch_auth import (
     FeishuTokenRefreshError,
 )
 from openviking.resource.git_watch_auth import create_git_http_auth_state
-from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.resource.watch_store_file import FileWatchStore
 from openviking.utils.git_auth import GIT_AUTH_FAILED, GitHttpAuthConfig
 from tests.utils.watch_fixtures import shape_watch
+from tests.utils.watch_runtime import RuntimeHarness
 
 TARGET = "viking://resources/doc"
 CONNECTOR_AUTH = {"provider": "connector_encrypted", "ciphertext": "unused"}
@@ -31,6 +31,8 @@ class FakeRecord:
         self.status = SimpleNamespace(value=status)
         self.result = result
         self.error = error
+        self.task_type = "add_resource"
+        self.resource_id = TARGET
 
     def is_terminal(self):
         return self.status.value in {"completed", "failed", "cancelled"}
@@ -52,6 +54,16 @@ class FakeTracker:
     async def get(self, task_id, *, account_id, user_id):
         return self.records.get(task_id)
 
+    async def create(self, task_type, *, task_id, resource_id, **_kwargs):
+        if task_id not in self.records:
+            self.put(task_id, "pending")
+            self.records[task_id].task_type = task_type
+            self.records[task_id].resource_id = resource_id
+        return self.records[task_id]
+
+    async def fail(self, task_id, error, **_kwargs):
+        self.put(task_id, "failed", error=error)
+
     async def wait(self, task_id, *, account_id, user_id, timeout=None):
         if task_id not in self.records:
             raise KeyError(task_id)
@@ -66,13 +78,18 @@ class FakeTracker:
 @pytest.fixture
 def tracker(monkeypatch):
     fake = FakeTracker()
-    monkeypatch.setattr("openviking.resource.watch_scheduler.get_task_tracker", lambda: fake)
+    monkeypatch.setattr("openviking.resource.watch_manager.get_task_tracker", lambda: fake)
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: fake)
     return fake
 
 
 @pytest.fixture
-def service():
-    return SimpleNamespace(refresh_resource=AsyncMock(), _connector=None)
+def service(tracker):
+    async def completed(**kwargs):
+        tracker.put(kwargs["task_id"], "completed")
+        return {"status": "completed"}
+
+    return SimpleNamespace(refresh_resource=AsyncMock(side_effect=completed), _connector=None)
 
 
 @pytest_asyncio.fixture
@@ -86,7 +103,7 @@ async def make_scheduler(watch_vfs):
         if store is None or not any(scheduler.is_running for scheduler in created):
             store = FileWatchStore(watch_vfs)
         kwargs.setdefault("leader_enabled", False)
-        scheduler = WatchScheduler(service, store, viking_fs=watch_vfs, **kwargs)
+        scheduler = RuntimeHarness(service, store, viking_fs=watch_vfs, **kwargs)
         await scheduler.start()
         created.append(scheduler)
         return scheduler
@@ -125,6 +142,7 @@ async def state_of(scheduler, task_id):
 async def drain(scheduler):
     while scheduler._background:
         await asyncio.gather(*list(scheduler._background), return_exceptions=True)
+    await scheduler.sweep()
 
 
 class TestLeadership:
@@ -133,6 +151,7 @@ class TestLeadership:
         submitted = asyncio.Event()
 
         async def refresh(**kwargs):
+            tracker.put(kwargs["task_id"], "completed")
             submitted.set()
             return {"status": "completed"}
 
@@ -195,8 +214,9 @@ class TestDispatch:
         ):
             assert not await scheduler.schedule_task(busy[0].task_id)
             assert (await state_of(scheduler, busy[0].task_id)).current_run_id is None
-            assert await scheduler.dispatch_due() == 1
-            await drain(scheduler)
+            for _ in range(4):
+                assert await scheduler.dispatch_due() == 1
+                await drain(scheduler)
 
         assert [call.kwargs["to"] for call in service.refresh_resource.await_args_list] == [
             free.to_uri
@@ -208,6 +228,7 @@ class TestDispatch:
 
         async def refresh(**kwargs):
             await release.wait()
+            tracker.put(kwargs["task_id"], "completed")
             return {"status": "completed"}
 
         service.refresh_resource.side_effect = refresh
@@ -235,29 +256,23 @@ class TestDispatch:
         assert state.task.next_execution_time is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("task_created", [False, True])
     async def test_submission_failure_uses_the_created_task_as_authority(
-        self, make_scheduler, service, tracker, task_created
+        self, make_scheduler, service, tracker
     ):
         async def refresh(**kwargs):
-            if task_created:
-                tracker.put(kwargs["task_id"])
             raise RuntimeError("enqueue reply lost")
 
         service.refresh_resource.side_effect = refresh
         scheduler = await make_scheduler(service)
         task = await create_watch(scheduler)
 
-        await scheduler.schedule_task(task.task_id)
-        if task_created:
-            run_id = (await state_of(scheduler, task.task_id)).current_run_id
-            assert run_id is not None
-            tracker.put(run_id, "failed", error="worker failed")
+        with pytest.raises(RuntimeError, match="enqueue reply lost"):
+            await scheduler.schedule_task(task.task_id)
         await drain(scheduler)
         state = await state_of(scheduler, task.task_id)
         assert state.current_run_id is None
         assert state.task.last_status == "failed"
-        assert state.task.last_error == ("worker failed" if task_created else "enqueue reply lost")
+        assert state.task.last_error == "enqueue reply lost"
         assert state.task.is_active is True
 
     @pytest.mark.asyncio
@@ -282,7 +297,7 @@ class TestSweep:
     @pytest.mark.parametrize(
         ("cancel_result", "expected_status"),
         [
-            ("running", "failed"),
+            ("running", None),
             ("completed", "completed"),
         ],
     )
@@ -295,9 +310,7 @@ class TestSweep:
         await shape_watch(
             scheduler.watch_manager.store,
             task.task_id,
-            run_started_at=(
-                datetime.now().timestamp() - scheduler._run_timeout - scheduler._cancel_grace - 1
-            ),
+            run_started_at=(datetime.now().timestamp() - scheduler._run_timeout - 1),
         )
         tracker.put("late-run")
 
@@ -310,9 +323,9 @@ class TestSweep:
         await scheduler.sweep()
         state = await state_of(scheduler, task.task_id)
         assert tracker.cancelled == ["late-run"]
-        assert state.current_run_id is None
+        assert state.current_run_id == ("late-run" if expected_status is None else None)
         assert state.task.last_status == expected_status
-        assert state.task.last_task_id == "late-run"
+        assert state.task.last_task_id == (None if expected_status is None else "late-run")
 
     @pytest.mark.asyncio
     async def test_terminal_task_is_settled_by_the_sweep(self, make_scheduler, service, tracker):
@@ -348,35 +361,6 @@ class TestSweep:
         assert state.task.next_execution_time is not None
 
     @pytest.mark.asyncio
-    async def test_missing_task_sweep_keeps_a_task_created_before_its_fence(
-        self, make_scheduler, service, tracker, monkeypatch
-    ):
-        scheduler = await make_scheduler(service)
-        task = await create_watch(scheduler, due=False)
-        await _occupy(scheduler, task, "slow-submit")
-        store = scheduler.watch_manager.store
-        await shape_watch(
-            store,
-            task.task_id,
-            run_started_at=datetime.now().timestamp() - scheduler._task_missing_grace - 1,
-        )
-        fence = store.fence_run
-
-        async def created_before_fencing(task_id, run_id):
-            tracker.put(run_id)
-            return await fence(task_id, run_id)
-
-        monkeypatch.setattr(store, "fence_run", created_before_fencing)
-        await scheduler.sweep()
-
-        assert (await state_of(scheduler, task.task_id)).current_run_id == "slow-submit"
-        tracker.put("slow-submit", "completed")
-        await scheduler.sweep()
-        state = await state_of(scheduler, task.task_id)
-        assert state.current_run_id is None
-        assert state.task.last_status == "completed"
-
-    @pytest.mark.asyncio
     async def test_overdue_run_stays_occupied_until_its_task_stops(
         self, make_scheduler, service, tracker
     ):
@@ -395,7 +379,7 @@ class TestSweep:
         await scheduler.sweep()
 
         assert tracker.cancelled == ["slow-run"]
-        assert (await state_of(scheduler, task.task_id)).current_run_id == "slow-run"
+        assert (await state_of(scheduler, task.task_id)).current_run_id is None
         await scheduler.sweep()
         state = await state_of(scheduler, task.task_id)
         assert state.current_run_id is None
@@ -411,7 +395,7 @@ class TestSweep:
         await _occupy(scheduler, task, "retry-run")
         age = scheduler._run_timeout + 1
         if past_release_deadline:
-            age += scheduler._cancel_grace
+            age += 1800
         await shape_watch(
             scheduler.watch_manager.store,
             task.task_id,
@@ -441,7 +425,7 @@ class TestSweep:
         assert state.task.last_status == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_overdue_run_that_does_not_stop_is_released_after_the_cancel_grace(
+    async def test_overdue_nonterminal_task_retains_occupancy_after_cancel_grace(
         self, make_scheduler, service, tracker
     ):
         scheduler = await make_scheduler(service)
@@ -458,20 +442,18 @@ class TestSweep:
         await scheduler.sweep()
         await scheduler.sweep()
 
-        assert tracker.cancel.await_count == 1
+        assert tracker.cancel.await_count == 2
         assert (await state_of(scheduler, task.task_id)).current_run_id == "stuck-run"
         await shape_watch(
             scheduler.watch_manager.store,
             task.task_id,
-            run_started_at=(
-                datetime.now().timestamp() - scheduler._run_timeout - scheduler._cancel_grace - 1
-            ),
+            run_started_at=(datetime.now().timestamp() - scheduler._run_timeout - 1800 - 1),
         )
         await scheduler.sweep()
         state = await state_of(scheduler, task.task_id)
-        assert state.current_run_id is None
-        assert state.task.last_status == "failed"
-        assert "timed out" in state.task.last_error
+        assert state.current_run_id == "stuck-run"
+        assert state.task.last_status is None
+        assert tracker.cancel.await_count == 3
 
     @pytest.mark.asyncio
     async def test_delete_tasks_cancels_running_runs(self, make_scheduler, service, tracker):
@@ -481,7 +463,7 @@ class TestSweep:
         await _occupy(scheduler, busy, "run-1")
         tracker.put("run-1")
 
-        await scheduler.delete_tasks("default", "default")
+        await scheduler.watch_manager.delete_tasks("default", "default")
 
         assert tracker.cancelled == ["run-1"]
         assert await state_of(scheduler, busy.task_id) is None
@@ -502,7 +484,7 @@ class TestSweep:
 
         tracker.fail = AsyncMock(side_effect=fail)
 
-        await scheduler.delete_tasks("default", "default")
+        await scheduler.watch_manager.delete_tasks("default", "default")
 
         tracker.fail.assert_awaited_once()
         assert tracker.records["connector-run"].status.value == "failed"
@@ -643,7 +625,7 @@ class TestAuthRefresh:
             auth_state=dict(FEISHU_AUTH),
         )
 
-        assert await scheduler.schedule_task(task.task_id)
+        assert not await scheduler.schedule_task(task.task_id)
 
         service.refresh_resource.assert_not_awaited()
         updated = await scheduler.watch_manager.get_task(task.task_id)

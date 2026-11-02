@@ -203,11 +203,12 @@ class WatchPatch:
 
 @dataclass(frozen=True)
 class WatchRun:
-    """The occupying run of one Watch. The run ID is also the ingestion Task ID."""
+    """One submission or an associated business Task, using this call's inputs."""
 
     task_id: str
-    run_id: str
+    run_id: Optional[str]
     task: WatchTask
+    started_at: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -219,11 +220,17 @@ class WatchState:
     run_started_at: Optional[float]
     deleted: bool
     now: float
-    run_fenced: bool = False
 
     @property
     def enabled(self) -> bool:
         return self.task.is_active and not self.deleted
+
+
+@dataclass(frozen=True)
+class WatchReceipt:
+    watch_id: str
+    task_id: str
+    reused: bool
 
 
 @dataclass(frozen=True)

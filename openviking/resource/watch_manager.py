@@ -1,19 +1,36 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
 # SPDX-License-Identifier: AGPL-3.0
-"""Watch task management over the Watch store.
+"""Watch management, resource submission and single-run settlement.
 
 Permission and runtime conditions are evaluated by the store. Target stability comes
 from PathLock: a Watch row is created, and a run starts occupying it, only
 while its target's Tree lock is held; transfers rewrite rows inside their own
 lock and check occupancy there.
+
+Initialize after FS and TaskTracker; close after callers, Runtime, resource
+monitors and queue callbacks stop. The Manager spawns no background coroutines.
 """
 
 import inspect
 from contextlib import asynccontextmanager
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Sequence
 
+from openviking.connector.auth import is_external_feishu_auth, restore_feishu_request
+from openviking.connector.delegate import ConnectorDelegate
 from openviking.observability.http_error_context import sanitize_public_http_error
+from openviking.resource.feishu_watch_auth import (
+    FeishuOAuthClient,
+    FeishuTokenRefreshError,
+    apply_feishu_refreshed_token,
+    feishu_auth_state_needs_refresh,
+    is_feishu_auth_state,
+)
+from openviking.resource.git_watch_auth import (
+    git_http_auth_config_from_state,
+    is_git_http_auth_state,
+)
 from openviking.resource.processing_mode import DEFAULT_PROCESSING_MODE, ProcessingMode
 from openviking.resource.watch_store import WatchMoveResult, WatchStore
 from openviking.resource.watch_types import (
@@ -21,12 +38,20 @@ from openviking.resource.watch_types import (
     PermissionDeniedError,
     WatchAuthority,
     WatchPatch,
+    WatchReceipt,
+    WatchRun,
     WatchRunResult,
+    WatchState,
     WatchTask,
 )
-from openviking.service.task_tracker_concurrency import run_to_completion
+from openviking.server.error_mapping import is_not_found_error
+from openviking.server.identity import RequestContext, Role
+from openviking.service.task_tracker import get_task_tracker
+from openviking.service.task_tracker_concurrency import KeyedAsyncLockPool, run_to_completion
 from openviking.storage.errors import LockAcquisitionError, ResourceBusyError
+from openviking.utils.git_auth import GIT_AUTH_FAILED
 from openviking_cli.exceptions import ConflictError, FailedPreconditionError
+from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import VikingURI
 from openviking_cli.utils.logger import get_logger
 
@@ -83,9 +108,27 @@ class WatchPathLocks:
 
 
 class WatchManager:
-    def __init__(self, store: WatchStore, locks: WatchPathLocks) -> None:
+    def __init__(
+        self,
+        store: WatchStore,
+        locks: Optional[WatchPathLocks] = None,
+        *,
+        viking_fs: Any = None,
+        tracker: Any = None,
+        resource_service: Any = None,
+        runtime_config_manager: Any = None,
+    ) -> None:
+        if locks is None:
+            if viking_fs is None:
+                raise ValueError("WatchManager requires target locks or VikingFS")
+            locks = WatchPathLocks(viking_fs)
         self._store = store
         self._locks = locks
+        self._viking_fs = viking_fs if viking_fs is not None else getattr(locks, "_fs", None)
+        self._tracker = tracker
+        self._resource_service = resource_service
+        self._runtime_config_manager = runtime_config_manager
+        self._trigger_locks: KeyedAsyncLockPool[str] = KeyedAsyncLockPool()
         self._deletion_guard: Optional[Callable[[str, str], Any]] = None
 
     def set_deletion_guard(self, guard: Optional[Callable[[str, str], Any]]) -> None:
@@ -112,16 +155,6 @@ class WatchManager:
 
     async def close(self) -> None:
         await self._store.close()
-
-    async def admits_run(self, task_id: str, run_id: str) -> bool:
-        """Allow Task creation only while the run still owns a live, unfenced Watch."""
-        state = await self._store.get_state(task_id)
-        return (
-            state is not None
-            and state.current_run_id == run_id
-            and not state.deleted
-            and not state.run_fenced
-        )
 
     async def create_task(
         self,
@@ -316,10 +349,17 @@ class WatchManager:
     async def update_connector_states(self, task_id: str, connector_states: Dict[str, Any]) -> None:
         await self._store.patch_task(task_id, WatchPatch({"connector_states": connector_states}))
 
-    async def finish_run(self, task_id: str, run_id: str, result: WatchRunResult) -> bool:
+    async def finish_run(
+        self,
+        task_id: str,
+        run_id: Optional[str],
+        result: WatchRunResult,
+        *,
+        started_at: Optional[float] = None,
+    ) -> bool:
         if result.error:
             result = replace(result, error=self._public_error(result.error))
-        return await self._store.finish_run(task_id, run_id, result)
+        return await self._store.finish_run(task_id, run_id, result, started_at=started_at)
 
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:
         return await self._store.deactivate_idle(
@@ -329,10 +369,6 @@ class WatchManager:
     @staticmethod
     def _public_error(error: str) -> str:
         return sanitize_public_http_error(code="WATCH_EXECUTION_FAILED", message=error).message
-
-    async def fail_initial_submission(self, task_id: str, run_id: str, error: str) -> None:
-        """Release a first run whose ingestion Task was never created."""
-        await self.finish_run(task_id, run_id, WatchRunResult(status="failed", error=error))
 
     async def has_running_overlap(self, account_id: str, uris: Sequence[str]) -> bool:
         return await self._store.has_running_overlap(account_id, uris)
@@ -358,3 +394,286 @@ class WatchManager:
         account_id: str = "default",
     ) -> List[WatchTask]:
         return await self._store.deactivate_under_uri(account_id, uri)
+
+    @property
+    def tracker(self) -> Any:
+        return self._tracker if self._tracker is not None else get_task_tracker()
+
+    @staticmethod
+    def context(task: WatchTask) -> RequestContext:
+        try:
+            role = Role(task.original_role)
+        except ValueError:
+            role = Role.USER
+        return RequestContext(
+            user=UserIdentifier(task.account_id, task.user_id),
+            role=role,
+            bypass_acl=True,
+        )
+
+    @staticmethod
+    def run(state: WatchState) -> WatchRun:
+        return WatchRun(
+            state.task.task_id,
+            state.current_run_id,
+            state.task.model_copy(deep=True),
+            started_at=state.run_started_at,
+        )
+
+    async def trigger(self, task_id: str, *, manual: bool = True) -> Optional[WatchReceipt]:
+        """Submit once through ResourceService and return its actual Task ID."""
+        if self._resource_service is None or self._viking_fs is None:
+            raise RuntimeError("Watch resource submission dependencies are not initialized")
+
+        async def submit() -> Optional[WatchReceipt]:
+            async with self._trigger_locks.acquire(task_id):
+                return await self._trigger(task_id, manual=manual)
+
+        return await run_to_completion(submit)
+
+    async def _trigger(self, task_id: str, *, manual: bool) -> Optional[WatchReceipt]:
+        state = await self.store.get_state(task_id)
+        if state is None or state.deleted:
+            return None
+        if state.run_started_at is not None:
+            return await self._reuse(state, retry_terminal=True, manual=manual)
+        task = state.task
+        if task.to_uri and not ConnectorDelegate.is_watch_auth_state(task.auth_state):
+            try:
+                await self._viking_fs.stat(task.to_uri, ctx=self.context(task), skip_count=True)
+            except Exception as exc:
+                if not is_not_found_error(exc):
+                    raise
+                await self.deactivate_idle(
+                    task_id,
+                    target_uri=task.to_uri,
+                    error=f"Watched target URI does not exist: {task.to_uri}",
+                )
+                return None
+        run = None
+        try:
+            async with self.locks.tree(
+                task.account_id, task.to_uri, timeout=5.0 if manual else 0.0
+            ):
+                if await self._owner_deleting(task.account_id, task.user_id):
+                    raise FailedPreconditionError("Identity deletion is in progress")
+                run = await self.store.begin_run(
+                    task_id,
+                    target_uri=task.to_uri,
+                    manual=manual,
+                )
+        except LockAcquisitionError:
+            pass
+        if run is None:
+            # Another caller may have attached its Task since the entry read.
+            latest = await self.store.get_state(task_id)
+            return await self._reuse(latest) if latest and not latest.deleted else None
+        # Release the data target lock before preparation or an external
+        # Connector request, whose callback may import into this target.
+        actual_run = run
+
+        async def on_task_created(record: Any) -> None:
+            nonlocal actual_run
+            actual_run = replace(run, run_id=record.task_id)
+            if not await self.store.attach_task(task_id, record.task_id, started_at=run.started_at):
+                raise FailedPreconditionError("Watch submission is no longer current")
+
+        try:
+            result = await self._submit_resource(run, on_task_created)
+            if actual_run.run_id is None:
+                if isinstance(result, WatchRunResult):
+                    outcome = result
+                elif (result or {}).get("status") in {"failed", "error", "cancelled"}:
+                    outcome = self.result(run.task, result["status"], result, None)
+                else:
+                    raise RuntimeError("Resource submission did not create a Task")
+                await self.finish_run(task_id, None, outcome, started_at=run.started_at)
+                return None
+            record = await self.tracker.get(
+                actual_run.run_id, account_id=task.account_id, user_id=task.user_id
+            )
+            await self.settle_record(actual_run, record)
+            return WatchReceipt(task_id, actual_run.run_id, False)
+        except Exception as exc:
+            if actual_run.run_id is not None:
+                owner = {"account_id": task.account_id, "user_id": task.user_id}
+                record = await self.tracker.get(actual_run.run_id, **owner)
+                if record is not None and not record.is_terminal():
+                    await self.tracker.fail(actual_run.run_id, str(exc), **owner)
+                    record = await self.tracker.get(actual_run.run_id, **owner)
+                await self.settle_record(actual_run, record)
+            await self.finish_run(
+                task_id,
+                None,
+                WatchRunResult(
+                    status="failed",
+                    error=str(exc),
+                    deactivate=isinstance(exc, FileNotFoundError)
+                    or getattr(exc, "code", None) == GIT_AUTH_FAILED,
+                ),
+                started_at=run.started_at,
+            )
+            raise
+
+    async def _reuse(
+        self, state: WatchState, *, retry_terminal: bool = False, manual: bool = True
+    ) -> Optional[WatchReceipt]:
+        if not state.current_run_id:
+            return None
+        run = self.run(state)
+        record = await self.tracker.get(
+            run.run_id, account_id=run.task.account_id, user_id=run.task.user_id
+        )
+        if record is None:
+            return None
+        if record.is_terminal():
+            await self.settle_record(run, record)
+            if retry_terminal:
+                return await self._trigger(run.task_id, manual=manual)
+        return WatchReceipt(run.task_id, run.run_id, True)
+
+    async def _submit_resource(self, run: WatchRun, on_task_created: Any) -> Any:
+        task, auth = run.task, run.task.auth_state
+        connector = ConnectorDelegate.is_watch_auth_state(auth)
+        ctx = self.context(task)
+        if (
+            not connector
+            and not task.path.startswith(("http://", "https://", "git@", "ssh://", "git://"))
+            and not Path(task.path).exists()
+        ):
+            return WatchRunResult(
+                status="failed",
+                error=f"Resource path does not exist: {task.path}",
+                deactivate=True,
+            )
+        kwargs = dict(task.processor_kwargs or {})
+        kwargs.pop("build_index", None)
+        kwargs.pop("summarize", None)
+        if is_external_feishu_auth(auth):
+            ctx.api_key, kwargs["args"] = await restore_feishu_request(
+                self._resource_service._connector, auth, path=task.path, ctx=ctx
+            )
+        elif is_feishu_auth_state(auth):
+            try:
+                if feishu_auth_state_needs_refresh(auth):
+                    from openviking.config.feishu import get_effective_feishu_config
+
+                    if self._runtime_config_manager is None:
+                        raise RuntimeError("Runtime config manager is not initialized")
+                    config = await get_effective_feishu_config(
+                        self._runtime_config_manager, task.account_id
+                    )
+                    refreshed = await FeishuOAuthClient.from_auth_state(
+                        auth, config=config
+                    ).refresh_user_access_token(auth.get("refresh_token"))
+                    auth = apply_feishu_refreshed_token(auth, refreshed)
+                    await self.update_auth_state(task.task_id, auth)
+                kwargs["feishu_access_token"] = auth["access_token"]
+            except FeishuTokenRefreshError as exc:
+                if not exc.permanent:
+                    raise
+                return WatchRunResult(status="failed", error=str(exc), deactivate=True)
+        elif is_git_http_auth_state(auth):
+            kwargs["auth_config"] = git_http_auth_config_from_state(auth, task.path)
+        elif connector:
+            (
+                ctx.api_key,
+                kwargs["add_type"],
+                kwargs["args"],
+                connector_auth,
+            ) = await self._resource_service._connector.restore_watch_request(
+                auth, account_id=task.account_id, path=task.path
+            )
+            if connector_auth is not None:
+                kwargs["connector_auth_config"] = connector_auth
+            kwargs["connector_states"] = task.connector_states
+        return await self._resource_service.refresh_resource(
+            path=task.path,
+            ctx=ctx,
+            to=task.to_uri,
+            to_is_directory=task.to_is_directory,
+            parent=task.parent_uri,
+            reason=task.reason,
+            instruction=task.instruction,
+            build_index=task.build_index,
+            summarize=task.summarize,
+            processing_mode=task.processing_mode,
+            watch_interval=task.watch_interval,
+            enforce_public_remote_targets=True,
+            wait_for_completion=False,
+            on_task_created=on_task_created,
+            **kwargs,
+        )
+
+    @staticmethod
+    def result(
+        task: WatchTask,
+        status: str,
+        result: Optional[dict[str, Any]],
+        error: Optional[str],
+    ) -> WatchRunResult:
+        result = result or {}
+        connector = ConnectorDelegate.is_watch_auth_state(task.auth_state)
+        states = result.get("connector_states")
+        has_states = connector and status == "completed" and "connector_states" in result
+        if has_states and not isinstance(states, dict):
+            status, error, has_states = "failed", "connector_states must be an object", False
+        if status in {"failed", "error"} and not error:
+            errors = result.get("errors")
+            error = "; ".join(str(item) for item in errors) if errors else "watch ingestion failed"
+        return WatchRunResult(
+            status=status,
+            execution_task_id=result.get("task_id"),
+            error=error,
+            deactivate=result.get("code") == GIT_AUTH_FAILED,
+            connector_states=states if has_states else None,
+            has_connector_states=has_states,
+        )
+
+    async def settle(self, task_id: str, run_id: str) -> bool:
+        """Settle callbacks that have IDs but no Watch run snapshot."""
+        state = await self.store.get_state(task_id)
+        if state is None or state.current_run_id != run_id:
+            return False
+        run = self.run(state)
+        record = await self.tracker.get(
+            run_id, account_id=run.task.account_id, user_id=run.task.user_id
+        )
+        return await self.settle_record(run, record)
+
+    async def settle_record(self, run: WatchRun, record: Any) -> bool:
+        """Use existing snapshots; the Store condition guards against stale runs."""
+        if record is None or record.task_id != run.run_id or not record.is_terminal():
+            return False
+        result = {**(record.result or {}), "task_id": record.task_id}
+        return await run_to_completion(
+            lambda: self.finish_run(
+                run.task_id,
+                run.run_id,
+                self.result(run.task, record.status.value, result, record.error),
+                started_at=run.started_at,
+            )
+        )
+
+    async def delete_tasks(self, account_id: str, user_id: Optional[str] = None) -> None:
+        """Identity cleanup uses durable rows, independently of any local Runtime."""
+        states = await self.store.delete_tasks(account_id, user_id)
+        for state in states:
+            run = self.run(state)
+            owner = {"account_id": run.task.account_id, "user_id": run.task.user_id}
+            record = await self.tracker.get(run.run_id, **owner) if run.run_id else None
+            if record is not None and not record.is_terminal():
+                try:
+                    await self.tracker.cancel(run.run_id, **owner)
+                except ValueError:
+                    await self.tracker.fail(run.run_id, "Watch deleted", **owner)
+                record = await self.tracker.get(run.run_id, **owner)
+            if record is None:
+                await self.finish_run(
+                    run.task_id,
+                    run.run_id,
+                    WatchRunResult(status="cancelled", execution_task_id=run.run_id),
+                    started_at=run.started_at,
+                )
+            else:
+                await self.settle_record(run, record)

@@ -8,11 +8,8 @@ answered from memory, and each change rewrites the file before it becomes
 visible. The file belongs to one OpenViking process; every operation runs under
 one in-process lock.
 
-Run occupancy is stored with each task. A first run is written with the Watch
-that it creates; a scheduled run stays in memory and reaches the file with the
-next write (at the latest when the run finishes), so a scheduled run costs one
-file write as before. After a restart, a run that never reached the file is
-forgotten and its Watch is scheduled again, as in earlier releases.
+Submission start and the associated real Task are persisted before becoming
+visible, so target transfers and observers can find in-flight work.
 """
 
 from __future__ import annotations
@@ -59,12 +56,10 @@ class _Row:
     current_run_id: Optional[str] = None
     run_started_at: Optional[float] = None
     deleted: bool = False
-    # In-process only: submitters do not survive a restart.
-    run_fenced: bool = False
 
     def to_storage_dict(self) -> dict[str, Any]:
         data = self.task.to_storage_dict()
-        if self.current_run_id:
+        if self.run_started_at is not None:
             data["current_run_id"] = self.current_run_id
             data["run_started_at"] = self.run_started_at
         if self.deleted:
@@ -78,7 +73,7 @@ class _Row:
         return cls(
             task=WatchTask.from_dict(data),
             current_run_id=run_id,
-            run_started_at=float(started) if run_id and started is not None else None,
+            run_started_at=float(started) if started is not None else None,
             deleted=bool(data.get("deleted", False)),
         )
 
@@ -166,7 +161,7 @@ class FileWatchStore(WatchStore):
                 logger.warning("[FileWatchStore] Failed to load task %s: %s", task_id, exc)
                 continue
             task = row.task
-            if row.deleted and not row.current_run_id:
+            if row.deleted and row.run_started_at is None:
                 normalized = True
                 continue
             if not task.is_active:
@@ -252,7 +247,7 @@ class FileWatchStore(WatchStore):
             if not row.deleted and row.task.to_uri:
                 key = (row.task.account_id, row.task.to_uri)
                 self._targets.setdefault(key, set()).add(task_id)
-            if row.current_run_id:
+            if row.run_started_at is not None:
                 self._running.add(task_id)
 
     def _require_initialized(self) -> None:
@@ -275,7 +270,6 @@ class FileWatchStore(WatchStore):
             run_started_at=row.run_started_at,
             deleted=row.deleted,
             now=now,
-            run_fenced=row.run_fenced,
         )
 
     def _on_target(self, account_id: str, uri: Optional[str]) -> list[_Row]:
@@ -286,7 +280,7 @@ class FileWatchStore(WatchStore):
     @staticmethod
     def _settled(row: _Row) -> Optional[_Row]:
         """The row to keep after a change; an idle tombstone is purged."""
-        return None if row.deleted and not row.current_run_id else row
+        return None if row.deleted and row.run_started_at is None else row
 
     # ── API reads and writes ────────────────────────────────────────────
 
@@ -429,7 +423,7 @@ class FileWatchStore(WatchStore):
                     user_id is not None and row.task.user_id != user_id
                 ):
                     continue
-                if not row.current_run_id:
+                if row.run_started_at is None:
                     updates[task_id] = None
                 elif not row.deleted:
                     updates[task_id] = replace(
@@ -460,7 +454,7 @@ class FileWatchStore(WatchStore):
                     and next_run <= now
                     and task.is_active
                     and not row.deleted
-                    and not row.current_run_id
+                    and row.run_started_at is None
                 ):
                     rows.append(row)
             rows.sort(key=lambda row: (row.task.next_execution_time, row.task.task_id))
@@ -477,12 +471,10 @@ class FileWatchStore(WatchStore):
         self,
         task_id: str,
         *,
-        run_id: str,
+        run_id: Optional[str] = None,
         target_uri: Optional[str],
         manual: bool = False,
     ) -> Optional[WatchRun]:
-        if not run_id:
-            raise ValueError("run_id is required")
         self._require_initialized()
         async with self._lock:
             now = datetime.now()
@@ -490,22 +482,61 @@ class FileWatchStore(WatchStore):
             if (
                 row is None
                 or row.deleted
-                or row.current_run_id
+                or row.run_started_at is not None
                 or row.task.to_uri != target_uri
                 or (not manual and not (row.task.is_active and _due(row.task, now)))
             ):
                 return None
             begun = replace(
-                row, current_run_id=run_id, run_started_at=now.timestamp(), run_fenced=False
+                row,
+                current_run_id=run_id,
+                run_started_at=now.timestamp(),
             )
-            await self._commit({task_id: begun}, persist=False)
-            return WatchRun(task_id=task_id, run_id=run_id, task=row.task)
+            await self._commit({task_id: begun})
+            return WatchRun(
+                task_id=task_id,
+                run_id=run_id,
+                task=row.task.model_copy(deep=True),
+                started_at=begun.run_started_at,
+            )
 
-    async def finish_run(self, task_id: str, run_id: str, result: WatchRunResult) -> bool:
+    async def attach_task(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        started_at: float,
+    ) -> bool:
         self._require_initialized()
         async with self._lock:
             row = self._rows.get(task_id)
-            if row is None or row.current_run_id != run_id:
+            if (
+                row is None
+                or row.deleted
+                or row.current_run_id is not None
+                or row.run_started_at != started_at
+            ):
+                return False
+            await self._commit({task_id: replace(row, current_run_id=run_id)})
+            return True
+
+    async def finish_run(
+        self,
+        task_id: str,
+        run_id: Optional[str],
+        result: WatchRunResult,
+        *,
+        started_at: Optional[float] = None,
+    ) -> bool:
+        self._require_initialized()
+        async with self._lock:
+            row = self._rows.get(task_id)
+            if (
+                row is None
+                or row.run_started_at is None
+                or row.current_run_id != run_id
+                or (started_at is not None and row.run_started_at != started_at)
+            ):
                 return False
             now = datetime.now()
             task = row.task
@@ -529,26 +560,20 @@ class FileWatchStore(WatchStore):
                 task=_changed(task, **changes),
                 current_run_id=None,
                 run_started_at=None,
-                run_fenced=False,
             )
             await self._commit({task_id: self._settled(settled)})
-            return True
-
-    async def fence_run(self, task_id: str, run_id: str) -> bool:
-        self._require_initialized()
-        async with self._lock:
-            row = self._rows.get(task_id)
-            if row is None or row.current_run_id != run_id:
-                return False
-            if not row.run_fenced:
-                await self._commit({task_id: replace(row, run_fenced=True)}, persist=False)
             return True
 
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:
         self._require_initialized()
         async with self._lock:
             row = self._rows.get(task_id)
-            if row is None or row.deleted or row.current_run_id or row.task.to_uri != target_uri:
+            if (
+                row is None
+                or row.deleted
+                or row.run_started_at is not None
+                or row.task.to_uri != target_uri
+            ):
                 return False
             task = _changed(
                 row.task,

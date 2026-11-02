@@ -332,11 +332,6 @@ class _FakeResourceMemoryLinkService:
         return self.result
 
 
-class _FakeWatchScheduler:
-    def __init__(self, watch_manager):
-        self.watch_manager = watch_manager
-
-
 class _FakeQueueManager:
     SEMANTIC = "semantic"
 
@@ -1112,7 +1107,7 @@ async def test_resource_rm_deactivates_watch_tasks(request_context):
     watch_manager = _FakeWatchManager()
     service = FSService(
         viking_fs=viking_fs,
-        watch_scheduler=_FakeWatchScheduler(watch_manager),
+        watch_manager=watch_manager,
     )
     service._enqueue_delete_refresh = AsyncMock()
 
@@ -1129,7 +1124,7 @@ async def test_resource_rm_does_not_deactivate_watch_task_control_uri(request_co
     watch_manager = _FakeWatchManager()
     service = FSService(
         viking_fs=viking_fs,
-        watch_scheduler=_FakeWatchScheduler(watch_manager),
+        watch_manager=watch_manager,
     )
 
     await service.rm("viking://resources/.watch_tasks.json", ctx=request_context)
@@ -1144,7 +1139,7 @@ async def test_resource_mv_rolls_back_exact_watch_move_when_filesystem_fails(req
     watch_manager = _FakeWatchManager()
     service = FSService(
         viking_fs=viking_fs,
-        watch_scheduler=_FakeWatchScheduler(watch_manager),
+        watch_manager=watch_manager,
     )
 
     with pytest.raises(OSError) as raised:
@@ -1180,7 +1175,7 @@ async def test_resource_mv_preserves_both_filesystem_and_rollback_errors(request
     watch_manager.move_errors = [None, rollback_error]
     service = FSService(
         viking_fs=viking_fs,
-        watch_scheduler=_FakeWatchScheduler(watch_manager),
+        watch_manager=watch_manager,
     )
     with pytest.raises(RuntimeError) as raised:
         await service.mv(
@@ -1199,7 +1194,7 @@ async def local_watch_fs_service(local_fs_service):
     store = FileWatchStore(viking_fs)
     manager = WatchManager(store, WatchPathLocks(viking_fs))
     await manager.initialize()
-    service._watch_scheduler = _FakeWatchScheduler(manager)
+    service._watch_manager = manager
     yield service, viking_fs, manager
     await manager.close()
 
@@ -1306,7 +1301,7 @@ async def test_mkdir_cp_mv_reject_storage_internal_names(request_context, name, 
     viking_fs.mkdir.assert_not_called()
 
 
-async def test_resource_mv_without_watch_scheduler_moves_resource_directly(request_context):
+async def test_resource_mv_without_watch_manager_moves_resource_directly(request_context):
     events = []
     viking_fs = _FakeVikingFS(events=events)
     service = FSService(viking_fs=viking_fs)
@@ -1358,7 +1353,7 @@ async def test_resource_mv_watch_control_file_skips_parent_refresh(request_conte
     viking_fs = _FakeVikingFS(is_dir=False)
     service = FSService(
         viking_fs=viking_fs,
-        watch_scheduler=_FakeWatchScheduler(_FakeWatchManager()),
+        watch_manager=_FakeWatchManager(),
     )
     service._enqueue_copy_refresh = AsyncMock()
 
@@ -2158,7 +2153,7 @@ async def test_transfer_waits_for_running_watch_then_proceeds(request_context, m
     viking_fs = _FakeVikingFS()
     watch_manager = _FakeWatchManager()
     watch_manager.running = [True, True]
-    service = FSService(viking_fs=viking_fs, watch_scheduler=_FakeWatchScheduler(watch_manager))
+    service = FSService(viking_fs=viking_fs, watch_manager=watch_manager)
     service._enqueue_copy_refresh = AsyncMock(return_value="queued")
 
     await service.mv(
@@ -2180,7 +2175,7 @@ async def test_fs_operation_reports_retryable_busy_while_watch_keeps_running(
     viking_fs.mkdir = AsyncMock()
     watch_manager = _FakeWatchManager()
     watch_manager.has_running_overlap = AsyncMock(return_value=True)
-    service = FSService(viking_fs=viking_fs, watch_scheduler=_FakeWatchScheduler(watch_manager))
+    service = FSService(viking_fs=viking_fs, watch_manager=watch_manager)
     source, target = "viking://resources/codeask/wiki", "viking://resources/archive/wiki"
 
     with pytest.raises(ResourceBusyError) as raised:

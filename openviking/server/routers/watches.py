@@ -8,7 +8,6 @@ single-resource endpoint accepts either path parameter ``{task_id}`` or
 query parameter ``?to_uri=``. Cross-key conflict returns 400.
 """
 
-import asyncio
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, Path, Query
@@ -29,14 +28,6 @@ from openviking_cli.exceptions import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["watches"])
-
-# Strong refs for in-flight fire-and-forget trigger tasks. Python asyncio
-# only keeps weak references to tasks created via asyncio.create_task, so a
-# task without an external strong reference can be garbage-collected
-# mid-execution and silently aborted. We hold each task here until it
-# completes and discard via done_callback. See
-# https://docs.python.org/3/library/asyncio-task.html#asyncio.create_task
-_BACKGROUND_TRIGGER_TASKS: set[asyncio.Task] = set()
 
 
 class WatchCredentialState(BaseModel):
@@ -99,21 +90,10 @@ class UpdateWatchRequest(BaseModel):
 
 def _wm() -> WatchManager:
     svc = get_service()
-    scheduler = getattr(svc, "watch_scheduler", None)
-    if scheduler is None or not scheduler.is_running:
-        raise FailedPreconditionError("Watch scheduler not running")
-    wm = scheduler.watch_manager
+    wm = getattr(svc, "watch_manager", None)
     if wm is None:
-        raise FailedPreconditionError("Watch scheduler not running")
+        raise FailedPreconditionError("Watch service not initialized")
     return wm
-
-
-def _scheduler():
-    svc = get_service()
-    scheduler = getattr(svc, "watch_scheduler", None)
-    if scheduler is None or not scheduler.is_running:
-        raise FailedPreconditionError("Watch scheduler not running")
-    return scheduler
 
 
 def _identity(ctx: RequestContext):
@@ -331,19 +311,8 @@ async def delete_watch_by_uri(
 
 
 async def _trigger_impl(target: WatchTask):
-    """Dispatch a scheduling request without waiting for execution.
-
-    `WatchScheduler.schedule_task` claims the Watch and submits its run
-    inline, which may refresh credentials or call a Connector and can take
-    seconds. We don't want HTTP requests blocked for that long, so the call
-    is fired off via `asyncio.create_task` and the response returns
-    immediately with ``scheduled=true``. Actual success/failure is observable
-    via subsequent `GET /watches/{task_id}` (last_execution_time updates).
-    """
-    scheduler = _scheduler()
-    task = asyncio.create_task(scheduler.schedule_task(target.task_id))
-    _BACKGROUND_TRIGGER_TASKS.add(task)
-    task.add_done_callback(_BACKGROUND_TRIGGER_TASKS.discard)
+    """Submit through WatchManager before returning the existing HTTP response."""
+    await _wm().trigger(target.task_id)
     return Response(
         status="ok",
         result={"task_id": target.task_id, "to_uri": target.to_uri, "scheduled": True},
@@ -366,11 +335,11 @@ async def trigger_watch_by_id(
     ),
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Immediately schedule the watch task for execution (fire-and-forget).
+    """Submit or reuse the Watch's current ingestion before returning.
 
-    Dispatches the scheduling request asynchronously and returns right away;
-    the actual re-fetch runs in the background. Poll
-    ``GET /watches/{task_id}.last_execution_time`` to confirm completion.
+    Waits for resource submission, including credential restoration and any
+    Connector acceptance request. Processing continues in the background; poll
+    ``GET /watches/{task_id}`` for the recorded execution outcome.
     """
     task = await _resolve_task(task_id, to_uri, _ctx)
     return await _trigger_impl(task)
@@ -381,6 +350,6 @@ async def trigger_watch_by_uri(
     to_uri: str = Query(..., description="Target URI of the watch task"),
     _ctx: RequestContext = Depends(get_request_context),
 ):
-    """Trigger by to_uri (fire-and-forget; see by-id variant for semantics)."""
+    """Submit or reuse a Watch by to_uri; see the by-id variant for semantics."""
     task = await _resolve_task(None, to_uri, _ctx)
     return await _trigger_impl(task)

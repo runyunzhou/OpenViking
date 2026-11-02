@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: AGPL-3.0
 """The Watch store contract shared by the file and MySQL implementations.
 
-``current_run_id`` is the only run occupancy; every transition of it is a
-compare-and-set on the stored row. Callers that change a Watch target, or start
-occupying it, hold the target's PathLock around the call.
+``run_started_at`` makes a submission visible to target transfers before the
+resource layer creates its Task. ``current_run_id`` then associates that real
+Task. Target transfers and starting submissions use the same target PathLock.
 """
 
 from __future__ import annotations
@@ -135,7 +135,7 @@ class WatchStore(ABC):
         self,
         task_id: str,
         *,
-        run_id: str,
+        run_id: Optional[str] = None,
         target_uri: Optional[str],
         manual: bool = False,
     ) -> Optional[WatchRun]:
@@ -146,17 +146,25 @@ class WatchStore(ABC):
         """
 
     @abstractmethod
-    async def finish_run(self, task_id: str, run_id: str, result: WatchRunResult) -> bool:
-        """Release occupancy and record the outcome iff *run_id* still occupies the row."""
+    async def attach_task(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        started_at: float,
+    ) -> bool:
+        """Associate the resource layer's real Task with this submission."""
 
     @abstractmethod
-    async def fence_run(self, task_id: str, run_id: str) -> bool:
-        """Stop admitting Task creation for *run_id*; whether it still occupies the row.
-
-        Occupancy is kept: whoever releases it must first fence, then re-check
-        that the run created no Task, so a concurrent creator that inserted
-        its Task before the fence is never left unprotected.
-        """
+    async def finish_run(
+        self,
+        task_id: str,
+        run_id: Optional[str],
+        result: WatchRunResult,
+        *,
+        started_at: Optional[float] = None,
+    ) -> bool:
+        """Release occupancy and record the outcome iff *run_id* still occupies the row."""
 
     @abstractmethod
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:

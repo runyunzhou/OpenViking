@@ -95,10 +95,7 @@ def _validate_tos_uri(
         not isinstance(value, str)
         or value != value.strip()
         or not value.startswith("tos://")
-        or any(
-            char in "?#%" or ord(char) < 0x20 or ord(char) == 0x7F
-            for char in value
-        )
+        or any(char in "?#%" or ord(char) < 0x20 or ord(char) == 0x7F for char in value)
     ):
         raise error
 
@@ -219,11 +216,10 @@ class ConnectorDelegate:
 
     @classmethod
     def is_watch_auth_state(cls, auth_state: Optional[Dict[str, Any]]) -> bool:
-        return (
-            isinstance(auth_state, dict)
-            and auth_state.get("provider")
-            in {cls._WATCH_AUTH_PROVIDER, cls._WATCH_PLAINTEXT_AUTH_PROVIDER}
-        )
+        return isinstance(auth_state, dict) and auth_state.get("provider") in {
+            cls._WATCH_AUTH_PROVIDER,
+            cls._WATCH_PLAINTEXT_AUTH_PROVIDER,
+        }
 
     async def restore_watch_request(
         self,
@@ -269,8 +265,10 @@ class ConnectorDelegate:
                 or not isinstance(add_type, str)
                 or not add_type
                 or not isinstance(connector_args, dict)
-                or (connector_auth_config is not None
-                    and not isinstance(connector_auth_config, dict))
+                or (
+                    connector_auth_config is not None
+                    and not isinstance(connector_auth_config, dict)
+                )
             ):
                 raise ValueError("invalid watch request")
             return (
@@ -535,6 +533,7 @@ class ConnectorDelegate:
             Callable[[str, Optional[str], Optional[str]], Awaitable[None]]
         ] = None,
         task_id: Optional[str] = None,
+        on_task_created: Optional[Callable[[Any], Awaitable[None]]] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Route add_resource to the external Connector service."""
@@ -710,6 +709,8 @@ class ConnectorDelegate:
             task_id=task_id,
         )
         try:
+            if on_task_created is not None:
+                await on_task_created(task)
             submit_kwargs: Dict[str, Any] = {
                 "add_type": add_type,
                 "api_key": ctx.api_key,

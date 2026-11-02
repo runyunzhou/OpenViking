@@ -57,8 +57,8 @@ from openviking.resource.watch_types import WatchRunResult
 
 @pytest.fixture
 def watch_manager(service):
-    wm = service.watch_scheduler.watch_manager
-    assert wm is not None, "WatchScheduler must be running for these tests"
+    wm = service.watch_manager
+    assert wm is not None, "WatchManager must be initialized for these tests"
     return wm
 
 
@@ -212,7 +212,7 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
 
     # POST trigger — monkeypatch scheduler so we don't actually run a fetch.
     # Class-level setattr means the function is bound as a method, so the
-    # fake must accept `self` (the WatchScheduler instance) as first arg.
+    # fake must accept `self` (the WatchManager instance) as first arg.
     triggered = []
     schedule_started = asyncio.Event()
 
@@ -222,7 +222,7 @@ async def test_full_lifecycle(client: httpx.AsyncClient, watch_manager, monkeypa
         return True
 
     monkeypatch.setattr(
-        "openviking.resource.watch_scheduler.WatchScheduler.schedule_task",
+        "openviking.resource.watch_manager.WatchManager.trigger",
         fake_schedule,
     )
     resp = await client.post(f"/api/v1/watches/{task.task_id}/trigger")
@@ -352,7 +352,7 @@ async def test_trigger_by_uri(client: httpx.AsyncClient, watch_manager, monkeypa
         return True
 
     monkeypatch.setattr(
-        "openviking.resource.watch_scheduler.WatchScheduler.schedule_task",
+        "openviking.resource.watch_manager.WatchManager.trigger",
         fake_schedule,
     )
     resp = await client.post("/api/v1/watches/trigger", params={"to_uri": task.to_uri})

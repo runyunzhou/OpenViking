@@ -90,9 +90,9 @@ class DeletionService:
             self._creation_blocked if self._require_registered_identity else self._is_deleting
         )
         get_task_tracker().set_deletion_guard(creation_guard)
-        scheduler = self._service.watch_scheduler
-        if scheduler is not None:
-            scheduler.watch_manager.set_deletion_guard(creation_guard)
+        watches = getattr(self._service, "watch_manager", None)
+        if watches is not None:
+            watches.set_deletion_guard(creation_guard)
         queue_manager = self._service._queue_manager
         queue = queue_manager.get_queue(queue_manager.DATA_CLEANUP)
         queued_task_ids = {
@@ -343,9 +343,9 @@ class DeletionService:
                 from openviking_gateway.app import delete_data
 
                 await run_to_completion(lambda: delete_data(self._gateway_app, account_id, user_id))
-            scheduler = self._service.watch_scheduler
-            if scheduler is not None:
-                await run_to_completion(lambda: scheduler.delete_tasks(account_id, user_id))
+            watches = getattr(self._service, "watch_manager", None)
+            if watches is not None:
+                await run_to_completion(lambda: watches.delete_tasks(account_id, user_id))
             await run_to_completion(lambda: self._cancel_tasks(account_id, user_id))
             if user_id is None:
                 from openviking.ttl.wiring import get_ttl_adapter

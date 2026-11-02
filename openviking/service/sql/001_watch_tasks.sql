@@ -18,7 +18,6 @@ CREATE TABLE `ov_watch_tasks` (
     next_run_at DOUBLE NULL,
     current_run_id VARCHAR(255) COLLATE utf8mb4_bin NULL,
     run_started_at DOUBLE NULL,
-    run_fenced BOOLEAN NOT NULL DEFAULT 0,
     last_execution_time DOUBLE NULL,
     last_task_id VARCHAR(255) COLLATE utf8mb4_bin NULL,
     last_status VARCHAR(64) COLLATE ascii_bin NULL,
@@ -32,7 +31,7 @@ CREATE TABLE `ov_watch_tasks` (
     updated_at DOUBLE NOT NULL,
     PRIMARY KEY (service_name, task_id),
     KEY ix_ov_watch_tasks_due (service_name, enabled, next_run_at),
-    KEY ix_ov_watch_tasks_run (service_name, current_run_id),
+    KEY ix_ov_watch_tasks_run (service_name, run_started_at),
     KEY ix_ov_watch_tasks_target (service_name, account_id, target_uri_hash),
     KEY ix_ov_watch_tasks_list
         (service_name(128), account_id(128), user_id(128), created_at)

@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from openviking.resource.watch_scheduler import WatchScheduler
+from openviking.resource.watch_manager import WatchManager
 from openviking.resource.watch_types import WatchRunResult
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
@@ -79,11 +79,13 @@ def service(monkeypatch: pytest.MonkeyPatch) -> ResourceService:
         skill_processor=object(),
     )
     monkeypatch.setattr(instance._connector, "should_delegate", lambda *_args, **_kwargs: False)
-    monkeypatch.setattr(
-        instance,
-        "_enqueue_add_resource_job",
-        AsyncMock(return_value=SimpleNamespace(task_id="task-1")),
-    )
+
+    async def enqueue(_msg, **kwargs):
+        task = SimpleNamespace(task_id="task-1")
+        await kwargs["on_task_created"](task)
+        return task
+
+    monkeypatch.setattr(instance, "_enqueue_add_resource_job", AsyncMock(side_effect=enqueue))
     monkeypatch.setattr(
         instance,
         "_plan_source_job_target",
@@ -100,8 +102,7 @@ async def test_no_split_is_forwarded_and_persisted_for_watch_replay(
     watch_manager = SimpleNamespace(
         create_task=AsyncMock(return_value=SimpleNamespace(task_id="watch-1")),
     )
-    scheduler = SimpleNamespace(watch_manager=watch_manager)
-    service._watch_scheduler = scheduler
+    service._watch_manager = watch_manager
 
     await service.add_resource(
         path="/test/path",
@@ -125,9 +126,8 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
     service: ResourceService,
     ctx: RequestContext,
 ):
-    scheduler = WatchScheduler(service, watch_store, viking_fs=watch_vfs, leader_enabled=False)
-    watch_manager = scheduler.watch_manager
-    service._watch_scheduler = scheduler
+    watch_manager = WatchManager(watch_store, viking_fs=watch_vfs, resource_service=service)
+    service._watch_manager = watch_manager
     service._plan_source_job_target = AsyncMock(
         side_effect=lambda **kwargs: (
             "viking://resources/test",
@@ -143,16 +143,10 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
         watch_interval=30.0,
         args={"parse_mode": "no_split"},
     )
-    assert "root_uri" not in result
+    assert result["root_uri"] == "viking://resources/test"
     message = service._enqueue_add_resource_job.await_args.args[0]
-    assert message.defer_target_resolution is True
-    await service.execute_add_resource_job(
-        message,
-        ctx=ctx,
-        resource_lock=None,
-        stage_callback=AsyncMock(),
-        task_auth={},
-    )
+    assert message.defer_target_resolution is False
+    assert message.skip_watch_management and message.watch_task_id
 
     tasks = await watch_manager.get_all_tasks(
         account_id=ctx.account_id,
@@ -174,7 +168,7 @@ async def test_no_split_watch_replay_preserves_auto_bound_file_target(
         target_uri=task.to_uri,
         manual=True,
     )
-    await scheduler._submit_resource(run)
+    await watch_manager._submit_resource(run, AsyncMock())
 
     replay_message = service._enqueue_add_resource_job.await_args.args[0]
     assert replay_message.root_uri == "viking://resources/test"
@@ -215,7 +209,7 @@ async def test_no_split_watch_persists_auto_bound_multi_artifact_directory(
     ctx: RequestContext,
 ):
     service._resource_processor.root_is_file = False
-    service._watch_scheduler = SimpleNamespace(watch_manager=watch_manager)
+    service._watch_manager = watch_manager
 
     await service.add_resource(
         path="https://example.com/guide.md",

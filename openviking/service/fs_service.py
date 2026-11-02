@@ -117,7 +117,6 @@ def _visible_grep_content(content: str, uri: str) -> str:
 
 if TYPE_CHECKING:
     from openviking.resource.watch_manager import WatchManager
-    from openviking.resource.watch_scheduler import WatchScheduler
     from openviking.service.compile_targets import CompileLifecycle
     from openviking.service.resource_memory_link_service import ResourceMemoryLinkService
     from openviking.storage import VikingDBManager
@@ -132,8 +131,8 @@ class FSService:
         vikingdb: Optional["VikingDBManager"] = None,
         privacy_config_service: Optional[UserPrivacyConfigService] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
-        watch_scheduler: Optional["WatchScheduler"] = None,
         privacy_sanitizer: Optional[PrivacySanitizer] = None,
+        watch_manager: Optional["WatchManager"] = None,
     ):
         self._viking_fs = viking_fs
         self._vikingdb = vikingdb
@@ -142,7 +141,7 @@ class FSService:
             PrivacySanitizer(privacy_config_service) if privacy_config_service is not None else None
         )
         self._resource_memory_link_service = resource_memory_link_service
-        self._watch_scheduler = watch_scheduler
+        self._watch_manager = watch_manager
         # Installed by OpenVikingService; records Compile output versions after writes.
         self.compile_versions: Optional[Any] = None
         # Installed by OpenVikingService; transfers exact-target Compile settings on mv.
@@ -154,8 +153,8 @@ class FSService:
         vikingdb: Optional["VikingDBManager"] = None,
         privacy_config_service: Optional[UserPrivacyConfigService] = None,
         resource_memory_link_service: Optional["ResourceMemoryLinkService"] = None,
-        watch_scheduler: Optional["WatchScheduler"] = None,
         privacy_sanitizer: Optional[PrivacySanitizer] = None,
+        watch_manager: Optional["WatchManager"] = None,
     ) -> None:
         """Set service dependencies (for deferred initialization)."""
         self._viking_fs = viking_fs
@@ -165,7 +164,7 @@ class FSService:
             PrivacySanitizer(privacy_config_service) if privacy_config_service is not None else None
         )
         self._resource_memory_link_service = resource_memory_link_service
-        self._watch_scheduler = watch_scheduler
+        self._watch_manager = watch_manager
 
     def _ensure_initialized(self) -> VikingFS:
         """Ensure VikingFS is initialized."""
@@ -185,9 +184,7 @@ class FSService:
         return await viking_fs.resolve_uri(uri_or_id, ctx=ctx)
 
     def _get_watch_manager(self) -> Optional["WatchManager"]:
-        if not self._watch_scheduler:
-            return None
-        return self._watch_scheduler.watch_manager
+        return self._watch_manager
 
     @asynccontextmanager
     async def _hold_watch_scope(

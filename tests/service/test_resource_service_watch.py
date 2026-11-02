@@ -13,7 +13,6 @@ import pytest_asyncio
 from openviking.parse.mode import ParseMode
 from openviking.resource.feishu_watch_auth import FeishuAppCredentials
 from openviking.resource.watch_manager import WatchManager
-from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.resource.watch_types import WatchRunResult
 from openviking.server.identity import RequestContext, Role
 from openviking.service import resource_service as resource_service_module
@@ -27,14 +26,14 @@ from openviking.storage.queuefs.add_resource_msg import AddResourceMsg
 from openviking.storage.queuefs.add_resource_processor import AddResourceProcessor
 from openviking.storage.queuefs.queue_manager import QueueManager
 from openviking.utils.ingest_options import IngestOptions
-from openviking_cli.exceptions import ConflictError, FailedPreconditionError, InvalidArgumentError
+from openviking_cli.exceptions import ConflictError, InvalidArgumentError
 from openviking_cli.session.user_id import UserIdentifier
 from tests.test_task_tracker import _FakeAgfs
-from tests.utils.watch_fixtures import shape_watch
+from tests.utils.watch_runtime import RuntimeHarness
 
 
 async def get_task_by_uri(service: ResourceService, to_uri: str, ctx: RequestContext):
-    return await service._watch_scheduler.watch_manager.get_task_by_uri(
+    return await service._watch_manager.get_task_by_uri(
         to_uri=to_uri,
         account_id=ctx.account_id,
         user_id=ctx.user.user_id,
@@ -97,6 +96,9 @@ class NoopTaskTracker:
     async def complete(self, *_args, **_kwargs):
         pass
 
+    async def get(self, *_args, **_kwargs):
+        return None
+
     async def wait(self, *_args, **_kwargs):
         return SimpleNamespace(status=TaskStatus.COMPLETED, result={})
 
@@ -129,13 +131,20 @@ class EnqueuedTasks:
 
 async def run_watch_now(monkeypatch, resource_service, watch_vfs, task):
     """Release the first run, then refresh through the scheduler."""
-    from openviking.resource.watch_scheduler import WatchScheduler
+    tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
+    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.resource.watch_manager.get_task_tracker", lambda: tracker)
 
-    tracker = EnqueuedTasks()
-    monkeypatch.setattr("openviking.resource.watch_scheduler.get_task_tracker", lambda: tracker)
-
-    def enqueued(msg, **_kwargs):
-        tracker.ids.add(msg.task_id)
+    async def enqueued(msg, **kwargs):
+        record = await tracker.create(
+            "add_resource",
+            task_id=msg.task_id,
+            resource_id=msg.root_uri,
+            account_id=msg.account_id,
+            user_id=msg.user_id,
+        )
+        await kwargs["on_task_created"](record)
+        await tracker.complete(msg.task_id, {}, account_id=msg.account_id, user_id=msg.user_id)
         return SimpleNamespace(task_id=msg.task_id)
 
     resource_service._enqueue_add_resource_job.side_effect = enqueued
@@ -147,7 +156,7 @@ async def run_watch_now(monkeypatch, resource_service, watch_vfs, task):
         )
     owner = RequestContext(user=UserIdentifier(task.account_id, task.user_id), role=Role.ROOT)
     await watch_vfs.mkdir(task.to_uri, ctx=owner, exist_ok=True)
-    scheduler = WatchScheduler(
+    scheduler = RuntimeHarness(
         resource_service,
         manager.store,
         viking_fs=watch_vfs,
@@ -155,6 +164,7 @@ async def run_watch_now(monkeypatch, resource_service, watch_vfs, task):
         leader_enabled=False,
     )
     await scheduler.start()
+    resource_service._watch_manager = scheduler.watch_manager
     try:
         assert await scheduler.schedule_task(task.task_id)
         await asyncio.gather(*list(scheduler._background))
@@ -205,17 +215,23 @@ async def resource_service(
     watch_manager: WatchManager, runtime_config_manager
 ) -> AsyncGenerator[ResourceService, None]:
     """Create ResourceService instance with watch support."""
-    scheduler = MagicMock()
-    scheduler.watch_manager = watch_manager
     service = ResourceService(
         vikingdb=MockVikingDB(),
         viking_fs=MockVikingFS(),
         resource_processor=MockResourceProcessor(),
         skill_processor=MockSkillProcessor(),
-        watch_scheduler=scheduler,
         runtime_config_manager=runtime_config_manager,
     )
-    service._enqueue_add_resource_job = AsyncMock(return_value=SimpleNamespace(task_id="test-task"))
+    service._watch_manager = WatchManager(
+        watch_manager.store, viking_fs=watch_manager.locks._fs, resource_service=service
+    )
+
+    async def enqueue(_msg, **kwargs):
+        record = SimpleNamespace(task_id="test-task")
+        await kwargs["on_task_created"](record)
+        return record
+
+    service._enqueue_add_resource_job = AsyncMock(side_effect=enqueue)
     yield service
 
 
@@ -766,7 +782,7 @@ class TestAddResourceArgs:
             ({"to": "viking://resources/feishu"}, True),
         ],
     )
-    async def test_native_feishu_watch_is_created_during_queue_processing(
+    async def test_native_feishu_watch_is_registered_before_response(
         self,
         monkeypatch: pytest.MonkeyPatch,
         resource_service: ResourceService,
@@ -795,28 +811,16 @@ class TestAddResourceArgs:
             **target,
         )
 
-        assert await get_task_by_uri(resource_service, to_uri, request_context) is None
+        task = await get_task_by_uri(resource_service, result["root_uri"], request_context)
+        assert task is not None
         assert result["task_id"] == "test-task"
 
         message = resource_service._enqueue_add_resource_job.await_args.args[0]
-        assert message.is_active is is_active
-        assert message.watch_task_id is None
-        assert message.skip_watch_management is False
-        assert AddResourceMsg.from_dict(message.to_dict()).is_active is is_active
-
-        await resource_service.execute_add_resource_job(
-            message,
-            ctx=request_context,
-            resource_lock=None,
-            stage_callback=AsyncMock(),
-        )
-
-        task = await get_task_by_uri(resource_service, to_uri, request_context)
-        assert task is not None
         assert message.watch_task_id == task.task_id
+        assert message.skip_watch_management
+        assert AddResourceMsg.from_dict(message.to_dict()).watch_task_id == task.task_id
         assert task.is_active is (is_active is not False)
         assert (task.next_execution_time is not None) is (is_active is not False)
-        assert len(resource_service._resource_processor.calls) == 1
 
     @pytest.mark.asyncio
     async def test_native_feishu_preflight_failure_does_not_create_watch(
@@ -1099,7 +1103,7 @@ async def test_add_resource_processor_records_checkpoint_only_after_success():
 @pytest.mark.asyncio
 async def test_record_watch_execution_redacts_error_in_log(caplog):
     scheduler = SimpleNamespace(settle=AsyncMock(return_value=True))
-    service = ResourceService(watch_scheduler=scheduler)
+    service = ResourceService(watch_manager=scheduler)
     error = "connector failed: api_key=secret-watch-key, Authorization: Bearer secret-token"
 
     resource_service_module.logger.addHandler(caplog.handler)
@@ -1123,18 +1127,19 @@ async def test_record_watch_execution_redacts_error_in_log(caplog):
 async def native_watch_submission(monkeypatch, resource_service, watch_store, watch_vfs):
     """Real Task creation, queue consumer and Watch settlement with a stub parser."""
     tracker = TaskTracker(PersistentTaskStore(_FakeAgfs()))
-    scheduler = WatchScheduler(
-        resource_service, watch_store, viking_fs=watch_vfs, leader_enabled=False
+    scheduler = RuntimeHarness(
+        resource_service, watch_store, viking_fs=watch_vfs, tracker=tracker, leader_enabled=False
     )
     await scheduler.start()
-    resource_service._watch_scheduler = scheduler
+    resource_service._watch_manager = scheduler.watch_manager
+    resource_service._watch_runtime = scheduler
     resource_service._viking_fs = watch_vfs
     resource_service._enqueue_add_resource_job = ResourceService._enqueue_add_resource_job.__get__(
         resource_service
     )
     queue = SimpleNamespace(enqueue=AsyncMock(return_value="message-1"))
     monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
-    monkeypatch.setattr("openviking.resource.watch_scheduler.get_task_tracker", lambda: tracker)
+    monkeypatch.setattr("openviking.resource.watch_manager.get_task_tracker", lambda: tracker)
     monkeypatch.setattr(
         "openviking.storage.queuefs.add_resource_processor.get_task_tracker", lambda: tracker
     )
@@ -1146,55 +1151,38 @@ async def native_watch_submission(monkeypatch, resource_service, watch_store, wa
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("revoke_at", ["before-check", "during-insert"])
-async def test_first_native_submission_rejects_a_released_run(
-    monkeypatch, native_watch_submission, request_context, revoke_at
+async def test_first_native_submission_registers_actual_task_before_enqueue(
+    native_watch_submission, request_context
 ):
     service = native_watch_submission.service
     tracker = native_watch_submission.tracker
-    scheduler = service._watch_scheduler
+    scheduler = service._watch_runtime
     manager = scheduler.watch_manager
     to_uri = "viking://resources/first-native"
 
-    async def release_run():
-        watch = await get_task_by_uri(service, to_uri, request_context)
-        await shape_watch(manager.store, watch.task_id, run_started_at=1.0)
-        await scheduler.sweep()
-        assert (await manager.store.get_state(watch.task_id)).current_run_id is None
-
-    if revoke_at == "before-check":
-
-        async def handoff(_lease):
-            await release_run()
-            return None
-
-        monkeypatch.setattr(service, "_lock_to_handoff_payload", handoff)
-    else:
-        create = tracker._store.create
-
-        async def insert(task, **kwargs):
-            await release_run()
-            return await create(task, **kwargs)
-
-        monkeypatch.setattr(tracker._store, "create", insert)
-
-    with pytest.raises(FailedPreconditionError, match="no longer admitted"):
-        await service._execute_resource_ingestion(
-            path="https://example.org/doc",
-            to=to_uri,
-            ctx=request_context,
-            defer_post_processing=True,
-            watch_interval=1,
-            task_id="first-native",
+    async def enqueue(_name, message):
+        watch = await get_task_by_uri(service, message["root_uri"], request_context)
+        state = await manager.store.get_state(watch.task_id)
+        record = await tracker.get(
+            message["task_id"],
+            account_id=request_context.account_id,
+            user_id=request_context.user.user_id,
         )
-    assert (
-        await tracker.list_tasks(
-            account_id=request_context.account_id, user_id=request_context.user.user_id
-        )
-        == []
+        assert record is not None and not record.is_terminal()
+        assert state.current_run_id == record.task_id
+        assert message["watch_task_id"] == watch.task_id
+        return "message"
+
+    native_watch_submission.queue.enqueue.side_effect = enqueue
+    result = await service._execute_resource_ingestion(
+        path="https://example.org/doc",
+        to=to_uri,
+        ctx=request_context,
+        defer_post_processing=True,
+        watch_interval=1,
     )
-    native_watch_submission.queue.enqueue.assert_not_awaited()
-    assert await manager.store.running() == []
+    assert result["task_id"] and result["watch_id"]
+    native_watch_submission.queue.enqueue.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1205,7 +1193,7 @@ async def test_native_task_runs_after_submission_and_settles_after_work(
 ):
     service = native_watch_submission.service
     tracker = native_watch_submission.tracker
-    scheduler = service._watch_scheduler
+    scheduler = service._watch_runtime
     to_uri = "viking://resources/accepted-native"
     owner = {"account_id": request_context.account_id, "user_id": request_context.user.user_id}
     result = await service._execute_resource_ingestion(
@@ -1239,7 +1227,7 @@ async def test_native_task_runs_after_submission_and_settles_after_work(
         await tracker.mark_work_failed(message.task_id, "queue-work", "Work failed", **owner)
     else:
         await tracker.mark_work_done(message.task_id, "queue-work", **owner)
-    await asyncio.wait_for(asyncio.gather(*list(scheduler._background)), timeout=5)
+    await scheduler.sweep()
     state = await scheduler.watch_manager.store.get_state(watch.task_id)
     assert state.current_run_id is None
     assert state.task.last_status == ("failed" if work_failed else "completed")
@@ -1257,7 +1245,7 @@ async def test_native_worker_callback_allows_shutdown_with_unfinished_work(
 
     service = native_watch_submission.service
     tracker = native_watch_submission.tracker
-    scheduler = service._watch_scheduler
+    scheduler = service._watch_runtime
     owner = {"account_id": request_context.account_id, "user_id": request_context.user.user_id}
     await service._execute_resource_ingestion(
         path="https://example.org/doc",
@@ -1578,7 +1566,7 @@ class TestWatchTaskConflict:
         assert task is not None
         task_id = task.task_id
 
-        watch_manager = resource_service._watch_scheduler.watch_manager
+        watch_manager = resource_service._watch_manager
         await watch_manager.update_task(
             task_id=task_id,
             account_id=request_context.account_id,
@@ -1625,7 +1613,7 @@ class TestWatchTaskCancellation:
     async def test_native_cancellation_reports_shared_target_conflict(
         self, resource_service: ResourceService, request_context: RequestContext, watch_interval
     ):
-        manager = resource_service._watch_scheduler.watch_manager
+        manager = resource_service._watch_manager
         to_uri = "viking://resources/shared"
         tasks = [
             await manager.create_task(
@@ -1750,7 +1738,7 @@ class TestWatchTaskUpdate:
         assert task is not None
         original_task_id = task.task_id
 
-        watch_manager = resource_service._watch_scheduler.watch_manager
+        watch_manager = resource_service._watch_manager
         await watch_manager.update_task(
             task_id=task.task_id,
             account_id=request_context.account_id,
@@ -1799,15 +1787,13 @@ class TestResourceProcessingIndependence:
         """Test that resource is added even if watch task creation fails."""
         failing_watch_manager = MagicMock(spec=WatchManager)
         failing_watch_manager.get_task_by_uri = AsyncMock(side_effect=Exception("DB error"))
-        scheduler = MagicMock()
-        scheduler.watch_manager = failing_watch_manager
 
         service = ResourceService(
             vikingdb=MockVikingDB(),
             viking_fs=MockVikingFS(),
             resource_processor=MockResourceProcessor(),
             skill_processor=MockSkillProcessor(),
-            watch_scheduler=scheduler,
+            watch_manager=failing_watch_manager,
         )
         service._enqueue_add_resource_job = AsyncMock(
             return_value=SimpleNamespace(task_id="test-task")
@@ -1831,7 +1817,7 @@ class TestResourceProcessingIndependence:
             viking_fs=MockVikingFS(),
             resource_processor=MockResourceProcessor(),
             skill_processor=MockSkillProcessor(),
-            watch_scheduler=None,
+            watch_manager=None,
         )
         service._enqueue_add_resource_job = AsyncMock(
             return_value=SimpleNamespace(task_id="test-task")
@@ -1949,7 +1935,8 @@ async def test_external_feishu_auth_survives_queue_and_multiple_watches(
     monkeypatch.setattr(
         ConnectorClient, "get_oauth_access_token", Mock(side_effect=InternalError("unavailable"))
     )
-    await run_watch_now(monkeypatch, resource_service, watch_vfs, tasks[0])
+    with pytest.raises(InternalError, match="unavailable"):
+        await run_watch_now(monkeypatch, resource_service, watch_vfs, tasks[0])
     task = await get_task_by_uri(resource_service, tasks[0].to_uri, request_context)
     assert task.is_active is True
     assert task.last_status == "failed"
@@ -2005,14 +1992,20 @@ async def test_processing_error_creates_no_watch(resource_service, request_conte
 @pytest.mark.parametrize("committed_task", [False, True])
 async def test_enqueue_failure_uses_task_as_authority(
     monkeypatch,
-    resource_service,
+    native_watch_submission,
     request_context,
     committed_task,
 ):
+    resource_service = native_watch_submission.service
     manager = resource_service._get_watch_manager()
-    resource_service._enqueue_add_resource_job = AsyncMock(side_effect=RuntimeError("queue down"))
-    tracker = SimpleNamespace(get=AsyncMock(return_value=object() if committed_task else None))
-    monkeypatch.setattr("openviking.service.task_tracker.get_task_tracker", lambda: tracker)
+    if committed_task:
+        native_watch_submission.queue.enqueue.side_effect = RuntimeError("queue down")
+    else:
+        monkeypatch.setattr(
+            native_watch_submission.tracker,
+            "create",
+            AsyncMock(side_effect=RuntimeError("queue down")),
+        )
     with pytest.raises(RuntimeError, match="queue down"):
         await resource_service._execute_resource_ingestion(
             path="https://example.org/test",
@@ -2023,8 +2016,10 @@ async def test_enqueue_failure_uses_task_as_authority(
             task_id="first-run",
         )
     watch = await get_task_by_uri(resource_service, "viking://resources/test", request_context)
-    state = await manager.store.get_state(watch.task_id)
-    assert state.current_run_id == ("first-run" if committed_task else None)
-    if not committed_task:
+    if committed_task:
+        state = await manager.store.get_state(watch.task_id)
+        assert state.current_run_id is None
         assert watch.last_status == "failed"
-        assert watch.last_error == "queue down"
+        assert watch.last_error == "Failed to enqueue resource processing"
+    else:
+        assert watch is None

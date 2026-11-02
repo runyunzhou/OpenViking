@@ -190,7 +190,6 @@ def watch_tables(table: str, metadata: Optional[MetaData] = None) -> Table:
         Column("next_run_at", Float, nullable=True),
         Column("current_run_id", key, nullable=True),
         Column("run_started_at", Float, nullable=True),
-        Column("run_fenced", Boolean, nullable=False, default=False),
         Column("last_execution_time", Float, nullable=True),
         Column("last_task_id", key, nullable=True),
         Column("last_status", String(64), nullable=True),
@@ -202,7 +201,7 @@ def watch_tables(table: str, metadata: Optional[MetaData] = None) -> Table:
         Column("created_at", Float, nullable=False),
         Column("updated_at", Float, nullable=False),
         Index(f"ix_{table}_due", "service_name", "enabled", "next_run_at"),
-        Index(f"ix_{table}_run", "service_name", "current_run_id"),
+        Index(f"ix_{table}_run", "service_name", "run_started_at"),
         Index(f"ix_{table}_target", "service_name", "account_id", "target_uri_hash"),
         Index(f"ix_{table}_list", "service_name", "account_id", "user_id", "created_at"),
     )
@@ -320,7 +319,6 @@ class MySQLWatchStore(WatchStore):
             run_started_at=row["run_started_at"],
             deleted=bool(row["deleted"]),
             now=float(row["db_now"]),
-            run_fenced=bool(row["run_fenced"]),
         )
 
     def _select_state(self) -> Any:
@@ -567,10 +565,10 @@ class MySQLWatchStore(WatchStore):
                 session,
                 self._select_state().where(
                     *where,
-                    c.current_run_id.is_not(None),
+                    c.run_started_at.is_not(None),
                 ),
             )
-            await session.execute(delete(self._tasks).where(*where, c.current_run_id.is_(None)))
+            await session.execute(delete(self._tasks).where(*where, c.run_started_at.is_(None)))
             return [self._state(row) for row in rows]
 
     async def _purge(self, session: Any, task_ids: Sequence[str]) -> None:
@@ -580,7 +578,7 @@ class MySQLWatchStore(WatchStore):
                 self._scope,
                 c.task_id.in_(list(task_ids)),
                 c.deleted.is_(True),
-                c.current_run_id.is_(None),
+                c.run_started_at.is_(None),
             )
         )
 
@@ -597,7 +595,7 @@ class MySQLWatchStore(WatchStore):
                     c.enabled.is_(True),
                     c.next_run_at <= db_now(),
                     c.deleted.is_(False),
-                    c.current_run_id.is_(None),
+                    c.run_started_at.is_(None),
                 )
                 .order_by(c.next_run_at, c.task_id)
                 .offset(offset)
@@ -613,7 +611,7 @@ class MySQLWatchStore(WatchStore):
                 self._select_state()
                 .where(
                     self._scope,
-                    c.current_run_id.is_not(None),
+                    c.run_started_at.is_not(None),
                     c.task_id > after,
                 )
                 .order_by(c.task_id)
@@ -625,7 +623,7 @@ class MySQLWatchStore(WatchStore):
         self,
         task_id: str,
         *,
-        run_id: str,
+        run_id: Optional[str] = None,
         target_uri: Optional[str],
         manual: bool = False,
     ) -> Optional[WatchRun]:
@@ -634,14 +632,12 @@ class MySQLWatchStore(WatchStore):
         The caller holds that target's Tree PathLock, so no transfer of the
         target can interleave between this check and the commit.
         """
-        if not run_id:
-            raise ValueError("run_id is required")
         c = self._tasks.c
         where = [
             self._scope,
             c.task_id == task_id,
             c.deleted.is_(False),
-            c.current_run_id.is_(None),
+            c.run_started_at.is_(None),
             c.target_uri_hash == _hash(target_uri),
         ]
         where.append(c.target_uri.is_(None) if target_uri is None else c.target_uri == target_uri)
@@ -655,7 +651,6 @@ class MySQLWatchStore(WatchStore):
                     .values(
                         current_run_id=run_id,
                         run_started_at=db_now(),
-                        run_fenced=False,
                         updated_at=db_now(),
                     )
                 )
@@ -665,9 +660,43 @@ class MySQLWatchStore(WatchStore):
             rows = await self._rows(
                 session, select(*self._tasks.c).where(self._scope, c.task_id == task_id)
             )
-            return WatchRun(task_id=task_id, run_id=run_id, task=self._task(rows[0]))
+            task = self._task(rows[0])
+            return WatchRun(
+                task_id=task_id,
+                run_id=run_id,
+                task=task,
+                started_at=float(rows[0]["run_started_at"]),
+            )
 
-    async def finish_run(self, task_id: str, run_id: str, result: WatchRunResult) -> bool:
+    async def attach_task(
+        self,
+        task_id: str,
+        run_id: str,
+        *,
+        started_at: float,
+    ) -> bool:
+        c = self._tasks.c
+        where = [
+            self._scope,
+            c.task_id == task_id,
+            c.current_run_id.is_(None),
+            c.deleted.is_(False),
+            c.run_started_at == started_at,
+        ]
+        async with self._transaction() as session:
+            result = await session.execute(
+                update(self._tasks).where(*where).values(current_run_id=run_id, updated_at=db_now())
+            )
+            return bool(result.rowcount)
+
+    async def finish_run(
+        self,
+        task_id: str,
+        run_id: Optional[str],
+        result: WatchRunResult,
+        *,
+        started_at: Optional[float] = None,
+    ) -> bool:
         """Release occupancy and record the outcome iff *run_id* still occupies the row."""
         c = self._tasks.c
         now = db_now()
@@ -686,7 +715,6 @@ class MySQLWatchStore(WatchStore):
             "last_error": result.error,
             "current_run_id": None,
             "run_started_at": None,
-            "run_fenced": False,
             "updated_at": now,
         }
         if result.deactivate:
@@ -695,36 +723,21 @@ class MySQLWatchStore(WatchStore):
             values["connector_states"] = self._cipher.seal(
                 task_id, "connector_states", result.connector_states
             )
+        where = [
+            self._scope,
+            c.task_id == task_id,
+            c.current_run_id == run_id,
+            c.run_started_at.is_not(None),
+        ]
+        if started_at is not None:
+            where.append(c.run_started_at == started_at)
         async with self._transaction() as session:
             changed = (
-                await session.execute(
-                    update(self._tasks)
-                    .where(
-                        self._scope,
-                        c.task_id == task_id,
-                        c.current_run_id == run_id,
-                    )
-                    .values(**values)
-                )
+                await session.execute(update(self._tasks).where(*where).values(**values))
             ).rowcount
             if changed:
                 await self._purge(session, [task_id])
             return bool(changed)
-
-    async def fence_run(self, task_id: str, run_id: str) -> bool:
-        """Stop admitting Task creation for *run_id* while it keeps occupying the row."""
-        c = self._tasks.c
-        async with self._transaction() as session:
-            await session.execute(
-                update(self._tasks)
-                .where(self._scope, c.task_id == task_id, c.current_run_id == run_id)
-                .values(run_fenced=True)
-            )
-            rows = await self._rows(
-                session,
-                select(c.current_run_id).where(self._scope, c.task_id == task_id),
-            )
-            return bool(rows) and rows[0]["current_run_id"] == run_id
 
     async def deactivate_idle(self, task_id: str, *, target_uri: Optional[str], error: str) -> bool:
         """Disable an idle Watch that still targets *target_uri* without starting a run."""
@@ -734,7 +747,7 @@ class MySQLWatchStore(WatchStore):
             self._scope,
             c.task_id == task_id,
             c.deleted.is_(False),
-            c.current_run_id.is_(None),
+            c.run_started_at.is_(None),
             c.target_uri_hash == _hash(target_uri),
         ]
         where.append(c.target_uri.is_(None) if target_uri is None else c.target_uri == target_uri)
@@ -783,7 +796,7 @@ class MySQLWatchStore(WatchStore):
                 .where(
                     self._scope,
                     c.account_id == account_id,
-                    c.current_run_id.is_not(None),
+                    c.run_started_at.is_not(None),
                     or_(*overlaps),
                 )
                 .limit(1),
