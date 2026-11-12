@@ -22,6 +22,7 @@ from openviking.config.vlm import VLMResolver
 from openviking.core.peer_id import safe_peer_id
 from openviking.message import Message
 from openviking.server.identity import RequestContext
+from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.session.memory.dataclass import (
     MemoryFile,
     MemoryOperationSource,
@@ -230,9 +231,14 @@ class StreamingMemoryUpdater:
             (await self._get_group_batcher(group_key)).submit(group_request)
             for group_key, group_request in grouped_requests
         ]
-        group_results = list(await asyncio.gather(*submissions))
+        # Let submit() receive cancellation so it flushes buffered work and waits for I/O.
+        # Ordinary failures still wait for every group before the error is propagated.
+        group_results = list(await asyncio.gather(*submissions, return_exceptions=True))
+        for group_result in group_results:
+            if isinstance(group_result, BaseException):
+                raise group_result
         result = combine_streaming_memory_results(*group_results, fallback_request_count=1)
-        await self._apply_post_group_links(request, result)
+        await run_to_completion(lambda: self._apply_post_group_links(request, result))
         return result
 
     async def _apply_post_group_links(
@@ -631,8 +637,12 @@ class StreamingMemoryUpdater:
             if kind_requests
         ]
         kind_results = await asyncio.gather(
-            *(merge_kind(kind_requests) for _, kind_requests in kind_batches)
+            *(merge_kind(kind_requests) for _, kind_requests in kind_batches),
+            return_exceptions=True,
         )
+        for kind_result in kind_results:
+            if isinstance(kind_result, BaseException):
+                raise kind_result
         uri_kinds: dict[str, str] = {}
         conflicting_uris: set[str] = set()
         for (kind, _), operations in zip(kind_batches, kind_results, strict=True):

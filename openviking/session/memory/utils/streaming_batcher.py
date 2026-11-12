@@ -12,6 +12,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
+from openviking.service.task_tracker_concurrency import run_to_completion
 from openviking.service.task_work_index import detach_task_context
 from openviking.telemetry import tracer
 from openviking_cli.utils import get_logger
@@ -115,7 +116,18 @@ class StreamingBatcher(Generic[T, R]):
         if should_flush:
             self._trigger_background_flush("count")
 
-        return await future
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            # A queued or already flushing item still owns physical batch work.
+            # Flush buffered items even if the timer is stopping, and finish I/O
+            # before the queue caller can ACK cancellation.
+            self._trigger_background_flush("cancel")
+            try:
+                await run_to_completion(lambda: future)
+            except Exception:
+                pass
+            raise
 
     async def close(self) -> R | None:
         if self._closed:
@@ -146,15 +158,20 @@ class StreamingBatcher(Generic[T, R]):
                     # A shared batch has no single caller-owned Task, including
                     # when flush() or close() is awaited directly.
                     with detach_task_context():
-                        result = await self.process_batch([item.payload for item in items], reason)
+                        result = await run_to_completion(
+                            lambda: self.process_batch([item.payload for item in items], reason)
+                        )
                     metadata = self._get_result_metadata(result)
                     if metadata is not None:
                         metadata.setdefault("batch_id", batch_id)
                         metadata.setdefault("batch_trace_id", batch_trace_id)
-            except Exception as exc:
+            except BaseException as exc:
                 for item in items:
                     if not item.future.done():
-                        item.future.set_exception(exc)
+                        if isinstance(exc, asyncio.CancelledError):
+                            item.future.cancel()
+                        else:
+                            item.future.set_exception(exc)
                 raise
 
             self._last_result = result
