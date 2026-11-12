@@ -39,7 +39,7 @@ gauges:
 
 | Field | Meaning |
 | --- | --- |
-| `pending` | Messages available for dequeue |
+| `pending` | Messages not yet dequeued, including groups temporarily blocked |
 | `processing` | Messages dequeued but not yet acknowledged |
 | `unacked` | `pending + processing` |
 
@@ -52,13 +52,13 @@ pending == 0 && processing == 0
 Equivalently, `unacked == 0`.
 
 An unacknowledged message remains incomplete when its handler fails, its ACK
-fails, or its worker exits. It becomes pending again through recovery or leaves
+fails, or its worker exits. It becomes pending again through `/retry` or recovery, or leaves
 the queue through a successful ACK.
 
 ## Ownership
 
 QueueFS is the owner of queue lifecycle state. Each backend must update
-`pending` and `processing` together with enqueue, dequeue, ACK, clear, and
+`pending` and `processing` together with enqueue, dequeue, ACK, retry, clear, and
 recovery operations.
 
 Python must not combine backend `pending` with a process-local counter to decide
@@ -89,15 +89,62 @@ QueueFS `/status` returns counts read atomically:
 `unacked` is derived as `pending + processing`. The existing `/size` operation
 can continue to mean `pending` for compatibility and worker scheduling.
 QueueFS control names are reserved path components: a queue name cannot end in
-`enqueue`, `dequeue`, `peek`, `size`, `status`, `messages`, `clear`, or `ack`.
+`enqueue`, `enqueue_ext`, `dequeue`, `peek`, `size`, `status`, `messages`,
+`clear`, `ack`, or `retry`.
 
 Backend requirements:
 
 - **SQLite:** read both counts from one database snapshot.
-- **Cache:** return `LLEN(pending)` and `ZCARD(processing)` from one Lua script.
+- **Cache:** return `ZCARD(pending)` and `ZCARD(processing)` from one Lua script.
 - **Memory:** maintain a processing collection; dequeue moves a message into it and
   ACK removes the message from it.
 
 `NamedQueue.get_status()` consumes this backend snapshot. `wait_complete()` and
 `is_all_complete()` use only the backend-owned `pending` and `processing`
 values.
+
+## Grouped Scheduling in the Kernel
+
+`/enqueue_ext` accepts optional, mutually exclusive keys per message. All three
+kinds may coexist in one queue:
+
+| Header metadata | Contract within one queue |
+| --- | --- |
+| Neither key | Ordinary independent delivery |
+| `serial_key` | Only one message of this key may be processing; its final ACK permits the next message |
+| `group_key` | Several messages of this key may be processing concurrently, all belonging to one consumer instance |
+
+Key namespaces and queues are independent; strict FIFO is not promised.
+Recovery preserves the original message ID. Later messages of a `serial_key`
+remain blocked until the original is ACKed. A `group_key` releases consumer
+ownership after its last in-flight ACK. Duplicate ACKs do not affect other claims.
+
+- **Redis/Cache:** enforces both keys across backend instances sharing a
+  `service_name` and queue path; consumer identity is a backend instance.
+  Exit recovery uses the existing heartbeat mechanism.
+- **Memory:** supports both keys within one backend instance; state is lost on exit.
+- **SQLite:** supports one consumer process. `group_key` is retained as metadata
+  and delivered normally; `serial_key` excludes concurrent deliveries within
+  that process. Startup replays unacknowledged messages.
+
+SQLite automatically adds a nullable `serial_key` column and its index. Old
+messages have `NULL` in that column. A `schedule_seq` column is backfilled from
+row IDs and replaces the status index's ordering column; IDs, payloads and
+original ordering remain unchanged. Redis layout is incompatible with older versions:
+drain shared queues under the service and upgrade producers and consumers
+together. Mixed versions and automatic backlog migration are unsupported.
+
+Extended enqueue uses a big-endian `QFSE` v1 frame (fixed header, TLVs, raw
+payload), with a 64 KiB header limit. `group_key` / `serial_key` use TLV types
+`2` / `3`, flags `1`, and 1–4096 UTF-8 bytes. Both keys together, duplicate or
+invalid keys, and unknown required fields are rejected; unknown optional fields
+are skipped. See the [protocol implementation](../../../crates/ragfs/src/plugins/queuefs/enqueue_protocol.rs)
+for the complete frame definition.
+
+Legacy `/enqueue` still accepts raw payload; dequeue, peek, messages and ACK
+formats are unchanged. `/dequeue` returns `{}` when nothing is eligible, even
+with pending messages. Extended write returns a byte count; the caller owns the
+UUID. An ID still present in the same queue returns `AlreadyExists`; deduplication
+records are not retained after ACK. `clear` and queue removal also clear scheduling
+state. ACK after processing, batching and writeback finish. This change provides
+kernel primitives; Python producers and business handlers are not yet connected.
