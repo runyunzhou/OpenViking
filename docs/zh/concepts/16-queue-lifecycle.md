@@ -128,5 +128,21 @@ key 长度为 1–4096 UTF-8 bytes；拒绝互斥字段并存、重复或无效 
 旧 `/enqueue` 仍接收原始 payload；dequeue、peek、messages 和 ACK 格式不变。
 无可投递消息时 `/dequeue` 返回 `{}`，即使 pending 非零。扩展 write 返回字节数，
 UUID 由调用方持有；同队列尚存 ID 重复入队返回 `AlreadyExists`，ACK 后不保留去重记录。
-`clear` 和删除队列同时清理调度状态。业务处理、合并及写回结束后才 ACK；
-本轮仅提供内核能力，Python 生产者和业务 handler 尚未自动接入。
+`clear` 和删除队列同时清理调度状态。业务处理、合并及写回结束后才 ACK。
+
+Python `enqueue(..., serial_key=..., group_key=...)` 在注册 Work 前校验 key，
+扩展入队返回实际 UUID；无 key 时保持旧路径。ExternalTask 使用账号、任务类型和
+provider 显式返回的 key 生成 `serial_key`；返回 `None` 时不启用串行调度。
+同账号跨用户的相同 key 共享串行约束。
+admission busy 或本地 finalization 未完成时返回 `ProcessResult.retry()`；
+通用 middleware 先保存 Work 为 pending，再写 `/retry`，释放 worker 槽位。
+原消息 ID、payload、时间戳和 key 不变，无 delay 调度；
+同 serial key 的后续消息仍须等待原消息最终 ACK，其他 key 可继续投递。
+`/retry` 只移动 processing 消息，重复 retry 和 pending ACK 均为空操作。
+旧 `ProcessResult.requeued()` 仍表示 handler 已发布替代消息，原消息照常 ACK。
+External 业务结果保存最多尝试三次；向外传播的执行、清理及
+Task/Work 保存异常均不 ACK，已处理的业务失败在 Work 结算后 ACK。
+取消沿用通用 Task middleware 契约；ACK 沿用通用队列行为，写入失败记录
+warning，消息留待恢复，消费继续。本版本 ExternalTaskService 保留基线的目标
+占用和执行保护，并在 worker 启动前恢复占用，以兼容未携带 key 的旧消息；
+这些过渡保护计划在下个版本移除。

@@ -146,5 +146,26 @@ formats are unchanged. `/dequeue` returns `{}` when nothing is eligible, even
 with pending messages. Extended write returns a byte count; the caller owns the
 UUID. An ID still present in the same queue returns `AlreadyExists`; deduplication
 records are not retained after ACK. `clear` and queue removal also clear scheduling
-state. ACK after processing, batching and writeback finish. This change provides
-kernel primitives; Python producers and business handlers are not yet connected.
+state. ACK after processing, batching and writeback finish.
+
+Python `enqueue(..., serial_key=..., group_key=...)` validates keys before Work
+registration and returns the actual UUID for extended writes; unkeyed writes
+keep the legacy path. ExternalTask derives `serial_key` from the account, task
+type and explicit provider key. A provider returning `None` uses ordinary
+delivery without serialization.
+Users in one account share provider key serialization. Pending admission or local
+finalization returns `ProcessResult.retry()`. Generic middleware persists Work as
+pending before writing `/retry`, releasing the worker slot. The original ID,
+payload, timestamp and keys remain unchanged, with no delayed scheduling.
+Later messages of the same serial key still wait for its final ACK; other keys
+remain eligible. `/retry` only moves processing messages; duplicate retry and
+pending ACK are no-ops. Existing `ProcessResult.requeued()` means the handler
+already published a replacement and the original delivery is ACKed.
+External outcome saves allow three attempts. Escaped execution,
+cleanup or Task/Work persistence errors leave the delivery unacknowledged; handled
+business failures are ACKed after Work settlement. Cancellation uses the common
+Task middleware contract. ACK uses the common queue behavior: a failed write logs
+a warning and leaves the delivery for recovery while consumption continues.
+For this release, ExternalTaskService retains its baseline target reservations
+and execution guard for pre-key deliveries, restoring reservations before workers
+start. These transitional guards are scheduled for removal in the next release.
